@@ -281,7 +281,13 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
         boxes, scores, classes = detect(model, image, conf, 640, tile, overlap, 0.5, DEVICE)
         for i, cid in enumerate(classes.tolist()):
             raw = model.names.get(int(cid), str(cid)) if isinstance(model.names, dict) else model.names[int(cid)]
-            key = "component_body"
+            if member == "pcbinspect_yolov12m":
+                key = {"componentbody": "component_body"}.get(
+                    str(raw).replace("_", "").replace(" ", "").lower())
+                if key is None:
+                    continue
+            else:
+                key = "component_body"
             routed[key].append({"box": [float(v) for v in boxes[i]], "score": float(scores[i]),
                                 "source": member})
 
@@ -305,7 +311,10 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
                 kept.append(item)
         return kept
 
-    locator_body = nms(routed["component_body"])
+    pcb_body = nms([item for item in routed["component_body"]
+                     if item.get("source") == "pcbinspect_yolov12m"])
+    locator_body = nms([item for item in routed["component_body"]
+                         if item.get("source") != "pcbinspect_yolov12m"])
 
     def same_body(a: dict, b: dict) -> bool:
         ax0, ay0, ax1, ay1 = a["box"]
@@ -320,7 +329,9 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
         iou = inter / (union + 1e-9)
         return smaller_coverage >= 0.70 or iou >= 0.35
 
-    body = locator_body
+    # PCBInspect provides the tighter semantic body box; locator boxes only fill gaps.
+    body = pcb_body + [item for item in locator_body
+                       if not any(same_body(item, primary) for primary in pcb_body)]
     items = [("component_body", item) for item in body]
     items.sort(key=lambda pair: -pair[1]["score"])
     boxes = torch.tensor([item["box"] for _, item in items], dtype=torch.float32).reshape(-1, 4)
@@ -347,6 +358,7 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
             "csv": table.getvalue()}
 
 
+
 def run_pcb_component_types_prediction(image_bytes: bytes, options: dict) -> dict:
     """Classify component-body proposals and exclude pin detections."""
     image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -357,7 +369,7 @@ def run_pcb_component_types_prediction(image_bytes: bytes, options: dict) -> dic
     overlap = min(0.50, max(0.0, float(options.get("overlap", 0.25))))
     started = time.perf_counter()
 
-    # Body proposals come from the configured locator ensemble; classifier only supplies type.
+    # Windows-compatible locator proposal and type-classification sequence.
     base = run_body_only_prediction(image_bytes, options)
     bodies = [d for d in base["detections"] if d["class_name"] == "component_body"]
     weight_path = EVAL_WEIGHT_ROOT / "pcb-yolov8s-detection" / "best.pt"
@@ -379,7 +391,7 @@ def run_pcb_component_types_prediction(image_bytes: bytes, options: dict) -> dic
         "transistor": "transistor",
     }
     # pads/pins are deliberately omitted from the component classifier output.
-    edges: list[tuple[float, int, int, dict]] = []
+    assignments: dict[int, list[dict]] = {i: [] for i in range(len(bodies))}
     for i, class_id in enumerate(classes.tolist()):
         raw = model.names.get(int(class_id), str(class_id)) if isinstance(model.names, dict) else model.names[int(class_id)]
         label = class_map.get(str(raw).strip().lower())
@@ -400,26 +412,20 @@ def run_pcb_component_types_prediction(image_bytes: bytes, options: dict) -> dic
             if (iou >= 0.15 or smaller_coverage >= 0.60) and match_score > best_match:
                 best_index, best_match = j, match_score
         if best_index >= 0:
-            edges.append((best_match, i, best_index, {"label": label, "score": float(scores[i]), "match_score": best_match}))
-
-    # Greedy global edge ordering gives one-to-one classifier/body assignments.
-    assignments: dict[int, dict] = {}
-    used_predictions: set[int] = set()
-    for _, pred_index, best_index, item in sorted(edges, key=lambda edge: edge[0], reverse=True):
-        if pred_index in used_predictions or best_index in assignments:
-            continue
-        assignments[best_index] = item
-        used_predictions.add(pred_index)
+            assignments[best_index].append({"label": label, "score": float(scores[i]),
+                                            "match_score": best_match})
 
     typed = []
     for i, body in enumerate(bodies):
-        best = assignments.get(i)
+        options_for_body = assignments[i]
+        best = max(options_for_body, key=lambda p: p["score"]) if options_for_body else None
         typed.append({"class_name": best["label"] if best else "unknown",
                       "confidence": best["score"] if best else 0.0,
                       "location_confidence": float(body["confidence"]),
                       "type_confidence": best["score"] if best else None,
                       "match_score": best["match_score"] if best else None,
-                      "bbox_xyxy": body["bbox_xyxy"], "body_confidence": body["confidence"]})
+                      "bbox_xyxy": body["bbox_xyxy"],
+                      "body_confidence": body["confidence"]})
     detections = typed
     all_boxes = torch.tensor([d["bbox_xyxy"] for d in detections], dtype=torch.float32).reshape(-1, 4)
     labels = [d["class_name"] for d in detections]
@@ -441,6 +447,7 @@ def run_pcb_component_types_prediction(image_bytes: bytes, options: dict) -> dic
             "seconds": round(time.perf_counter() - started, 2),
             "elements_image": jpeg_data_url(elements), "types_image": jpeg_data_url(overlay),
             "csv": table.getvalue()}
+
 
 
 def attach_pin_pad_result(image: np.ndarray, result: dict) -> dict:
