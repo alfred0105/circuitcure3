@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from math import isfinite
+import json
 from typing import Any
 
 
@@ -29,9 +30,12 @@ def evaluate_component_measurements(
         fault_id = str(row.get("fault_hypothesis") or "")
         test_id = str(row.get("test_id") or "")
         target = str(row.get("measurement_target") or "").strip()
-        condition = str(row.get("operating_conditions") or "").strip()
-        normalized_condition = _fold(condition)
-        key: AssessmentKey = (component_id, fault_id, test_id, _fold(target), normalized_condition)
+        condition = row.get("measurement_conditions") or row.get("operating_conditions") or ""
+        condition_key = (json.dumps(condition, sort_keys=True, ensure_ascii=False)
+                         if isinstance(condition, dict) else _fold(condition))
+        normalized_condition = _fold(condition if not isinstance(condition, dict) else " ".join(
+            f"{key}:{value}" for key, value in sorted(condition.items())))
+        key: AssessmentKey = (component_id, fault_id, test_id, _fold(target), condition_key)
         measurement_id = str(row.get("measurement_id") or "")
         reason = None
         verdict = "non_diagnostic"
@@ -62,7 +66,13 @@ def evaluate_component_measurements(
             reason = "검증된 데이터시트/보드 사양의 출처 ID와 설명이 필요합니다."
         elif not target:
             reason = "측정 대상/단자가 지정되지 않았습니다."
-        elif not normalized_condition or normalized_condition != _fold(row.get("reference_conditions")):
+        elif isinstance(condition, dict) and isinstance(row.get("reference_conditions"), dict) and condition != row["reference_conditions"]:
+            reason = "전원·분리·방전·검사 모드 등 측정 조건과 기준 조건이 일치하지 않습니다."
+        elif not normalized_condition or (
+            condition != row.get("reference_conditions")
+            if isinstance(condition, dict) and isinstance(row.get("reference_conditions"), dict)
+            else normalized_condition != _fold(row.get("reference_conditions"))
+        ):
             reason = "실제 측정 조건과 정상 기준 조건이 일치하지 않습니다."
         else:
             component_type = str(row.get("component_type") or "").casefold()
@@ -120,6 +130,8 @@ def evaluate_component_measurements(
             if old_valid and new_valid and previous.get("verdict") != verdict:
                 previous.update(status="CONFLICTED", verdict="conflicted",
                                 reason="동일한 검사·단자·조건의 결과가 서로 충돌합니다.")
+            elif previous.get("verdict") == "conflicted":
+                previous["evidence_ids"] = evidence_ids
             elif new_valid and not old_valid:
                 previous.update(item)
             previous["evidence_ids"] = evidence_ids

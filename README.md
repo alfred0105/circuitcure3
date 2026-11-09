@@ -81,6 +81,20 @@ Historical phase acceptance criteria: [docs/ROADMAP.md](docs/ROADMAP.md). Curren
 
 Requires Python 3.11+ (Python 3.11 is the CI baseline; Python 3.12 also works).
 
+### macOS Apple Silicon
+
+Use a Python 3.11 virtual environment. The runtime requirements use PyTorch's Apple Silicon MPS backend when available and retain CPU fallback. The optional training list is separate; weights are supplied locally and are not tracked in this repository.
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-macos-arm64.txt
+streamlit run src/circuitcare/ui.py
+```
+
+For optional model training tools, install `requirements-macos-arm64-training.txt` after the runtime requirements. Set `CIRCUITCARE_UI_V2=0` only when you need the legacy dashboard.
+
 ```bash
 python -m pip install -e ".[dev,ui,vision,datasheet]"
 circuitcare --netlist tests/fixtures/simple_kicad_netlist.xml --fault U1

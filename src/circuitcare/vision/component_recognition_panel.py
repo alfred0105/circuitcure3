@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import importlib.util
 import sys
 from pathlib import Path
@@ -19,11 +20,32 @@ CLASS_OPTIONS = [
     "voltage_regulator", "MOV", "transformer", "heatsink",
 ]
 STATUS_OPTIONS = ["검수 필요", "확인", "제외"]
+AUTO_CLASS_OPTIONS = ["unknown", "resistor", "capacitor", "IC", "diode", "LED", "transistor",
+                      "inductor", "connector", "switch", "relay", "battery", "buzzer", "display",
+                      "fuse", "transformer", "clock", "heatsink", "potentiometer"]
+INFERENCE_CONFIG = {"model_pipeline": "yolo26s+doctor-v12n+arshia-yolov8s", "conf": 0.20,
+                    "tile": 1024, "overlap": 0.25, "postprocess": "one-to-one-v2"}
+
+
+def _model_cache_fingerprint() -> str:
+    specs = ((APP_DIR / "weights" / "any_best.pt"),
+             (APP_DIR / "weights" / "external" / "pcb-ai-doctor" / "best_v12n.pt"),
+             (APP_DIR / "weights" / "external" / "pcb-yolov8s-detection" / "best.pt"))
+    parts = []
+    for path in specs:
+        try:
+            info = path.stat()
+            parts.append(f"{path.name}:{info.st_size}:{info.st_mtime_ns}")
+        except OSError:
+            parts.append(f"{path.name}:missing")
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:12]
 
 
 def review_scope(image_bytes: bytes, project_id: str, photo_id: str) -> str:
     # Version the review cache because detector input now keeps its source resolution.
-    return f"{project_id}_{photo_id}_native_{hashlib.sha256(image_bytes).hexdigest()[:16]}"
+    versioned_options = {**INFERENCE_CONFIG, "weight_fingerprint": _model_cache_fingerprint()}
+    digest = hashlib.sha256(image_bytes + json.dumps(versioned_options, sort_keys=True).encode()).hexdigest()[:16]
+    return f"{project_id}_{photo_id}_native_{digest}"
 
 
 def review_keys(scope: str) -> tuple[str, str, str]:
@@ -50,17 +72,39 @@ def _app_server() -> Any:
     return module
 
 
-def _record(label: str, bbox: list | tuple, status: str = "검수 필요", confidence: float = 0.0) -> dict:
-    return {"소자 종류": label if label in CLASS_OPTIONS else "unknown",
+def _record(label: str, bbox: list | tuple, status: str = "검수 필요", confidence: float = 0.0,
+            component_id: str | None = None, **scores: Any) -> dict:
+    return {"component_id": component_id or f"manual-{hashlib.sha256(repr(tuple(round(float(v),1) for v in bbox)).encode()).hexdigest()[:16]}",
+            "소자 종류": label if label in CLASS_OPTIONS else "unknown",
             "상태": status if status in STATUS_OPTIONS else "검수 필요",
             "신뢰도": float(confidence or 0.0),
+            "location_confidence": scores.get("location_confidence", confidence),
+            "type_confidence": scores.get("type_confidence"), "match_score": scores.get("match_score"),
             "x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]}
 
 
 def _store_predictions(state: Any, records_key: str, result: dict) -> None:
-    state[records_key] = [_record(row.get("class_name", "unknown"), row["bbox_xyxy"],
-                                  confidence=row.get("confidence", 0.0))
-                          for row in result.get("detections", [])]
+    old_rows = state.get(records_key, [])
+    new_rows = []
+    for row in result.get("detections", []):
+        box = row["bbox_xyxy"]
+        best, best_iou = None, 0.0
+        for previous in old_rows:
+            a = (previous["x1"], previous["y1"], previous["x2"], previous["y2"])
+            ix = max(0, min(a[2], box[2]) - max(a[0], box[0])) * max(0, min(a[3], box[3]) - max(a[1], box[1]))
+            aa = max(0, a[2]-a[0]) * max(0, a[3]-a[1]); bb = max(0, box[2]-box[0]) * max(0, box[3]-box[1])
+            iou = ix / (aa + bb - ix + 1e-9)
+            if iou > best_iou and iou >= 0.30:
+                best, best_iou = previous, iou
+        reused = best is not None and all(r.get("component_id") != best.get("component_id") for r in new_rows)
+        new_rows.append(_record(row.get("class_name", "unknown"), box,
+            status=best.get("상태", "검수 필요") if reused else "검수 필요",
+            confidence=row.get("confidence", 0.0),
+            component_id=best["component_id"] if reused else None,
+            location_confidence=row.get("location_confidence", row.get("body_confidence", 0.0)),
+            type_confidence=row.get("type_confidence", row.get("confidence")),
+            match_score=row.get("match_score")))
+    state[records_key] = new_rows
 
 
 def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: str,
@@ -78,7 +122,8 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
         with st_api.spinner("선택한 PCB 사진에서 소자를 자동 탐지하고 있습니다…"):
             engine = _app_server()
             engine.load_component_locator()
-            result = engine.run_prediction(image_bytes, {"conf": 0.20, "tile": 1024, "overlap": 0.25})
+            result = engine.run_prediction(image_bytes, {"conf": INFERENCE_CONFIG["conf"],
+                "tile": INFERENCE_CONFIG["tile"], "overlap": INFERENCE_CONFIG["overlap"]})
         if review_image_size and result.get("detections"):
             source_width = max(1, int(result.get("image_width", review_image_size[0])))
             source_height = max(1, int(result.get("image_height", review_image_size[1])))
@@ -101,10 +146,7 @@ def render_selected_component_editor(st_api: Any, *, image_bytes: bytes, scope: 
     """Edit class, review status, and coordinates for the selected overlay box."""
     _result_key, records_key, _error_key = review_keys(scope)
     rows = st_api.session_state.get(records_key, [])
-    try:
-        index = int(component_id.rsplit("-", 1)[-1]) - 1
-    except (TypeError, ValueError):
-        return
+    index = next((i for i, item in enumerate(rows) if item.get("component_id") == component_id), -1)
     if not 0 <= index < len(rows):
         return
     row = rows[index]
@@ -161,7 +203,6 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
     st_api.caption("이미지 위의 ‘박스 그리기’를 눌러 드래그하세요. 박스를 선택하면 오른쪽에서 종류·상태·위치를 수정할 수 있습니다.")
     if st_api.button("선택 사진 다시 탐지", key=f"cc_component_run_{scope}"):
         st_api.session_state.pop(result_key, None)
-        st_api.session_state.pop(records_key, None)
         st_api.session_state.pop(error_key, None)
         st_api.rerun()
     rows = st_api.session_state.get(records_key, [])
@@ -169,7 +210,9 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
     result = st_api.session_state[result_key]
     export_rows = [{"project_id": project_id, "photo_id": photo_id,
                     "active": row.get("상태") != "제외", "class_name": row["소자 종류"],
-                    "review_status": row.get("상태", "검수 필요"),
+                    "review_status": row.get("상태", "검수 필요"), "component_id": row.get("component_id"),
+                    "location_confidence": row.get("location_confidence"),
+                    "type_confidence": row.get("type_confidence"), "match_score": row.get("match_score"),
                     **{key: row[key] for key in ("x1", "y1", "x2", "y2")}}
                    for row in rows]
     st_api.download_button("검수 결과 CSV 저장", pd.DataFrame(export_rows).to_csv(index=False).encode("utf-8-sig"),

@@ -40,6 +40,12 @@ class ObservationStore:
                     result_json TEXT NOT NULL, observations_json TEXT NOT NULL,
                     FOREIGN KEY (diagnosis_id) REFERENCES diagnosis_sessions(diagnosis_id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS observation_change_history (
+                    change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    diagnosis_id TEXT NOT NULL, observation_id TEXT NOT NULL,
+                    changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, previous_json TEXT NOT NULL,
+                    replacement_json TEXT NOT NULL
+                );
             """)
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("""
@@ -59,6 +65,25 @@ class ObservationStore:
                   json.dumps(observations, ensure_ascii=False, allow_nan=False)))
             for index, row in enumerate(observations):
                 observation_id = str(row.get("id") or f"{row.get('code', 'unknown')}:{index}")
+                replacement = json.dumps(row, ensure_ascii=False, allow_nan=False, sort_keys=True)
+                previous = connection.execute(
+                    "SELECT code,value_json,status,source,component_id,confidence,conditions_json,evidence_quote "
+                    "FROM diagnosis_observations WHERE diagnosis_id=? AND observation_id=?",
+                    (diagnosis_id, observation_id),
+                ).fetchone()
+                if previous is not None:
+                    previous_record = dict(zip(("code", "value_json", "status", "source", "component_id",
+                                                "confidence", "conditions_json", "evidence_quote"), previous))
+                    if previous_record != {
+                        "code": str(row.get("code", "unknown")),
+                        "value_json": json.dumps(row.get("value"), ensure_ascii=False),
+                        "status": str(row.get("status", "unknown")), "source": str(row.get("source", "unknown")),
+                        "component_id": row.get("component_id"), "confidence": row.get("confidence"),
+                        "conditions_json": json.dumps(row.get("measurement_conditions"), ensure_ascii=False),
+                        "evidence_quote": row.get("evidence_quote"),
+                    }:
+                        connection.execute("INSERT INTO observation_change_history(diagnosis_id,observation_id,previous_json,replacement_json) VALUES(?,?,?,?)",
+                                           (diagnosis_id, observation_id, json.dumps(previous_record, ensure_ascii=False), replacement))
                 connection.execute("""
                     INSERT INTO diagnosis_observations(
                         observation_id, diagnosis_id, code, value_json, status, source,

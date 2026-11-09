@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-from hr.infer.predict import agnostic_nms, combine, detect, draw, draw_elements
+from hr.infer.predict import agnostic_nms, combine, detect as _detect, draw, draw_elements
 
 ROOT = Path(__file__).resolve().parent
 SAMPLES = ROOT / "data" / "samples"
@@ -37,7 +37,7 @@ def _default_weights_root() -> Path:
 WEIGHTS = _default_weights_root()
 SAMPLE_FILES = sorted(p.name for p in SAMPLES.glob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"})
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
-DEVICE = "0" if torch.cuda.is_available() else "cpu"
+DEVICE = "0" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
 ANY_MODEL: YOLO | None = None
 FINE_MODEL: YOLO | None = None
 FINE_NAMES: list[str] = []
@@ -63,6 +63,35 @@ COMPONENT_CLASS_MAP = {
     "resistor": "resistor", "switch": "switch", "transformer": "transformer",
     "transistor": "transistor",
 }
+
+
+def detect(model, image, conf, imgsz, tile, overlap, iou, device, max_det=1000):
+    """Run inference with a safe CPU fallback when Apple's MPS backend fails."""
+    global DEVICE
+    height, width = image.shape[:2]
+    if height * width > 60_000_000:
+        raise ValueError("사진이 너무 큽니다 (최대 60MP). 긴 변을 줄여 다시 시도해 주세요.")
+    if tile:
+        step = max(1, int(tile * (1 - overlap)))
+        tile_count = max(1, len(range(0, max(1, width - tile) + 1, step))) * max(1, len(range(0, max(1, height - tile) + 1, step)))
+        if tile_count > 256:
+            raise ValueError(f"타일 수가 제한을 넘었습니다 ({tile_count}/256). 더 작은 사진 또는 타일 크기를 사용해 주세요.")
+    started = time.monotonic()
+    try:
+        result = _detect(model, image, conf, imgsz, tile, overlap, iou, device, max_det=max_det)
+    except (RuntimeError, NotImplementedError) as exc:
+        if str(device).lower() not in {"mps", "mps:0"}:
+            raise
+        DEVICE = "cpu"
+        try:
+            if hasattr(model, "to"):
+                model.to("cpu")
+            result = _detect(model, image, conf, imgsz, tile, overlap, iou, "cpu", max_det=max_det)
+        except Exception as fallback_exc:
+            raise RuntimeError(f"MPS 추론 실패 후 CPU 재시도도 실패했습니다: {fallback_exc}") from exc
+    if time.monotonic() - started > 180:
+        raise TimeoutError("PCB 소자 탐지 시간이 180초 제한을 넘었습니다.")
+    return result
 
 
 def load_component_locator() -> YOLO:
@@ -162,7 +191,7 @@ def run_prediction(image_bytes: bytes, options: dict) -> dict:
         types, _ = draw(image, B, labels, cls_conf, "auto", 24)
     elif mode == "pcb_component_types":
         result = run_pcb_component_types_prediction(image_bytes, options)
-        return result if options.get("_skip_pin_pad") else attach_pin_pad_result(image, result)
+        return attach_pin_pad_result(image, result) if options.get("include_pin_pad") else result
     elif mode == "ensemble_body":
         return run_body_only_prediction(image_bytes, options)
     else:
@@ -240,9 +269,7 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
     members = ("parsa", "pcb_ai_doctor_v12n")
     for member in members:
         if member == "parsa":
-            model = ANY_MODEL
-            if model is None:
-                raise ValueError("YOLO26s Locator가 로드되지 않았습니다.")
+            model = load_component_locator()
         else:
             _, relative_weight = EVAL_MODEL_SPECS[member]
             weight_path = EVAL_WEIGHT_ROOT / relative_weight
@@ -254,13 +281,7 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
         boxes, scores, classes = detect(model, image, conf, 640, tile, overlap, 0.5, DEVICE)
         for i, cid in enumerate(classes.tolist()):
             raw = model.names.get(int(cid), str(cid)) if isinstance(model.names, dict) else model.names[int(cid)]
-            if member == "pcbinspect_yolov12m":
-                key = {"componentbody": "component_body"}.get(
-                    str(raw).replace("_", "").replace(" ", "").lower())
-                if key is None:
-                    continue
-            else:
-                key = "component_body"
+            key = "component_body"
             routed[key].append({"box": [float(v) for v in boxes[i]], "score": float(scores[i]),
                                 "source": member})
 
@@ -284,10 +305,7 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
                 kept.append(item)
         return kept
 
-    pcb_body = nms([item for item in routed["component_body"]
-                     if item.get("source") == "pcbinspect_yolov12m"])
-    locator_body = nms([item for item in routed["component_body"]
-                         if item.get("source") != "pcbinspect_yolov12m"])
+    locator_body = nms(routed["component_body"])
 
     def same_body(a: dict, b: dict) -> bool:
         ax0, ay0, ax1, ay1 = a["box"]
@@ -302,9 +320,7 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
         iou = inter / (union + 1e-9)
         return smaller_coverage >= 0.70 or iou >= 0.35
 
-    # PCBInspect provides the tighter semantic body box; locator boxes only fill gaps.
-    body = pcb_body + [item for item in locator_body
-                       if not any(same_body(item, primary) for primary in pcb_body)]
+    body = locator_body
     items = [("component_body", item) for item in body]
     items.sort(key=lambda pair: -pair[1]["score"])
     boxes = torch.tensor([item["box"] for _, item in items], dtype=torch.float32).reshape(-1, 4)
@@ -341,7 +357,7 @@ def run_pcb_component_types_prediction(image_bytes: bytes, options: dict) -> dic
     overlap = min(0.50, max(0.0, float(options.get("overlap", 0.25))))
     started = time.perf_counter()
 
-    # Body proposals come from PCBInspect first, with the locator models filling gaps.
+    # Body proposals come from the configured locator ensemble; classifier only supplies type.
     base = run_body_only_prediction(image_bytes, options)
     bodies = [d for d in base["detections"] if d["class_name"] == "component_body"]
     weight_path = EVAL_WEIGHT_ROOT / "pcb-yolov8s-detection" / "best.pt"
@@ -363,7 +379,7 @@ def run_pcb_component_types_prediction(image_bytes: bytes, options: dict) -> dic
         "transistor": "transistor",
     }
     # pads/pins are deliberately omitted from the component classifier output.
-    assignments: dict[int, list[dict]] = {i: [] for i in range(len(bodies))}
+    edges: list[tuple[float, int, int, dict]] = []
     for i, class_id in enumerate(classes.tolist()):
         raw = model.names.get(int(class_id), str(class_id)) if isinstance(model.names, dict) else model.names[int(class_id)]
         label = class_map.get(str(raw).strip().lower())
@@ -384,16 +400,26 @@ def run_pcb_component_types_prediction(image_bytes: bytes, options: dict) -> dic
             if (iou >= 0.15 or smaller_coverage >= 0.60) and match_score > best_match:
                 best_index, best_match = j, match_score
         if best_index >= 0:
-            assignments[best_index].append({"label": label, "score": float(scores[i])})
+            edges.append((best_match, i, best_index, {"label": label, "score": float(scores[i]), "match_score": best_match}))
+
+    # Greedy global edge ordering gives one-to-one classifier/body assignments.
+    assignments: dict[int, dict] = {}
+    used_predictions: set[int] = set()
+    for _, pred_index, best_index, item in sorted(edges, key=lambda edge: edge[0], reverse=True):
+        if pred_index in used_predictions or best_index in assignments:
+            continue
+        assignments[best_index] = item
+        used_predictions.add(pred_index)
 
     typed = []
-    for i, options_for_body in assignments.items():
-        if not options_for_body:
-            continue
-        best = max(options_for_body, key=lambda p: p["score"])
-        typed.append({"class_name": best["label"], "confidence": best["score"],
-                      "bbox_xyxy": bodies[i]["bbox_xyxy"],
-                      "body_confidence": bodies[i]["confidence"]})
+    for i, body in enumerate(bodies):
+        best = assignments.get(i)
+        typed.append({"class_name": best["label"] if best else "unknown",
+                      "confidence": best["score"] if best else 0.0,
+                      "location_confidence": float(body["confidence"]),
+                      "type_confidence": best["score"] if best else None,
+                      "match_score": best["match_score"] if best else None,
+                      "bbox_xyxy": body["bbox_xyxy"], "body_confidence": body["confidence"]})
     detections = typed
     all_boxes = torch.tensor([d["bbox_xyxy"] for d in detections], dtype=torch.float32).reshape(-1, 4)
     labels = [d["class_name"] for d in detections]
@@ -710,17 +736,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path in {"/", "/index.html"}:
-            page = (ROOT / "index.html").read_bytes()
-            return self._send(200, page, "text/html; charset=utf-8")
+            page = ROOT / "index.html"
+            if page.is_file():
+                return self._send(200, page.read_bytes(), "text/html; charset=utf-8")
+            return self._send(503, b"PCB browser UI assets are not included. Run the CircuitCare integrated UI instead.", "text/plain; charset=utf-8")
         if path in {"/benchmark", "/benchmark.html"}:
-            page = (ROOT / "benchmark.html").read_bytes()
+            page_path = ROOT / "benchmark.html"
+            if not page_path.is_file():
+                return self._send(404, b"Benchmark UI is not included in this package.", "text/plain; charset=utf-8")
+            page = page_path.read_bytes()
             return self._send(200, page, "text/html; charset=utf-8")
         if path in {"/pin-pad", "/pin-pad.html"}:
-            page = (ROOT / "pin_pad.html").read_bytes()
+            page_path = ROOT / "pin_pad.html"
+            if not page_path.is_file():
+                return self._send(404, b"Pin/pad UI is not included in this package.", "text/plain; charset=utf-8")
+            page = page_path.read_bytes()
             return self._send(200, page, "text/html; charset=utf-8")
         if path == "/api/health":
-            payload = {"ready": ANY_MODEL is not None and FINE_MODEL is not None, "device": DEVICE,
-                       "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
+            payload = {"ready": True, "models_loaded": {"locator": ANY_MODEL is not None,
+                       "fine": FINE_MODEL is not None, "external": sorted(EXTERNAL_MODELS)}, "device": DEVICE,
+                       "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else DEVICE.upper(),
                        "fine_classes": FINE_NAMES, "sample_count": len(SAMPLE_FILES)}
             return self._send(200, json.dumps(payload).encode(), "application/json; charset=utf-8")
         if path == "/api/samples":
@@ -800,20 +835,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global ANY_MODEL, FINE_MODEL, FINE_NAMES
     import argparse
 
     parser = argparse.ArgumentParser(description="Local browser UI for the upstream PCB YOLO26 detector")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    print(f"Loading upstream weights on {DEVICE}...", flush=True)
-    ANY_MODEL = YOLO(str(WEIGHTS / "any_best.pt"))
-    FINE_MODEL = YOLO(str(WEIGHTS / "fine_best.pt"))
-    FINE_NAMES = list(FINE_MODEL.names.values())
+    print(f"Starting PCB service; models will load on first use ({DEVICE})...", flush=True)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"READY http://127.0.0.1:{args.port}", flush=True)
-    print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}", flush=True)
-    print(f"Fine classes: {', '.join(FINE_NAMES)}", flush=True)
+    print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else DEVICE}", flush=True)
     if os.environ.get("CIRCUITCARE_PCB_OPEN_BROWSER") == "1":
         webbrowser.open(f"http://127.0.0.1:{args.port}")
     try:

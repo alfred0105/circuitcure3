@@ -39,6 +39,11 @@ class ComponentOverlayViewModel:
     ocr_candidates: tuple[str, ...] = ()
     presence_status: str = "UNCONFIRMED"
     confirmed_functional_roles: tuple[str, ...] = ()
+    location_confidence: float | None = None
+    type_confidence: float | None = None
+    match_score: float | None = None
+    component_type_status: str = "UNCONFIRMED"
+    part_identity_status: str = "UNCONFIRMED"
 
 
 @dataclass(frozen=True)

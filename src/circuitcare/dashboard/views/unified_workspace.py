@@ -349,7 +349,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             project_id=project.project_id,
             board_id=project.board_id or "",
             board_side=side_enum or active_side,
-            component_id=f"auto-{review_hash}-{index + 1}",
+            component_id=str(row.get("component_id") or f"auto-{review_hash}-{index + 1}"),
             component_type=str(row.get("소자 종류", "unknown")),
             display_label=f"{index + 1} · {row.get('소자 종류', 'unknown')}",
             canonical_frame_id=selected,
@@ -367,6 +367,9 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             evidence=("YOLO component proposal; awaiting user review",),
             overlay_status="EXCLUDED" if row.get("상태") == "제외" else "CANDIDATE",
             diagnosis_display_status="DIAGNOSIS_NOT_RUN",
+            location_confidence=float(row.get("location_confidence", row.get("신뢰도", 0.0))),
+            type_confidence=row.get("type_confidence"), match_score=row.get("match_score"),
+            component_type_status="USER_CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED",
         ) for index, row in enumerate(review_rows))
         component_models = tuple(component_models) + auto_models
         st.session_state["circuitcare_v4_selected_marking_context"] = None
@@ -457,11 +460,12 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             return
         _result_key, records_key, _error_key = review_keys(review_scope)
         rows = list(st.session_state.get(records_key, []))
-        rows.append({"소자 종류": "unknown", "상태": "검수 필요", "신뢰도": 0.0,
+        manual_id = f"manual-{review_hash}-{hashlib.sha256(repr(tuple(bbox)).encode()).hexdigest()[:12]}"
+        rows.append({"component_id": manual_id, "소자 종류": "unknown", "상태": "검수 필요", "신뢰도": 0.0,
                      "x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]})
         st.session_state[records_key] = rows
         update_selection(st.session_state, project=project,
-                         selected_component=f"auto-{review_hash}-{len(rows)}")
+                         selected_component=manual_id)
 
     interactive, _viewer_key, viewer_coordinate_status = render_component_viewer(
         st, image=image, source_image_bytes=image_data, canonical_png_bytes=canonical_png_bytes,

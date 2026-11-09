@@ -40,7 +40,7 @@ def test_v2_flag_routes_to_real_entry_screen(monkeypatch):
     assert any(selectbox.label == "회로 데이터셋" for selectbox in app.selectbox)
 
 
-def test_default_entry_keeps_legacy_ui_when_v2_flag_is_unset(monkeypatch):
+def test_default_entry_uses_latest_v2_ui_when_flag_is_unset(monkeypatch):
     pytest.importorskip("streamlit")
     from streamlit.testing.v1 import AppTest
 
@@ -49,8 +49,8 @@ def test_default_entry_keeps_legacy_ui_when_v2_flag_is_unset(monkeypatch):
     app = AppTest.from_file(str(project_root / "src/circuitcare/ui.py"), default_timeout=30).run()
 
     assert not app.exception
-    # The existing demo case chooser is still present on the legacy route.
-    assert any(selectbox.label == "회로 데이터셋" for selectbox in app.selectbox)
+    assert any("새 PCB 진단" in item.value for item in app.markdown)
+    assert any(button.label == "진단 시작" for button in app.button)
 
 
 def test_existing_project_draft_shows_prepared_state_without_claiming_analysis(monkeypatch):

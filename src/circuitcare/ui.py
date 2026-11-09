@@ -110,7 +110,7 @@ def main() -> None:
     import streamlit as st
 
     st.set_page_config(page_title="CircuitCare AI", page_icon="🔧", layout="wide")
-    if os.environ.get("CIRCUITCARE_UI_V2") == "1" and not st.session_state.get("circuitcare_v2_legacy_demo"):
+    if os.environ.get("CIRCUITCARE_UI_V2", "1") != "0" and not st.session_state.get("circuitcare_v2_legacy_demo"):
         if st.session_state.get("circuitcare_v2_screen") == "workbench":
             from circuitcare.dashboard.views.unified_workspace import render_workbench_shell
             from circuitcare.frontend.state import INTAKE_PROJECT_KEY
@@ -127,7 +127,7 @@ def main() -> None:
             if render_diagnosis_entry(st) == "demo":
                 st.rerun()
         st.stop()
-    if os.environ.get("CIRCUITCARE_UI_V2") == "1":
+    if os.environ.get("CIRCUITCARE_UI_V2", "1") != "0":
         if st.sidebar.button("새 PCB 진단으로 돌아가기", key="cc_v2_return_to_entry"):
             st.session_state.pop("circuitcare_v2_legacy_demo", None)
             st.rerun()

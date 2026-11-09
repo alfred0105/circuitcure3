@@ -87,7 +87,8 @@ def render_inspection_panel(
             current_value = edit.get("component_info", selected_component.component_info or "")
             st.caption(f"부품 ID · {selected_component.component_id}")
             inventory_item = inventory.setdefault(selected_component.component_id, {
-                "presence_status": "UNCONFIRMED", "confirmed_functional_roles": [],
+                "presence_status": "UNCONFIRMED", "component_type_status": "UNCONFIRMED",
+                "part_identity_status": "UNCONFIRMED", "confirmed_functional_roles": [],
             })
             presence_options = ("UNCONFIRMED", "CONFIRMED", "EXCLUDED")
             presence_labels = {"UNCONFIRMED": "미확인", "CONFIRMED": "실제 부품 확인", "EXCLUDED": "오검출 · 제외"}
@@ -101,6 +102,21 @@ def render_inspection_panel(
             )
             inventory_item["presence_status"] = presence_status
             st.caption("확인한 소자만 진단 후보로 사용합니다. 오검출은 제외하고, 아직 판단이 안 되면 미확인으로 두세요.")
+            type_status_key = f"cc_component_type_status_{hash(owner)}_{selected_component.component_id}"
+            type_status_options = ("UNCONFIRMED", "USER_CONFIRMED")
+            if st.session_state.get(type_status_key) not in type_status_options:
+                st.session_state[type_status_key] = inventory_item.get("component_type_status", "UNCONFIRMED")
+            component_type_status = st.radio("부품 종류 확인", type_status_options,
+                format_func=lambda value: "종류 확인됨" if value == "USER_CONFIRMED" else "종류 미확인",
+                horizontal=True, key=type_status_key)
+            inventory_item["component_type_status"] = component_type_status
+            identity_key = f"cc_part_identity_status_{hash(owner)}_{selected_component.component_id}"
+            if st.session_state.get(identity_key) not in type_status_options:
+                st.session_state[identity_key] = inventory_item.get("part_identity_status", "UNCONFIRMED")
+            part_identity_status = st.radio("부품 모델/부품번호 확인", type_status_options,
+                format_func=lambda value: "모델 식별됨" if value == "USER_CONFIRMED" else "모델 미확인",
+                horizontal=True, key=identity_key)
+            inventory_item["part_identity_status"] = part_identity_status
             role_key = f"cc_component_roles_{hash(owner)}_{selected_component.component_id}"
             current_roles = inventory_item.get("confirmed_functional_roles", [])
             if role_key not in st.session_state:
@@ -115,8 +131,6 @@ def render_inspection_panel(
             selected_component = replace(
                 selected_component,
                 component_type=current_type,
-                identification_status=("USER_CONFIRMED" if presence_status == "CONFIRMED"
-                                       else selected_component.identification_status),
                 presence_status=presence_status,
                 confirmed_functional_roles=tuple(confirmed_roles),
             )
@@ -166,7 +180,7 @@ def render_inspection_panel(
             if selected_component.evidence:
                 with st.expander("검출 근거"):
                     st.write(" · ".join(selected_component.evidence))
-            if (selected_component.component_id.startswith("auto-")
+            if (selected_component.component_id.startswith(("auto-", "manual-"))
                     and review_image_bytes is not None and review_scope):
                 render_selected_component_editor(
                     st, image_bytes=review_image_bytes, scope=review_scope,

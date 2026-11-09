@@ -390,10 +390,13 @@ def diagnose(
         mode = modes.get(fault_id, {})
         required = {_normalized_type(value) for value in mode.get("required_component_types", [])}
         symptom_requirements = mode.get("required_component_types_by_symptom", {})
-        for symptom in selected:
-            required.update(_normalized_type(value) for value in symptom_requirements.get(symptom, []))
         if not required.issubset(detected_types):
             return False
+        relevant_symptoms = set(mode.get("supported_symptoms", {})) & set(selected)
+        for symptom in relevant_symptoms:
+            per_symptom = {_normalized_type(value) for value in symptom_requirements.get(symptom, [])}
+            if not per_symptom.issubset(detected_types):
+                return False
         candidate_types = {_normalized_type(value) for value in mode.get("candidate_component_types", [])}
         if mode.get("level") == "board" and candidate_types and not (candidate_types & detected_types):
             return False

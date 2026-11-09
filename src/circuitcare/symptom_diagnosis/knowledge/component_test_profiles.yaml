@@ -35,4 +35,6 @@ profiles:
         target_keywords: [순방향, forward, 애노드, anode, 캐소드, cathode]
         condition_keywords: [전원 차단, power off, 회로에서 분리, isolated]
         fault_relations:
-          DIODE_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
+          DIODE_SHORT_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
+          DIODE_OPEN_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
+          DIODE_LEAKAGE_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
