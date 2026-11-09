@@ -1,0 +1,14 @@
+# Experimental source-label contract for the CC0 PCB Component Detection candidate.
+# Preserves exact source names; do not merge into the deployed 10-class model.
+classes:
+  - Cap1
+  - Cap2
+  - Cap3
+  - Cap4
+  - MOSFET
+  - Mov
+  - Resestor
+  - Resistor
+  - Transformer
+canonical_10_class_mapping: PENDING_REVIEW
+training_ready: false

@@ -1,0 +1,11 @@
+names:
+  0: resistor
+  1: capacitor
+  2: diode
+  3: led
+  4: integrated_circuit
+  5: connector
+  6: switch_button
+  7: header
+  8: crystal
+  9: debug_test_point

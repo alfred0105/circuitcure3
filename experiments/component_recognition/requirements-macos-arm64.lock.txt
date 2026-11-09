@@ -1,0 +1,15 @@
+# Versions observed in the successful M5 run on 2026-11-06 (Python 3.12, arm64).
+torch==2.15.0
+torchvision==0.29.2
+ultralytics==8.4.203
+opencv-python==4.14.0.94
+numpy==2.5.4
+pillow==13.0.0
+onnx==1.23.2
+onnxruntime==1.31.1
+pandas==3.1.1
+matplotlib==3.11.2
+PyYAML==6.0.3
+tqdm==4.70.1
+psutil==7.2.2
+onnxslim==0.1.99

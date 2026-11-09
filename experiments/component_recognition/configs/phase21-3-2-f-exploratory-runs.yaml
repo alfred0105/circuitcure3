@@ -1,0 +1,50 @@
+experiment_id: phase21-3-2-f-exploratory-real-pcb-model-comparison
+status: EXPLORATORY_RUN_WITH_SOURCE_LABEL_LIMITATIONS
+production_model_change: false
+
+dataset:
+  id: domain-reviewed-v5-source-label-exploratory
+  manifest: data/component_training/processed/domain-reviewed-v5/filtered_manifest.json
+  yaml: data/component_training/processed/domain-reviewed-v5/data.yaml
+  images: 101
+  train_images: 77
+  validation_images: 24
+  validation_board_groups: 4
+  separate_locked_test_split: false
+  annotation_status: SOURCE_PROVIDED_LABELS_NOT_INDEPENDENTLY_ADJUDICATED
+  cad_candidate_labels_included: false
+
+models:
+  - yolov8s.pt
+  - yolo26s.pt
+  - yolo26m.pt
+  - yolo26l.pt
+  - yolo26x.pt
+excluded_models:
+  - model: RF-DETR-Large
+    status: NOT_RUN_PER_USER_DIRECTION
+
+shared_training:
+  task: detection
+  pretrained: true
+  image_size: 640
+  batch_size: 2
+  batch_size_from_yolo26x_onward: 4
+  oom_fallback: halve_batch_and_record
+  epochs_max: 50
+  early_stopping_patience: 15
+  seed: 42
+  workers: 2
+  amp: false
+  cache: false
+
+reported_validation_metrics:
+  - precision
+  - recall
+  - mAP50
+  - mAP50_95
+
+interpretation:
+  metrics_meaning: agreement_with_source_annotations_on_development_validation_only
+  compare_directly_to_previous_single_class_ic_runs: false
+  final_test_or_ground_truth_claim: false

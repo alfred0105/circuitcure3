@@ -1,0 +1,12 @@
+# Isolated experiment: the PCB-DSLR archive part 1, IC-only detection.
+# This does not change or replace the deployed ten-class detector.
+experiment_id: pcb-dslr-part1-integrated-circuit-only
+class_names:
+  - integrated_circuit
+source: https://zenodo.org/records/3886553
+license_scope: NON_COMMERCIAL_RESEARCH_ONLY
+source_shard: cvl_pcb_dslr_1.zip
+split_method: DETERMINISTIC_SOURCE_BOARD_ID_HASH_SPLIT_70_15_15
+source_annotation: ROTATED_IC_BOXES_CONVERTED_TO_AXIS_ALIGNED_YOLO
+training_ready: true
+commercial_use: PROHIBITED_WITHOUT_SEPARATE_PERMISSION

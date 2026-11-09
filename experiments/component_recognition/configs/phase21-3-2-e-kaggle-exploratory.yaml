@@ -1,0 +1,40 @@
+experiment_id: phase21-3-2-e-kaggle-source-only-yolo26s
+status: EXPLORATORY_SOURCE_LABEL_COMPARISON
+dataset_manifest: data/component_training/processed/kaggle-source-only-yolov8s-dev-v1/experiment_manifest.json
+dataset_yaml: data/component_training/processed/kaggle-source-only-yolov8s-dev-v1/data.yaml
+source_class_contract:
+  - Cap1
+  - Cap2
+  - Cap3
+  - Cap4
+  - MOSFET
+  - Mov
+  - Resestor
+  - Resistor
+  - Transformer
+split:
+  train_images: 1035
+  development_images: 261
+  train_visual_components: 44
+  development_visual_components: 75
+  physical_board_ids: UNVERIFIED
+  sealed_test: false
+excluded_empty_annotations: 114
+train:
+  task: detect
+  model: yolo26s.pt
+  imgsz: 640
+  batch: 2
+  epochs: 5
+  patience: 3
+  seed: 42
+  workers: 2
+  device: mps
+  cache: false
+  amp: false
+evaluation:
+  split: development
+  source_only: true
+  physical_board_generalization_claim: false
+  resestor_ap_when_validation_support_zero: null
+production_model: false

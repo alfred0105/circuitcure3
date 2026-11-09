@@ -1,0 +1,15 @@
+# Independent Apple Silicon training environment. Python 3.12, ARM64.
+torch>=2.5,<3
+torchvision>=0.20,<1
+ultralytics>=8.3,<9
+opencv-python>=4.10,<5
+numpy>=1.26,<3
+pillow>=10
+onnx>=1.16,<2
+onnxruntime>=1.18,<2
+pandas>=2
+matplotlib>=3.8
+PyYAML>=6
+tqdm>=4.66
+psutil>=5.9
+onnxslim>=0.1.82

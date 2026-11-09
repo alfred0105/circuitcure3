@@ -1,0 +1,1578 @@
+{
+  "schema_version": "circuitcare.phase21-3-2-e-model-comparison.v1",
+  "status": "EXPERIMENTAL_NO_PRODUCTION_CHANGE",
+  "dataset": {
+    "id": "pcb-dslr-part1-ic-research-v1",
+    "manifest_sha256": "a17c9e050f781b5b6882999d4488e990f68cebe432d0ac28b7552b4cdc164b05",
+    "yaml_sha256": "0237f9fe93146e7696770557e37febb4f331c73890b71d2548e135f5fb233487",
+    "images": 87,
+    "boards": 20,
+    "train": {
+      "images": 59,
+      "boards": 14,
+      "IC_boxes": 1825
+    },
+    "validation": {
+      "images": 14,
+      "boards": 3,
+      "IC_boxes": 153
+    },
+    "previously_exposed_test": {
+      "images": 14,
+      "boards": 3,
+      "integrity_hash_audited": true,
+      "predictions_or_selection_used": false
+    }
+  },
+  "environment": {
+    "python": "3.12.14",
+    "torch": "2.15.0",
+    "ultralytics": "8.4.203",
+    "device": "Apple M5 MPS",
+    "image_size": 640,
+    "batch": 2,
+    "seed": 42,
+    "workers": 2,
+    "amp": false,
+    "optimizer": "AdamW (Ultralytics auto resolved identically)"
+  },
+  "training": {
+    "20261106-191800-ccb464": {
+      "experiment_id": "20261106-191800-ccb464",
+      "model": "yolov8s.pt",
+      "dataset_sha256": "71f6f8a7fccad3f2049f942daa4692882e0b6b1f5a9ca1ef0f7a9fa653c741a5",
+      "data_yaml_sha256": "0237f9fe93146e7696770557e37febb4f331c73890b71d2548e135f5fb233487",
+      "base_checkpoint_sha256": "1f47a78bf100391c2a140b7ac73a1caae18c32779be7d310658112f7ac9aa78a",
+      "best_checkpoint_sha256": "0fc9e441887bac42af97bce4065f51ac5f2f007d4df0eee3ac85499fba4348d2",
+      "best_validation_epoch": 19,
+      "epochs": 50,
+      "patience": 15,
+      "batch_effective": 2,
+      "seed": 42,
+      "imgsz": 640,
+      "device": "mps",
+      "python": "3.12.14 (main, Aug 12 2026, 13:57:54) [Clang 21.0.0 (clang-2100.1.1.101)]",
+      "torch": "2.15.0",
+      "ultralytics": "8.4.203",
+      "best_validation_metrics": {
+        "metrics/precision(B)": 0.66393,
+        "metrics/recall(B)": 0.74891,
+        "metrics/mAP50(B)": 0.78778,
+        "metrics/mAP50-95(B)": 0.50227
+      }
+    },
+    "20261106-192334-c62b65": {
+      "experiment_id": "20261106-192334-c62b65",
+      "model": "yolo26s.pt",
+      "dataset_sha256": "71f6f8a7fccad3f2049f942daa4692882e0b6b1f5a9ca1ef0f7a9fa653c741a5",
+      "data_yaml_sha256": "0237f9fe93146e7696770557e37febb4f331c73890b71d2548e135f5fb233487",
+      "base_checkpoint_sha256": "646f8bc3fe0a656803d95c294f7852321748cb29d13466a1af8862e2db384a1b",
+      "best_checkpoint_sha256": "2823097bbfa78419ae2cad75041676020b1b3d858e86abde9fa11e9621748d38",
+      "best_validation_epoch": 30,
+      "epochs": 50,
+      "patience": 15,
+      "batch_effective": 2,
+      "seed": 42,
+      "imgsz": 640,
+      "device": "mps",
+      "python": "3.12.14 (main, Aug 12 2026, 13:57:54) [Clang 21.0.0 (clang-2100.1.1.101)]",
+      "torch": "2.15.0",
+      "ultralytics": "8.4.203",
+      "best_validation_metrics": {
+        "metrics/precision(B)": 0.59715,
+        "metrics/recall(B)": 0.77124,
+        "metrics/mAP50(B)": 0.77074,
+        "metrics/mAP50-95(B)": 0.53112
+      }
+    },
+    "20261106-193555-37ad49": {
+      "experiment_id": "20261106-193555-37ad49",
+      "model": "yolo26s.pt",
+      "dataset_sha256": "6c745494ae82b29f69b85321fa795fa2dd32945da80b074dc54334aed4fd0b71",
+      "data_yaml_sha256": "149e935ce026ba588c1676d647f6d8cbe38046ffb02bdfedebcf9044ac0941a1",
+      "base_checkpoint_sha256": "646f8bc3fe0a656803d95c294f7852321748cb29d13466a1af8862e2db384a1b",
+      "best_checkpoint_sha256": "5ac8ecfda3ffb781b97c5d3a6c5d22c99b749df05598e0c38229a7a6c03f8675",
+      "best_validation_epoch": 4,
+      "epochs": 5,
+      "patience": 3,
+      "batch_effective": 2,
+      "seed": 42,
+      "imgsz": 640,
+      "device": "mps",
+      "python": "3.12.14 (main, Aug 12 2026, 13:57:54) [Clang 21.0.0 (clang-2100.1.1.101)]",
+      "torch": "2.15.0",
+      "ultralytics": "8.4.203",
+      "best_validation_metrics": {
+        "metrics/precision(B)": 0.97738,
+        "metrics/recall(B)": 0.92634,
+        "metrics/mAP50(B)": 0.96382,
+        "metrics/mAP50-95(B)": 0.63199
+      }
+    }
+  },
+  "validation_evaluations": {
+    "yolov8s_raw": {
+      "schema_version": "circuitcare.pcb-dslr-component-model-evaluation.v2",
+      "dataset_id": "pcb-dslr-part1-ic-research-v1",
+      "dataset_version": "Zenodo record 3886553, archive part 1",
+      "dataset_manifest_sha256": "a17c9e050f781b5b6882999d4488e990f68cebe432d0ac28b7552b4cdc164b05",
+      "split": "validation",
+      "image_count": 14,
+      "board_count": 3,
+      "board_ids": [
+        "pcb14",
+        "pcb16",
+        "pcb17"
+      ],
+      "annotation_count": 153,
+      "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-191800-ccb464/weights/best.pt",
+      "model_class_contract": [
+        "integrated_circuit"
+      ],
+      "prediction_head": "raw",
+      "image_size": 640,
+      "device": "mps",
+      "confidence_threshold": 0.25,
+      "nms_iou": 0.45,
+      "metric_iou": 0.5,
+      "metrics": {
+        "precision": 0.46953405017921146,
+        "recall": 0.8562091503267973,
+        "f1": 0.6064814814814815,
+        "mAP50": 0.7889100853776584,
+        "mAP50_95": 0.5021791711809588,
+        "ap_by_iou": {
+          "0.50": 0.7889100853776584,
+          "0.55": 0.7525837031020134,
+          "0.60": 0.7205021280830743,
+          "0.65": 0.6676753672927824,
+          "0.70": 0.6201855121865972,
+          "0.75": 0.570770456975918,
+          "0.80": 0.5064910509556878,
+          "0.85": 0.3042794991409833,
+          "0.90": 0.08962780408146347,
+          "0.95": 0.0007661046134090195
+        },
+        "tp": 131,
+        "fp": 148,
+        "fn": 22,
+        "small_object_recall": 0.8405797101449275,
+        "small_object_gt_count": 138,
+        "small_object_tp": 116,
+        "small_object_fn": 22,
+        "small_object_AP50": 0.7536182684008318,
+        "small_object_AP50_95": 0.4617708830370744,
+        "small_object_ap_by_iou": {
+          "0.50": 0.7536182684008318,
+          "0.55": 0.7154386051014981,
+          "0.60": 0.6799971512251459,
+          "0.65": 0.623823491941574,
+          "0.70": 0.5738615527738441,
+          "0.75": 0.5209878560465862,
+          "0.80": 0.4528933994424163,
+          "0.85": 0.24625799068346657,
+          "0.90": 0.050064410141971966,
+          "0.95": 0.0007661046134090195
+        }
+      },
+      "localization_error_on_matched_boxes": {
+        "matched_count": 131,
+        "mean_absolute_xyxy_error_px": 5.654947586641967,
+        "mean_iou": 0.8073853013982595
+      },
+      "confidence_distribution": {
+        "count": 279,
+        "min": 0.25071126222610474,
+        "q25": 0.34955646097660065,
+        "median": 0.5183711647987366,
+        "q75": 0.8276019394397736,
+        "max": 0.991766631603241
+      },
+      "board_metrics": {
+        "pcb14": {
+          "gt": 50,
+          "tp": 41,
+          "recall": 0.82
+        },
+        "pcb16": {
+          "gt": 8,
+          "tp": 7,
+          "recall": 0.875
+        },
+        "pcb17": {
+          "gt": 95,
+          "tp": 83,
+          "recall": 0.8736842105263158
+        }
+      },
+      "inference_latency_ms": {
+        "mean": 71.94239592146394,
+        "median": 21.315833495464176,
+        "p95": 269.1974432702407
+      },
+      "peak_process_rss_bytes": 1956577280,
+      "visualizations": {
+        "pr_curve": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-191800-ccb464/phase-e/validation-raw/precision_recall.png",
+        "confusion_matrix": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-191800-ccb464/phase-e/validation-raw/confusion_matrix.png",
+        "comparisons": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-191800-ccb464/phase-e/validation-raw/comparisons"
+      },
+      "failure_examples": {
+        "false_positive_images": [
+          [
+            18,
+            "pcb14:rec5"
+          ],
+          [
+            17,
+            "pcb14:rec3"
+          ],
+          [
+            17,
+            "pcb14:rec1"
+          ],
+          [
+            14,
+            "pcb16:rec4"
+          ],
+          [
+            14,
+            "pcb14:rec4"
+          ],
+          [
+            12,
+            "pcb16:rec3"
+          ],
+          [
+            12,
+            "pcb16:rec2"
+          ],
+          [
+            12,
+            "pcb14:rec2"
+          ],
+          [
+            7,
+            "pcb16:rec1"
+          ],
+          [
+            6,
+            "pcb17:rec4"
+          ],
+          [
+            5,
+            "pcb17:rec5"
+          ],
+          [
+            5,
+            "pcb17:rec3"
+          ]
+        ],
+        "false_negative_images": [
+          [
+            6,
+            "pcb17:rec1"
+          ],
+          [
+            4,
+            "pcb17:rec3"
+          ],
+          [
+            2,
+            "pcb14:rec5"
+          ],
+          [
+            2,
+            "pcb14:rec4"
+          ],
+          [
+            2,
+            "pcb14:rec3"
+          ],
+          [
+            2,
+            "pcb14:rec1"
+          ],
+          [
+            1,
+            "pcb17:rec5"
+          ],
+          [
+            1,
+            "pcb17:rec4"
+          ],
+          [
+            1,
+            "pcb16:rec2"
+          ],
+          [
+            1,
+            "pcb14:rec2"
+          ]
+        ]
+      },
+      "ground_truth_status": "SOURCE_PROVIDED_UNADJUDICATED",
+      "interpretation": "Experimental source-label agreement only; not independently adjudicated generalization accuracy."
+    },
+    "yolo26s_raw": {
+      "schema_version": "circuitcare.pcb-dslr-component-model-evaluation.v2",
+      "dataset_id": "pcb-dslr-part1-ic-research-v1",
+      "dataset_version": "Zenodo record 3886553, archive part 1",
+      "dataset_manifest_sha256": "a17c9e050f781b5b6882999d4488e990f68cebe432d0ac28b7552b4cdc164b05",
+      "split": "validation",
+      "image_count": 14,
+      "board_count": 3,
+      "board_ids": [
+        "pcb14",
+        "pcb16",
+        "pcb17"
+      ],
+      "annotation_count": 153,
+      "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/weights/best.pt",
+      "model_class_contract": [
+        "integrated_circuit"
+      ],
+      "prediction_head": "raw",
+      "image_size": 640,
+      "device": "mps",
+      "confidence_threshold": 0.25,
+      "nms_iou": 0.45,
+      "metric_iou": 0.5,
+      "metrics": {
+        "precision": 0.41210374639769454,
+        "recall": 0.934640522875817,
+        "f1": 0.572,
+        "mAP50": 0.7698806939676908,
+        "mAP50_95": 0.5346251992213433,
+        "ap_by_iou": {
+          "0.50": 0.7698806939676908,
+          "0.55": 0.7568942745961252,
+          "0.60": 0.7326523229782673,
+          "0.65": 0.7033174777193708,
+          "0.70": 0.6759952113279467,
+          "0.75": 0.5903567539856905,
+          "0.80": 0.49924821555568566,
+          "0.85": 0.42237781750121267,
+          "0.90": 0.18107402906189238,
+          "0.95": 0.014455195519551956
+        },
+        "tp": 143,
+        "fp": 204,
+        "fn": 10,
+        "small_object_recall": 0.927536231884058,
+        "small_object_gt_count": 138,
+        "small_object_tp": 128,
+        "small_object_fn": 10,
+        "small_object_AP50": 0.7261733210541731,
+        "small_object_AP50_95": 0.4874917441522502,
+        "small_object_ap_by_iou": {
+          "0.50": 0.7261733210541731,
+          "0.55": 0.7123990626767392,
+          "0.60": 0.6852994238175054,
+          "0.65": 0.6552400759741647,
+          "0.70": 0.624575712507764,
+          "0.75": 0.5348904431334194,
+          "0.80": 0.4382782537394142,
+          "0.85": 0.36013491215566146,
+          "0.90": 0.12528651440091232,
+          "0.95": 0.012639722062748632
+        }
+      },
+      "localization_error_on_matched_boxes": {
+        "matched_count": 143,
+        "mean_absolute_xyxy_error_px": 4.966904486809577,
+        "mean_iou": 0.8210121244972538
+      },
+      "confidence_distribution": {
+        "count": 347,
+        "min": 0.25027063488960266,
+        "q25": 0.3616696149110794,
+        "median": 0.5668363571166992,
+        "q75": 0.7403152585029602,
+        "max": 0.9235616326332092
+      },
+      "board_metrics": {
+        "pcb14": {
+          "gt": 50,
+          "tp": 42,
+          "recall": 0.84
+        },
+        "pcb16": {
+          "gt": 8,
+          "tp": 7,
+          "recall": 0.875
+        },
+        "pcb17": {
+          "gt": 95,
+          "tp": 94,
+          "recall": 0.9894736842105263
+        }
+      },
+      "inference_latency_ms": {
+        "mean": 83.36170550319366,
+        "median": 22.81360450433567,
+        "p95": 320.66162086848607
+      },
+      "peak_process_rss_bytes": 1960607744,
+      "visualizations": {
+        "pr_curve": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/validation-raw/precision_recall.png",
+        "confusion_matrix": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/validation-raw/confusion_matrix.png",
+        "comparisons": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/validation-raw/comparisons"
+      },
+      "failure_examples": {
+        "false_positive_images": [
+          [
+            27,
+            "pcb14:rec4"
+          ],
+          [
+            27,
+            "pcb14:rec3"
+          ],
+          [
+            22,
+            "pcb14:rec5"
+          ],
+          [
+            21,
+            "pcb14:rec2"
+          ],
+          [
+            20,
+            "pcb14:rec1"
+          ],
+          [
+            18,
+            "pcb16:rec2"
+          ],
+          [
+            15,
+            "pcb16:rec4"
+          ],
+          [
+            11,
+            "pcb17:rec2"
+          ],
+          [
+            9,
+            "pcb17:rec5"
+          ],
+          [
+            9,
+            "pcb16:rec3"
+          ],
+          [
+            8,
+            "pcb17:rec4"
+          ],
+          [
+            7,
+            "pcb17:rec3"
+          ]
+        ],
+        "false_negative_images": [
+          [
+            2,
+            "pcb14:rec5"
+          ],
+          [
+            2,
+            "pcb14:rec4"
+          ],
+          [
+            2,
+            "pcb14:rec1"
+          ],
+          [
+            1,
+            "pcb17:rec1"
+          ],
+          [
+            1,
+            "pcb16:rec1"
+          ],
+          [
+            1,
+            "pcb14:rec3"
+          ],
+          [
+            1,
+            "pcb14:rec2"
+          ]
+        ]
+      },
+      "ground_truth_status": "SOURCE_PROVIDED_UNADJUDICATED",
+      "interpretation": "Experimental source-label agreement only; not independently adjudicated generalization accuracy."
+    },
+    "yolo26s_nms_free": {
+      "schema_version": "circuitcare.pcb-dslr-component-model-evaluation.v2",
+      "dataset_id": "pcb-dslr-part1-ic-research-v1",
+      "dataset_version": "Zenodo record 3886553, archive part 1",
+      "dataset_manifest_sha256": "a17c9e050f781b5b6882999d4488e990f68cebe432d0ac28b7552b4cdc164b05",
+      "split": "validation",
+      "image_count": 14,
+      "board_count": 3,
+      "board_ids": [
+        "pcb14",
+        "pcb16",
+        "pcb17"
+      ],
+      "annotation_count": 153,
+      "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/weights/best.pt",
+      "model_class_contract": [
+        "integrated_circuit"
+      ],
+      "prediction_head": "nms-free",
+      "image_size": 640,
+      "device": "mps",
+      "confidence_threshold": 0.25,
+      "nms_iou": null,
+      "metric_iou": 0.5,
+      "metrics": {
+        "precision": 0.40988372093023256,
+        "recall": 0.9215686274509803,
+        "f1": 0.5674044265593562,
+        "mAP50": 0.7786509850110448,
+        "mAP50_95": 0.5227110298199888,
+        "ap_by_iou": {
+          "0.50": 0.7786509850110448,
+          "0.55": 0.764312308621811,
+          "0.60": 0.7532567071463235,
+          "0.65": 0.7223134633956417,
+          "0.70": 0.6677475805042402,
+          "0.75": 0.5560354158280253,
+          "0.80": 0.4605679129206879,
+          "0.85": 0.3773084738865811,
+          "0.90": 0.14040028676999736,
+          "0.95": 0.006517164115534985
+        },
+        "tp": 141,
+        "fp": 203,
+        "fn": 12,
+        "small_object_recall": 0.9130434782608695,
+        "small_object_gt_count": 138,
+        "small_object_tp": 126,
+        "small_object_fn": 12,
+        "small_object_AP50": 0.7430174863101864,
+        "small_object_AP50_95": 0.4841089693126084,
+        "small_object_ap_by_iou": {
+          "0.50": 0.7430174863101864,
+          "0.55": 0.726864636784039,
+          "0.60": 0.716096959360007,
+          "0.65": 0.6821256744206112,
+          "0.70": 0.6231417567747498,
+          "0.75": 0.5056518433557684,
+          "0.80": 0.40732181300530546,
+          "0.85": 0.3200013804960532,
+          "0.90": 0.1124152577985375,
+          "0.95": 0.004452884820826035
+        }
+      },
+      "localization_error_on_matched_boxes": {
+        "matched_count": 141,
+        "mean_absolute_xyxy_error_px": 5.275517619247978,
+        "mean_iou": 0.8152237638798567
+      },
+      "confidence_distribution": {
+        "count": 344,
+        "min": 0.2500314712524414,
+        "q25": 0.3399301841855049,
+        "median": 0.5139992535114288,
+        "q75": 0.6976862400770187,
+        "max": 0.9399555325508118
+      },
+      "board_metrics": {
+        "pcb14": {
+          "gt": 50,
+          "tp": 42,
+          "recall": 0.84
+        },
+        "pcb16": {
+          "gt": 8,
+          "tp": 7,
+          "recall": 0.875
+        },
+        "pcb17": {
+          "gt": 95,
+          "tp": 92,
+          "recall": 0.968421052631579
+        }
+      },
+      "inference_latency_ms": {
+        "mean": 48.57427378634124,
+        "median": 23.634875018615276,
+        "p95": 144.88854374212667
+      },
+      "peak_process_rss_bytes": 1871413248,
+      "visualizations": {
+        "pr_curve": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/validation-nms-free/precision_recall.png",
+        "confusion_matrix": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/validation-nms-free/confusion_matrix.png",
+        "comparisons": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/validation-nms-free/comparisons"
+      },
+      "failure_examples": {
+        "false_positive_images": [
+          [
+            26,
+            "pcb14:rec4"
+          ],
+          [
+            26,
+            "pcb14:rec3"
+          ],
+          [
+            24,
+            "pcb14:rec2"
+          ],
+          [
+            20,
+            "pcb14:rec5"
+          ],
+          [
+            19,
+            "pcb14:rec1"
+          ],
+          [
+            13,
+            "pcb17:rec4"
+          ],
+          [
+            13,
+            "pcb17:rec2"
+          ],
+          [
+            13,
+            "pcb16:rec2"
+          ],
+          [
+            12,
+            "pcb16:rec4"
+          ],
+          [
+            9,
+            "pcb17:rec3"
+          ],
+          [
+            8,
+            "pcb17:rec5"
+          ],
+          [
+            8,
+            "pcb16:rec3"
+          ]
+        ],
+        "false_negative_images": [
+          [
+            2,
+            "pcb14:rec5"
+          ],
+          [
+            2,
+            "pcb14:rec4"
+          ],
+          [
+            2,
+            "pcb14:rec1"
+          ],
+          [
+            1,
+            "pcb17:rec5"
+          ],
+          [
+            1,
+            "pcb17:rec3"
+          ],
+          [
+            1,
+            "pcb17:rec1"
+          ],
+          [
+            1,
+            "pcb16:rec1"
+          ],
+          [
+            1,
+            "pcb14:rec3"
+          ],
+          [
+            1,
+            "pcb14:rec2"
+          ]
+        ]
+      },
+      "ground_truth_status": "SOURCE_PROVIDED_UNADJUDICATED",
+      "interpretation": "Experimental source-label agreement only; not independently adjudicated generalization accuracy."
+    },
+    "kaggle_yolo26s": {
+      "schema_version": "circuitcare.kaggle-source-only-evaluation.v1",
+      "status": "DEVELOPMENT_ONLY_SOURCE_LABEL_METRICS",
+      "dataset_status": "EXPLORATORY_SOURCE_LABELS",
+      "images": {
+        "validation": 261,
+        "train": 1035
+      },
+      "groups": {
+        "train_component_groups": 44,
+        "validation_component_groups": 75,
+        "train_filename_groups": 344,
+        "validation_filename_groups": 87
+      },
+      "physical_boards": "UNVERIFIED",
+      "sealed_test": "NOT_AVAILABLE",
+      "empty_annotation_excluded": 114,
+      "source_classes": [
+        "Cap1",
+        "Cap2",
+        "Cap3",
+        "Cap4",
+        "MOSFET",
+        "Mov",
+        "Resestor",
+        "Resistor",
+        "Transformer"
+      ],
+      "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-193555-37ad49/weights/best.pt",
+      "imgsz": 640,
+      "device": "mps",
+      "confidence_threshold": "Ultralytics validation default; see evaluator version and run args",
+      "overall": {
+        "precision": 0.9769466988669993,
+        "recall": 0.9251606963044147,
+        "mAP50": 0.963499658708904,
+        "mAP50_95": 0.632599104807426
+      },
+      "per_class": {
+        "Cap1": {
+          "validation_boxes": 260,
+          "precision": 1.0,
+          "recall": 0.9837706579198423,
+          "AP50": 0.9949613899613899,
+          "AP50_95": 0.7365884870989251,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Cap2": {
+          "validation_boxes": 255,
+          "precision": 0.976305226905954,
+          "recall": 0.9803921568627451,
+          "AP50": 0.9856929282868673,
+          "AP50_95": 0.6069174080060463,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Cap3": {
+          "validation_boxes": 241,
+          "precision": 0.9469885520289081,
+          "recall": 0.8894905588475249,
+          "AP50": 0.924351284190422,
+          "AP50_95": 0.6366593886421861,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Cap4": {
+          "validation_boxes": 237,
+          "precision": 0.9370944293948847,
+          "recall": 0.8987341772151899,
+          "AP50": 0.9427749858866049,
+          "AP50_95": 0.6172532466530474,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "MOSFET": {
+          "validation_boxes": 261,
+          "precision": 0.9768112598490732,
+          "recall": 0.9616858237547893,
+          "AP50": 0.9831479405592687,
+          "AP50_95": 0.6470963832787765,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Mov": {
+          "validation_boxes": 261,
+          "precision": 0.9922867164460277,
+          "recall": 0.9857997806044153,
+          "AP50": 0.9942644569188274,
+          "AP50_95": 0.6449625967911594,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Resestor": {
+          "validation_boxes": 0,
+          "precision": null,
+          "recall": null,
+          "AP50": null,
+          "AP50_95": null,
+          "status": "NO_VALIDATION_SUPPORT"
+        },
+        "Resistor": {
+          "validation_boxes": 232,
+          "precision": 1.0,
+          "recall": 0.739897866850016,
+          "AP50": 0.8889244022758425,
+          "AP50_95": 0.47718854193655436,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Transformer": {
+          "validation_boxes": 516,
+          "precision": 0.9860874063111468,
+          "recall": 0.9615145483807941,
+          "AP50": 0.9938798815920092,
+          "AP50_95": 0.6941267860527123,
+          "status": "MEASURED_SOURCE_LABELS"
+        }
+      },
+      "caveats": [
+        "Source annotations are not fully reviewed or guaranteed complete.",
+        "No physical board identity or independent sealed test is available.",
+        "The connected duplicate/ORB groups are conservative visual groups, not verified board IDs.",
+        "These metrics are agreement with source labels, not adjudicated truth.",
+        "Connected visual groups do not establish physical PCB identity.",
+        "Do not compare directly with the single-class PCB-DSLR metrics."
+      ],
+      "ultralytics_artifacts_dir": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-193555-37ad49/phase-e/kaggle-development"
+    }
+  },
+  "onnx_benchmark": {
+    "schema_version": "circuitcare.phase21-3-2-e-onnx-benchmark.v1",
+    "dataset_manifest_sha256": "a17c9e050f781b5b6882999d4488e990f68cebe432d0ac28b7552b4cdc164b05",
+    "dataset_split": "validation",
+    "previously_exposed_test_used": false,
+    "image_count": 14,
+    "board_count": 3,
+    "model_summary": {
+      "yolov8s": {
+        "architecture": "best",
+        "parameters_including_all_heads": 11135987,
+        "gflops_one_to_many_640": 28.642048,
+        "gflops_one_to_one_640": null,
+        "checkpoint_size_bytes": 22517681,
+        "checkpoint_sha256": "0fc9e441887bac42af97bce4065f51ac5f2f007d4df0eee3ac85499fba4348d2"
+      },
+      "yolo26s": {
+        "architecture": "yolo26s.yaml",
+        "parameters_including_all_heads": 9948638,
+        "gflops_one_to_many_640": 22.7395584,
+        "gflops_one_to_one_640": 22.7395584,
+        "checkpoint_size_bytes": 20331311,
+        "checkpoint_sha256": "2823097bbfa78419ae2cad75041676020b1b3d858e86abde9fa11e9621748d38"
+      }
+    },
+    "fixed_tolerance": {
+      "minimum_detection_iou": 0.8,
+      "maximum_confidence_abs_error": 0.05,
+      "maximum_box_coordinate_error_px": 4.0
+    },
+    "exports": {
+      "yolov8_raw": {
+        "weights": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-191800-ccb464/weights/best.pt",
+        "weights_sha256": "0fc9e441887bac42af97bce4065f51ac5f2f007d4df0eee3ac85499fba4348d2",
+        "onnx": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/onnx-comparison/yolov8s-raw.onnx",
+        "onnx_sha256": "558313e9c21e50d07fb723c41ae1a6477b2da43b1608cd17aaa075b742657e37",
+        "onnx_size_bytes": 44719456,
+        "ultralytics": "8.4.203",
+        "requested_nms": null,
+        "onnx_inputs": [
+          {
+            "name": "images",
+            "shape": [
+              1,
+              3,
+              640,
+              640
+            ],
+            "type": "tensor(float)"
+          }
+        ],
+        "onnx_outputs": [
+          {
+            "name": "output0",
+            "shape": [
+              1,
+              5,
+              8400
+            ],
+            "type": "tensor(float)"
+          }
+        ],
+        "providers": [
+          "CPUExecutionProvider"
+        ]
+      },
+      "yolo26_raw": {
+        "weights": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/weights/best.pt",
+        "weights_sha256": "2823097bbfa78419ae2cad75041676020b1b3d858e86abde9fa11e9621748d38",
+        "onnx": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/onnx-comparison/yolo26s-raw.onnx",
+        "onnx_sha256": "f9159d39394090b98c2fc32661f2e3335e0ca0aea6e06cb2b95f3aabfcfa1851",
+        "onnx_size_bytes": 38109825,
+        "ultralytics": "8.4.203",
+        "requested_nms": null,
+        "onnx_inputs": [
+          {
+            "name": "images",
+            "shape": [
+              1,
+              3,
+              640,
+              640
+            ],
+            "type": "tensor(float)"
+          }
+        ],
+        "onnx_outputs": [
+          {
+            "name": "output0",
+            "shape": [
+              1,
+              5,
+              8400
+            ],
+            "type": "tensor(float)"
+          }
+        ],
+        "providers": [
+          "CPUExecutionProvider"
+        ]
+      },
+      "yolo26_nms_free": {
+        "weights": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/weights/best.pt",
+        "weights_sha256": "2823097bbfa78419ae2cad75041676020b1b3d858e86abde9fa11e9621748d38",
+        "onnx": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/onnx-comparison/yolo26s-nms-free.onnx",
+        "onnx_sha256": "75e1feb2d3030a8c4511fe9c842b88927a7a1f09b7a4594ef84e86192c2337a9",
+        "onnx_size_bytes": 38119531,
+        "ultralytics": "8.4.203",
+        "requested_nms": false,
+        "onnx_inputs": [
+          {
+            "name": "images",
+            "shape": [
+              1,
+              3,
+              640,
+              640
+            ],
+            "type": "tensor(float)"
+          }
+        ],
+        "onnx_outputs": [
+          {
+            "name": "output0",
+            "shape": [
+              1,
+              300,
+              6
+            ],
+            "type": "tensor(float)"
+          }
+        ],
+        "one_to_one_adapter": {
+          "decoded_dummy_detection_count": 0,
+          "adapter": "decode_nms_free_output",
+          "applies_nms": false
+        },
+        "providers": [
+          "CPUExecutionProvider"
+        ]
+      }
+    },
+    "parity": {
+      "yolov8s": {
+        "raw_mps_vs_onnx_cpu": {
+          "images": 14,
+          "strict_all_detections_match": false,
+          "complete_match_images": 11
+        },
+        "raw_cpu_vs_onnx_cpu": {
+          "images": 14,
+          "strict_all_detections_match": false,
+          "complete_match_images": 11
+        }
+      },
+      "yolo26s": {
+        "raw_mps_vs_onnx_cpu": {
+          "image_count": 14,
+          "all_detections_within_tolerance": false,
+          "complete_match_images": 6
+        },
+        "raw_cpu_vs_onnx_cpu": {
+          "image_count": 14,
+          "all_detections_within_tolerance": false,
+          "complete_match_images": 6
+        },
+        "nmsfree_mps_vs_onnx_cpu": {
+          "image_count": 14,
+          "all_detections_within_tolerance": false,
+          "complete_match_images": 6
+        },
+        "nmsfree_cpu_vs_onnx_cpu": {
+          "image_count": 14,
+          "all_detections_within_tolerance": false,
+          "complete_match_images": 6
+        }
+      },
+      "confidence_0_50_diagnostic": {
+        "yolov8s_complete_images": 12,
+        "yolo26s_raw_complete_images": 12,
+        "yolo26s_nmsfree_complete_images": 11,
+        "image_count": 14,
+        "note": "Diagnostic only; primary parity reporting remains at the preregistered confidence 0.25."
+      }
+    },
+    "same_image_head_overlay_summary": {
+      "per_image": [
+        {
+          "image_id": "pcb14:rec1",
+          "ground_truth": 10,
+          "yolov8s_detected": 8,
+          "yolo26s_detected": 8,
+          "yolov8s_fp": 17,
+          "yolo26s_fp": 20
+        },
+        {
+          "image_id": "pcb14:rec2",
+          "ground_truth": 10,
+          "yolov8s_detected": 9,
+          "yolo26s_detected": 9,
+          "yolov8s_fp": 12,
+          "yolo26s_fp": 21
+        },
+        {
+          "image_id": "pcb14:rec3",
+          "ground_truth": 10,
+          "yolov8s_detected": 8,
+          "yolo26s_detected": 9,
+          "yolov8s_fp": 17,
+          "yolo26s_fp": 27
+        },
+        {
+          "image_id": "pcb14:rec4",
+          "ground_truth": 10,
+          "yolov8s_detected": 8,
+          "yolo26s_detected": 8,
+          "yolov8s_fp": 14,
+          "yolo26s_fp": 27
+        },
+        {
+          "image_id": "pcb14:rec5",
+          "ground_truth": 10,
+          "yolov8s_detected": 8,
+          "yolo26s_detected": 8,
+          "yolov8s_fp": 18,
+          "yolo26s_fp": 22
+        },
+        {
+          "image_id": "pcb16:rec1",
+          "ground_truth": 2,
+          "yolov8s_detected": 2,
+          "yolo26s_detected": 1,
+          "yolov8s_fp": 7,
+          "yolo26s_fp": 6
+        },
+        {
+          "image_id": "pcb16:rec2",
+          "ground_truth": 2,
+          "yolov8s_detected": 1,
+          "yolo26s_detected": 2,
+          "yolov8s_fp": 12,
+          "yolo26s_fp": 18
+        },
+        {
+          "image_id": "pcb16:rec3",
+          "ground_truth": 2,
+          "yolov8s_detected": 2,
+          "yolo26s_detected": 2,
+          "yolov8s_fp": 12,
+          "yolo26s_fp": 9
+        },
+        {
+          "image_id": "pcb16:rec4",
+          "ground_truth": 2,
+          "yolov8s_detected": 2,
+          "yolo26s_detected": 2,
+          "yolov8s_fp": 14,
+          "yolo26s_fp": 15
+        },
+        {
+          "image_id": "pcb17:rec1",
+          "ground_truth": 19,
+          "yolov8s_detected": 13,
+          "yolo26s_detected": 18,
+          "yolov8s_fp": 4,
+          "yolo26s_fp": 4
+        },
+        {
+          "image_id": "pcb17:rec2",
+          "ground_truth": 19,
+          "yolov8s_detected": 19,
+          "yolo26s_detected": 19,
+          "yolov8s_fp": 5,
+          "yolo26s_fp": 11
+        },
+        {
+          "image_id": "pcb17:rec3",
+          "ground_truth": 19,
+          "yolov8s_detected": 15,
+          "yolo26s_detected": 19,
+          "yolov8s_fp": 5,
+          "yolo26s_fp": 7
+        },
+        {
+          "image_id": "pcb17:rec4",
+          "ground_truth": 19,
+          "yolov8s_detected": 18,
+          "yolo26s_detected": 19,
+          "yolov8s_fp": 6,
+          "yolo26s_fp": 8
+        },
+        {
+          "image_id": "pcb17:rec5",
+          "ground_truth": 19,
+          "yolov8s_detected": 18,
+          "yolo26s_detected": 19,
+          "yolov8s_fp": 5,
+          "yolo26s_fp": 9
+        }
+      ],
+      "gt_missed_by_yolov8_recovered_by_yolo26": [
+        "pcb14:rec2:7",
+        "pcb14:rec3:7",
+        "pcb16:rec2:0",
+        "pcb17:rec1:8",
+        "pcb17:rec1:11",
+        "pcb17:rec1:14",
+        "pcb17:rec1:15",
+        "pcb17:rec1:18",
+        "pcb17:rec3:9",
+        "pcb17:rec3:18",
+        "pcb17:rec3:11",
+        "pcb17:rec3:12",
+        "pcb17:rec4:11",
+        "pcb17:rec5:12"
+      ],
+      "gt_missed_by_yolo26_recovered_by_yolov8": [
+        "pcb14:rec2:9",
+        "pcb16:rec1:0"
+      ],
+      "overlay_dir": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/onnx-comparison/same-image-head-overlays"
+    },
+    "detail_paths": {
+      "yolov8s": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/onnx-comparison/parity/yolov8s/onnx-parity.json",
+      "yolo26s": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/onnx-comparison/parity/yolo26s/onnx-parity.json"
+    },
+    "performance": {
+      "yolov8s_raw_pt": {
+        "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-191800-ccb464/weights/best.pt",
+        "model_sha256": "0fc9e441887bac42af97bce4065f51ac5f2f007d4df0eee3ac85499fba4348d2",
+        "head": "raw",
+        "device": "mps",
+        "backend": "PyTorch MPS",
+        "imgsz": 640,
+        "batch": 1,
+        "confidence_threshold": 0.25,
+        "nms_iou": 0.45,
+        "warmup_calls": 10,
+        "timed_calls": 100,
+        "first_call_ms": 136.56420801999047,
+        "end_to_end": {
+          "median_ms": 20.877542003290728,
+          "p95_ms": 22.10470174322836,
+          "mean_ms": 20.899838372133672,
+          "count": 100,
+          "images_per_second": 47.84725997371001
+        },
+        "phase": {
+          "preprocess": {
+            "median_ms": 1.6721669817343354,
+            "p95_ms": 1.9185812183422968,
+            "mean_ms": 1.6543346620164812,
+            "count": 100
+          },
+          "inference": {
+            "median_ms": 10.93543748720549,
+            "p95_ms": 11.657549429219216,
+            "mean_ms": 11.041990797384642,
+            "count": 100
+          },
+          "postprocess": {
+            "median_ms": 1.8518750148359686,
+            "p95_ms": 2.535508380969986,
+            "mean_ms": 1.836170379538089,
+            "count": 100
+          }
+        },
+        "peak_process_rss_bytes": 2353692672,
+        "model_size_bytes": 22517681
+      },
+      "yolov8s_raw_onnx": {
+        "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/onnx-comparison/yolov8s-raw.onnx",
+        "model_sha256": null,
+        "head": "raw",
+        "device": "cpu",
+        "backend": "ONNX Runtime CPU",
+        "imgsz": 640,
+        "batch": 1,
+        "confidence_threshold": 0.25,
+        "nms_iou": 0.45,
+        "warmup_calls": 10,
+        "timed_calls": 100,
+        "first_call_ms": 85.90854197973385,
+        "end_to_end": {
+          "median_ms": 56.950479513034225,
+          "p95_ms": 65.0671854877146,
+          "mean_ms": 57.343492918880656,
+          "count": 100,
+          "images_per_second": 17.438770278863576
+        },
+        "phase": {
+          "preprocess": {
+            "median_ms": 1.2010210193693638,
+            "p95_ms": 1.4278937655035406,
+            "mean_ms": 1.2241695710690692,
+            "count": 100
+          },
+          "inference": {
+            "median_ms": 46.38318749493919,
+            "p95_ms": 54.08336318505462,
+            "mean_ms": 47.45341258181725,
+            "count": 100
+          },
+          "postprocess": {
+            "median_ms": 0.3350209735799581,
+            "p95_ms": 0.5310726031893864,
+            "mean_ms": 0.37327869969885796,
+            "count": 100
+          }
+        },
+        "peak_process_rss_bytes": 2345369600,
+        "model_size_bytes": 44719456
+      },
+      "yolo26s_raw_pt": {
+        "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/weights/best.pt",
+        "model_sha256": "2823097bbfa78419ae2cad75041676020b1b3d858e86abde9fa11e9621748d38",
+        "head": "raw",
+        "device": "mps",
+        "backend": "PyTorch MPS",
+        "imgsz": 640,
+        "batch": 1,
+        "confidence_threshold": 0.25,
+        "nms_iou": 0.45,
+        "warmup_calls": 10,
+        "timed_calls": 100,
+        "first_call_ms": 134.82179102720693,
+        "end_to_end": {
+          "median_ms": 22.128291515400633,
+          "p95_ms": 23.29010179382749,
+          "mean_ms": 22.115153400227427,
+          "count": 100,
+          "images_per_second": 45.21786405468552
+        },
+        "phase": {
+          "preprocess": {
+            "median_ms": 1.5091875102370977,
+            "p95_ms": 2.108546457020566,
+            "mean_ms": 1.6200504312291741,
+            "count": 100
+          },
+          "inference": {
+            "median_ms": 12.08700001006946,
+            "p95_ms": 13.04730685078539,
+            "mean_ms": 12.278639989672229,
+            "count": 100
+          },
+          "postprocess": {
+            "median_ms": 1.749208488035947,
+            "p95_ms": 2.6121380913536996,
+            "mean_ms": 1.8218408228131011,
+            "count": 100
+          }
+        },
+        "peak_process_rss_bytes": 2346172416,
+        "model_size_bytes": 20331311
+      },
+      "yolo26s_raw_onnx": {
+        "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/onnx-comparison/yolo26s-raw.onnx",
+        "model_sha256": null,
+        "head": "raw",
+        "device": "cpu",
+        "backend": "ONNX Runtime CPU",
+        "imgsz": 640,
+        "batch": 1,
+        "confidence_threshold": 0.25,
+        "nms_iou": 0.45,
+        "warmup_calls": 10,
+        "timed_calls": 100,
+        "first_call_ms": 73.76620802097023,
+        "end_to_end": {
+          "median_ms": 43.8288540171925,
+          "p95_ms": 49.42949408723507,
+          "mean_ms": 45.25517836736981,
+          "count": 100,
+          "images_per_second": 22.096918763246478
+        },
+        "phase": {
+          "preprocess": {
+            "median_ms": 1.2201039935462177,
+            "p95_ms": 1.4026309683686122,
+            "mean_ms": 1.3067975593730807,
+            "count": 100
+          },
+          "inference": {
+            "median_ms": 34.70604197354987,
+            "p95_ms": 38.446930595091544,
+            "mean_ms": 35.79429832811002,
+            "count": 100
+          },
+          "postprocess": {
+            "median_ms": 0.3070419770665467,
+            "p95_ms": 0.46420657890848815,
+            "mean_ms": 0.3331058396724984,
+            "count": 100
+          }
+        },
+        "peak_process_rss_bytes": 2459222016,
+        "model_size_bytes": 38109825
+      },
+      "yolo26s_nmsfree_pt": {
+        "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/weights/best.pt",
+        "model_sha256": "2823097bbfa78419ae2cad75041676020b1b3d858e86abde9fa11e9621748d38",
+        "head": "yolo26_nms_free",
+        "device": "mps",
+        "backend": "PyTorch MPS",
+        "imgsz": 640,
+        "batch": 1,
+        "confidence_threshold": 0.25,
+        "nms_iou": null,
+        "warmup_calls": 10,
+        "timed_calls": 100,
+        "first_call_ms": 132.8174580121413,
+        "end_to_end": {
+          "median_ms": 21.03229201748036,
+          "p95_ms": 22.070958354743198,
+          "mean_ms": 21.08484085300006,
+          "count": 100,
+          "images_per_second": 47.42743883967779
+        },
+        "phase": {
+          "preprocess": {
+            "median_ms": 1.556104514747858,
+            "p95_ms": 1.8963993556099012,
+            "mean_ms": 1.6263920988421887,
+            "count": 100
+          },
+          "inference": {
+            "median_ms": 12.327457981882617,
+            "p95_ms": 13.154256605776027,
+            "mean_ms": 12.466374116484076,
+            "count": 100
+          },
+          "postprocess": {
+            "median_ms": 0.83758300752379,
+            "p95_ms": 0.9835288627073169,
+            "mean_ms": 0.7525145693216473,
+            "count": 100
+          }
+        },
+        "peak_process_rss_bytes": 2513567744,
+        "model_size_bytes": 20331311
+      },
+      "yolo26s_nmsfree_onnx": {
+        "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-192334-c62b65/phase-e/onnx-comparison/yolo26s-nms-free.onnx",
+        "model_sha256": null,
+        "head": "yolo26_nms_free",
+        "device": "cpu",
+        "backend": "ONNX Runtime CPU",
+        "imgsz": 640,
+        "batch": 1,
+        "confidence_threshold": 0.25,
+        "nms_iou": null,
+        "warmup_calls": 10,
+        "timed_calls": 100,
+        "first_call_ms": 81.25283301342279,
+        "end_to_end": {
+          "median_ms": 42.73652099072933,
+          "p95_ms": 48.51689340430312,
+          "mean_ms": 43.583472105674446,
+          "count": 100,
+          "images_per_second": 22.944477612415895
+        },
+        "phase": {
+          "preprocess": {
+            "median_ms": 1.2252289743628353,
+            "p95_ms": 1.481587201124057,
+            "mean_ms": 1.2587359105236828,
+            "count": 100
+          },
+          "inference": {
+            "median_ms": 33.93847949337214,
+            "p95_ms": 39.63529377360828,
+            "mean_ms": 34.60597753117327,
+            "count": 100
+          },
+          "postprocess": {
+            "median_ms": 0.11737499153241515,
+            "p95_ms": 0.18099551380146295,
+            "mean_ms": 0.12396832287777215,
+            "count": 100
+          }
+        },
+        "peak_process_rss_bytes": 2752544768,
+        "model_size_bytes": 38119531
+      }
+    }
+  },
+  "kaggle_source_only": {
+    "comparison_baseline": "YOLOv8s Phase D run 20261106-184118-08e6b8",
+    "yolo26s_run": "20261106-193555-37ad49",
+    "dataset": "kaggle-source-only-yolov8s-dev-v1",
+    "candidate_images": 1410,
+    "unreviewed_images": 1410,
+    "training_validation_images": 1296,
+    "train_images": 1035,
+    "validation_images": 261,
+    "empty_annotations_excluded": 114,
+    "physical_board_ids": "UNVERIFIED",
+    "sealed_test": "NOT_AVAILABLE",
+    "source_classes": [
+      "Cap1",
+      "Cap2",
+      "Cap3",
+      "Cap4",
+      "MOSFET",
+      "Mov",
+      "Resestor",
+      "Resistor",
+      "Transformer"
+    ],
+    "metrics": {
+      "schema_version": "circuitcare.kaggle-source-only-evaluation.v1",
+      "status": "DEVELOPMENT_ONLY_SOURCE_LABEL_METRICS",
+      "dataset_status": "EXPLORATORY_SOURCE_LABELS",
+      "images": {
+        "validation": 261,
+        "train": 1035
+      },
+      "groups": {
+        "train_component_groups": 44,
+        "validation_component_groups": 75,
+        "train_filename_groups": 344,
+        "validation_filename_groups": 87
+      },
+      "physical_boards": "UNVERIFIED",
+      "sealed_test": "NOT_AVAILABLE",
+      "empty_annotation_excluded": 114,
+      "source_classes": [
+        "Cap1",
+        "Cap2",
+        "Cap3",
+        "Cap4",
+        "MOSFET",
+        "Mov",
+        "Resestor",
+        "Resistor",
+        "Transformer"
+      ],
+      "model": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-193555-37ad49/weights/best.pt",
+      "imgsz": 640,
+      "device": "mps",
+      "confidence_threshold": "Ultralytics validation default; see evaluator version and run args",
+      "overall": {
+        "precision": 0.9769466988669993,
+        "recall": 0.9251606963044147,
+        "mAP50": 0.963499658708904,
+        "mAP50_95": 0.632599104807426
+      },
+      "per_class": {
+        "Cap1": {
+          "validation_boxes": 260,
+          "precision": 1.0,
+          "recall": 0.9837706579198423,
+          "AP50": 0.9949613899613899,
+          "AP50_95": 0.7365884870989251,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Cap2": {
+          "validation_boxes": 255,
+          "precision": 0.976305226905954,
+          "recall": 0.9803921568627451,
+          "AP50": 0.9856929282868673,
+          "AP50_95": 0.6069174080060463,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Cap3": {
+          "validation_boxes": 241,
+          "precision": 0.9469885520289081,
+          "recall": 0.8894905588475249,
+          "AP50": 0.924351284190422,
+          "AP50_95": 0.6366593886421861,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Cap4": {
+          "validation_boxes": 237,
+          "precision": 0.9370944293948847,
+          "recall": 0.8987341772151899,
+          "AP50": 0.9427749858866049,
+          "AP50_95": 0.6172532466530474,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "MOSFET": {
+          "validation_boxes": 261,
+          "precision": 0.9768112598490732,
+          "recall": 0.9616858237547893,
+          "AP50": 0.9831479405592687,
+          "AP50_95": 0.6470963832787765,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Mov": {
+          "validation_boxes": 261,
+          "precision": 0.9922867164460277,
+          "recall": 0.9857997806044153,
+          "AP50": 0.9942644569188274,
+          "AP50_95": 0.6449625967911594,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Resestor": {
+          "validation_boxes": 0,
+          "precision": null,
+          "recall": null,
+          "AP50": null,
+          "AP50_95": null,
+          "status": "NO_VALIDATION_SUPPORT"
+        },
+        "Resistor": {
+          "validation_boxes": 232,
+          "precision": 1.0,
+          "recall": 0.739897866850016,
+          "AP50": 0.8889244022758425,
+          "AP50_95": 0.47718854193655436,
+          "status": "MEASURED_SOURCE_LABELS"
+        },
+        "Transformer": {
+          "validation_boxes": 516,
+          "precision": 0.9860874063111468,
+          "recall": 0.9615145483807941,
+          "AP50": 0.9938798815920092,
+          "AP50_95": 0.6941267860527123,
+          "status": "MEASURED_SOURCE_LABELS"
+        }
+      },
+      "caveats": [
+        "Source annotations are not fully reviewed or guaranteed complete.",
+        "No physical board identity or independent sealed test is available.",
+        "The connected duplicate/ORB groups are conservative visual groups, not verified board IDs.",
+        "These metrics are agreement with source labels, not adjudicated truth.",
+        "Connected visual groups do not establish physical PCB identity.",
+        "Do not compare directly with the single-class PCB-DSLR metrics."
+      ],
+      "ultralytics_artifacts_dir": "/Users/hyunsu/Documents/ChatGPT/\ub300\ud68c/data/component_training/runs/20261106-193555-37ad49/phase-e/kaggle-development"
+    },
+    "human_image_review_performed": false
+  },
+  "decision": {
+    "production_model_changed": false,
+    "selected_deployment_winner": null,
+    "reason": [
+      "PCB validation has only three boards",
+      "YOLO26s recall gains trade off with more false positives at the fixed operating point",
+      "strict PyTorch-to-ONNX parity fails on multiple validation images for every tested path",
+      "Kaggle labels and physical-board identities are not adjudicated"
+    ],
+    "next_status": "Research comparison complete; deployment unchanged."
+  },
+  "limitations": [
+    "MPS reported nondeterministic operations; seed does not guarantee bit-identical reruns.",
+    "Source-provided PCB-DSLR labels are not independently adjudicated.",
+    "No test predictions or selection used the previously exposed test split.",
+    "Short local latency measurements are not production SLO measurements."
+  ]
+}

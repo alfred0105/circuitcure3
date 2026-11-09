@@ -1,0 +1,59 @@
+experiment_id: phase21-3-2-f-real-pcb-model-comparison
+status: BLOCKED_PENDING_FINAL_LABELS_AND_LOCKED_BOARD_SPLIT
+purpose: exploratory research comparison only; no production model change
+
+dataset:
+  id: null
+  manifest: null
+  annotation_status_required: FINALIZED
+  image_level_component_coverage_required: true
+  board_level_train_validation_test_split_required: true
+  separate_test_split_required: true
+
+models:
+  - id: yolov8s
+    framework: ultralytics
+    checkpoint: yolov8s.pt
+  - id: yolo26s
+    framework: ultralytics
+    checkpoint: yolo26s.pt
+  - id: yolo26m
+    framework: ultralytics
+    checkpoint: yolo26m.pt
+  - id: yolo26l
+    framework: ultralytics
+    checkpoint: yolo26l.pt
+  - id: yolo26x
+    framework: ultralytics
+    checkpoint: yolo26x.pt
+  - id: rf-detr-large
+    framework: rfdetr
+    model_class: RFDETRLarge
+
+shared_training:
+  image_size: 640
+  seed: 42
+  max_epochs: 50
+  early_stopping_patience: 15
+  pretrained: true
+  training_data_augmentation: framework_default
+  preserve_run_metadata: true
+  record_framework_specific_deviations: true
+
+evaluation:
+  split: locked_test
+  confidence_threshold: 0.25
+  matching_iou_threshold: 0.50
+  metrics:
+    - precision
+    - recall
+    - map50
+    - map50_95
+  report_per_class: true
+  report_aggregate: true
+
+readiness_blockers:
+  - final image-space component labels are not available for the collected photo/CAD set
+  - CAD registration currently supports only one photo as a candidate reference and is not verified visual ground truth
+  - the current 101-image development set has no verified physical board IDs or independent locked test split
+  - the existing YOLOv8s and YOLO26s pilot results use a separate single-class IC dataset

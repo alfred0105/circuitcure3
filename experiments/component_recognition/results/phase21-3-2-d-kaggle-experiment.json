@@ -1,0 +1,149 @@
+{
+  "schema_version": "circuitcare.phase21-3-2-d-kaggle-source-only.v1",
+  "experiment_id": "20261106-184118-08e6b8",
+  "status": "DEVELOPMENT_ONLY_SOURCE_LABEL_METRICS",
+  "source_dataset": {
+    "image_count": 1410,
+    "empty_annotation_excluded": 114,
+    "images_used": 1296,
+    "source_annotation_count": 11119,
+    "source_classes": [
+      "Cap1",
+      "Cap2",
+      "Cap3",
+      "Cap4",
+      "MOSFET",
+      "Mov",
+      "Resestor",
+      "Resistor",
+      "Transformer"
+    ],
+    "candidate_domain_type": "POPULATED_PCB for 1,410 images (automated/unreviewed candidate)",
+    "review_status": "HUMAN_REVIEW_REQUIRED for all 1,410 images"
+  },
+  "split": {
+    "source_split_used": false,
+    "policy": "All filename stems, declared augmentation families, exact image SHA duplicates, and all C.1 ORB/RANSAC candidate pairs are kept in one connected split group.",
+    "train_images": 1035,
+    "validation_images": 261,
+    "train_visual_components": 44,
+    "validation_visual_components": 75,
+    "train_filename_groups": 344,
+    "validation_filename_groups": 87,
+    "physical_board_ids": "UNVERIFIED",
+    "sealed_test": false,
+    "Resestor_development_boxes": 0
+  },
+  "model": {
+    "architecture": "YOLOv8s",
+    "class_contract": [
+      "Cap1",
+      "Cap2",
+      "Cap3",
+      "Cap4",
+      "MOSFET",
+      "Mov",
+      "Resestor",
+      "Resistor",
+      "Transformer"
+    ],
+    "device": "mps",
+    "imgsz": 640,
+    "batch": 2,
+    "epochs_cap": 5,
+    "epochs_completed": 5,
+    "best_epoch": 5,
+    "seed": 42,
+    "patience": 3,
+    "workers": 2,
+    "amp": false,
+    "ultralytics": "8.4.203",
+    "torch": "2.15.0"
+  },
+  "metrics": {
+    "precision": 0.9647563283879397,
+    "recall": 0.9467744108144798,
+    "mAP50": 0.9706421128721383,
+    "mAP50_95": 0.6563195371513405
+  },
+  "per_class": {
+    "Cap1": {
+      "validation_boxes": 260,
+      "precision": 1.0,
+      "recall": 0.9716829659679393,
+      "AP50": 0.994809885931559,
+      "AP50_95": 0.7290037663875599,
+      "status": "MEASURED_SOURCE_LABELS"
+    },
+    "Cap2": {
+      "validation_boxes": 255,
+      "precision": 0.9457425664720528,
+      "recall": 0.9686274509803922,
+      "AP50": 0.986296883876014,
+      "AP50_95": 0.6133934982503164,
+      "status": "MEASURED_SOURCE_LABELS"
+    },
+    "Cap3": {
+      "validation_boxes": 241,
+      "precision": 0.8895219397259252,
+      "recall": 0.9128630705394191,
+      "AP50": 0.940315741639898,
+      "AP50_95": 0.6505542834099517,
+      "status": "MEASURED_SOURCE_LABELS"
+    },
+    "Cap4": {
+      "validation_boxes": 237,
+      "precision": 0.9274301094965075,
+      "recall": 0.9166993599436449,
+      "AP50": 0.9490879966166975,
+      "AP50_95": 0.6370145871368549,
+      "status": "MEASURED_SOURCE_LABELS"
+    },
+    "MOSFET": {
+      "validation_boxes": 261,
+      "precision": 0.996145327959714,
+      "recall": 0.9901394053913546,
+      "AP50": 0.9948076923076924,
+      "AP50_95": 0.7051103277641257,
+      "status": "MEASURED_SOURCE_LABELS"
+    },
+    "Mov": {
+      "validation_boxes": 261,
+      "precision": 1.0,
+      "recall": 0.9955716049192546,
+      "AP50": 0.995,
+      "AP50_95": 0.6984552380558654,
+      "status": "MEASURED_SOURCE_LABELS"
+    },
+    "Resestor": {
+      "validation_boxes": 0,
+      "precision": null,
+      "recall": null,
+      "AP50": null,
+      "AP50_95": null,
+      "status": "NO_VALIDATION_SUPPORT"
+    },
+    "Resistor": {
+      "validation_boxes": 232,
+      "precision": 0.9797021112954146,
+      "recall": 0.8321773202467013,
+      "AP50": 0.9105762105704449,
+      "AP50_95": 0.5119062264811296,
+      "status": "MEASURED_SOURCE_LABELS"
+    },
+    "Transformer": {
+      "validation_boxes": 516,
+      "precision": 0.979508572153904,
+      "recall": 0.9864341085271318,
+      "AP50": 0.9942424920348013,
+      "AP50_95": 0.7051183697249205,
+      "status": "MEASURED_SOURCE_LABELS"
+    }
+  },
+  "source_only_label_policy": {
+    "canonical_merges": [],
+    "empty_images_used_as_negative": false,
+    "raw_images_and_annotations_modified": false
+  },
+  "interpretation": "Agreement with non-adjudicated source labels on a visual-group development split; not independent physical-board generalization and not directly comparable to PCB-DSLR IC metrics. Resestor was present only 3 times in training and absent from validation."
+}

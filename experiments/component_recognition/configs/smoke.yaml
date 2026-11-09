@@ -1,0 +1,8 @@
+model: yolov8n.pt
+imgsz: 512
+batch: 2
+epochs: 1
+workers: 0
+device: mps
+amp: false
+seed: 21
