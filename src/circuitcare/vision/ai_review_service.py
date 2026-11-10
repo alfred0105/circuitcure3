@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw
 from circuitcare.local_llm import OllamaClient
 from circuitcare.component_taxonomy import COMPONENT_LABELS, UNKNOWN_CLASS, normalize_component_class
 from circuitcare.vision.box_reconciliation import (
-    boxes_overlap_candidate, duplicate_box_metrics, same_component_box_pair,
+    boxes_overlap_candidate, duplicate_box_metrics, find_group_box_candidates, same_component_box_pair,
 )
 
 DEFAULT_REVIEW_MODEL = "qwen3.5:9b"
@@ -33,6 +33,13 @@ REVIEW_SCHEMA = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
         }, "required": ["detection_ids", "decision", "confidence", "evidence"], "additionalProperties": False}},
+        "group_reviews": {"type": "array", "items": {"type": "object", "properties": {
+            "parent_id": {"type": "string"},
+            "decision": {"type": "string", "enum": ["single_component", "multiple_components", "uncertain"]},
+            "child_ids": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence": {"type": "string"},
+        }, "required": ["parent_id", "decision", "child_ids", "confidence", "evidence"], "additionalProperties": False}},
         "missed_component_candidates": {"type": "array", "items": {"type": "object", "properties": {
             "image_index": {"type": "integer", "minimum": 0, "maximum": 48},
             "bbox_norm_999": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 999}, "minItems": 4, "maxItems": 4},
@@ -42,16 +49,17 @@ REVIEW_SCHEMA = {
         }, "required": ["image_index", "bbox_norm_999", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
         "notes": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["class_reviews", "duplicate_reviews", "missed_component_candidates", "notes"],
+    "required": ["class_reviews", "duplicate_reviews", "group_reviews", "missed_component_candidates", "notes"],
     "additionalProperties": False,
 }
 
-_SYSTEM = """You review a PCB photo and its YOLO component proposals. Use only the supplied shared component labels. Return unknown whenever appearance is ambiguous; return not_component only when the box clearly contains no physical component. Be conservative: only suggest a class when the physical component appearance is clear. Small SMD parts are often visually ambiguous. Use body markings and nearby OCR/silkscreen as cross-check evidence; a reference such as C12 may not label the closest body. Conflicting evidence means decision=uncertain and proposed_class=unknown. Do not claim certainty. Do not invent unseen parts. Existing boxes are identified by IDs; assess duplicate pairs only when their IDs are listed in duplicate_pair_crops, using the associated paired crop and surrounding board context. Search for at most a few clearly visible missed components, including when there are no detector proposals. Every proposed box is only a rough review candidate and must be manually checked. Each supplied image has an image_index from image_sources; missed boxes must be normalized relative to the image they cite. Return only the requested JSON object."""
+_SYSTEM = """You review a PCB photo and its YOLO component proposals. Use only the supplied shared component labels. Return unknown whenever appearance is ambiguous; return not_component only when the box clearly contains no physical component. Be conservative: only suggest a class when the physical component appearance is clear. Small SMD parts are often visually ambiguous. Use body markings and nearby OCR/silkscreen as cross-check evidence; a reference such as C12 may not label the closest body. Conflicting evidence means decision=uncertain and proposed_class=unknown. Do not claim certainty. Do not invent unseen parts. Existing boxes are identified by IDs; assess duplicate pairs only when their IDs are listed in duplicate_pair_crops, using the associated paired crop and surrounding board context. For group_candidate_crops, decide whether the parent box encloses multiple independent components or one physical component/package (including a connector); never split pins or internal regions of one package. Reuse listed child detection IDs. Return multiple_components only when the crop clearly shows separate physical component bodies. Search for at most a few clearly visible missed components, including when there are no detector proposals. Every proposed box is only a rough review candidate and must be manually checked. Each supplied image has an image_index from image_sources; missed boxes must be normalized relative to the image they cite. Return only the requested JSON object."""
 
 
 def _review_images(
-    image_bytes: bytes, detections: list[dict[str, Any]], *, max_crop_count: int = 10,
-) -> tuple[list[bytes], tuple[int, int], list[dict[str, Any]], list[dict[str, Any]]]:
+    image_bytes: bytes, detections: list[dict[str, Any]], *,
+    group_candidates: list[dict[str, Any]] | None = None, max_crop_count: int = 10,
+) -> tuple[list[bytes], tuple[int, int], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     with Image.open(io.BytesIO(image_bytes)) as source_image:
         image = source_image.convert("RGB")
     width, height = image.size
@@ -140,12 +148,44 @@ def _review_images(
         manifest.append({"image_index": image_index, "kind": "duplicate_pair_crop",
                          "detection_ids": [left["detection_id"], right["detection_id"]],
                          "bbox_xyxy": crop_box})
+    group_manifest = []
+    for group in (group_candidates or [])[:8]:
+        parent, children = group["parent"], group["children"]
+        parent_box = parent["bbox_xyxy"]
+        group_boxes = [parent_box, *[child["bbox_xyxy"] for child in children]]
+        pad_x = max(10.0, (float(parent_box[2]) - float(parent_box[0])) * .12)
+        pad_y = max(10.0, (float(parent_box[3]) - float(parent_box[1])) * .12)
+        crop_box = [max(0, int(min(box[0] for box in group_boxes) - pad_x)),
+                    max(0, int(min(box[1] for box in group_boxes) - pad_y)),
+                    min(width, int(max(box[2] for box in group_boxes) + pad_x)),
+                    min(height, int(max(box[3] for box in group_boxes) + pad_y))]
+        if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+            continue
+        crop = image.crop(tuple(crop_box))
+        painter = ImageDraw.Draw(crop)
+        for detection, color in [(parent, "#ff9d2e"), *[(child, "#77d8ff") for child in children]]:
+            box = detection["bbox_xyxy"]
+            local_box = (int(box[0] - crop_box[0]), int(box[1] - crop_box[1]),
+                         int(box[2] - crop_box[0]), int(box[3] - crop_box[1]))
+            painter.rectangle(local_box, outline=color, width=4)
+            painter.text((local_box[0] + 2, max(0, local_box[1] - 16)), detection["detection_id"],
+                         fill="white", stroke_width=2, stroke_fill="black")
+        crop.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+        image_index = len(images)
+        images.append(crop)
+        child_ids = [child["detection_id"] for child in children]
+        group_manifest.append({"image_index": image_index, "parent_id": parent["detection_id"],
+                               "child_ids": child_ids, "crop_bbox_xyxy": crop_box,
+                               "metrics": group["metrics"]})
+        manifest.append({"image_index": image_index, "kind": "group_candidate_crop",
+                         "parent_id": parent["detection_id"], "child_ids": child_ids,
+                         "bbox_xyxy": crop_box})
     encoded = []
     for candidate in images:
         buffer = io.BytesIO()
         candidate.save(buffer, format="JPEG", quality=88)
         encoded.append(buffer.getvalue())
-    return encoded, (width, height), manifest, pair_manifest
+    return encoded, (width, height), manifest, pair_manifest, group_manifest
 
 
 def _duplicate_pair_candidates(detections: list[dict[str, Any]], *, limit: int = 8) -> list[dict[str, Any]]:
@@ -189,12 +229,15 @@ def review_components_with_qwen(
                            "ocr_class_hints": row.get("ocr_class_hints", []),
                            "reference_designators": row.get("reference_designators", []),
                            "body_marking": row.get("body_marking")})
-    images, (width, height), image_manifest, pair_manifest = _review_images(image_bytes, identified)
+    group_candidates = find_group_box_candidates(identified)
+    images, (width, height), image_manifest, pair_manifest, group_manifest = _review_images(
+        image_bytes, identified, group_candidates=group_candidates)
     payload = {
         "image_coordinates_px": {"width": width, "height": height},
         "annotated_image_box_ids": [row["detection_id"] for row in identified],
         "image_sources": image_manifest,
         "duplicate_pair_crops": pair_manifest,
+        "group_candidate_crops": group_manifest,
         "detector_proposals": [{key: value for key, value in row.items() if key != "bbox_xyxy"}
                                | {"bbox_xyxy": [round(float(value), 1) for value in row["bbox_xyxy"]]}
                                for row in identified],
@@ -254,6 +297,29 @@ def review_components_with_qwen(
         seen_pairs.add(pair)
         duplicate_reviews.append({**row, "detection_ids": list(pair), "confidence": float(confidence),
                                   "evidence": str(row.get("evidence", ""))[:500]})
+    allowed_groups = {group["parent_id"]: set(group["child_ids"])
+                      for group in group_manifest}
+    group_reviews = []
+    seen_group_ids = set()
+    for row in content.get("group_reviews", []):
+        parent_id = row.get("parent_id")
+        child_ids = row.get("child_ids", [])
+        confidence = row.get("confidence")
+        if (parent_id not in allowed_groups or parent_id in seen_group_ids
+                or row.get("decision") not in {"single_component", "multiple_components", "uncertain"}
+                or not isinstance(child_ids, list) or len(child_ids) != len(set(child_ids))
+                or not set(child_ids) <= allowed_groups[parent_id]
+                or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
+                or not 0 <= float(confidence) <= 1):
+            continue
+        if row["decision"] == "multiple_components" and len(child_ids) < 2:
+            continue
+        if row["decision"] != "multiple_components":
+            child_ids = []
+        seen_group_ids.add(parent_id)
+        group_reviews.append({**row, "child_ids": child_ids, "confidence": float(confidence),
+                              "evidence": str(row.get("evidence", ""))[:500],
+                              "review_status": "AI_SUGGESTIONS_ONLY"})
     missed = []
     for row in content.get("missed_component_candidates", [])[:8]:
         box = row.get("bbox_norm_999", [])
@@ -262,6 +328,7 @@ def review_components_with_qwen(
         image_index = row.get("image_index", 0)
         if (type(image_index) is not int or not 0 <= image_index < len(image_manifest)
                 or len(box) != 4 or any(type(value) is not int or not 0 <= value <= 999 for value in box)
+                or proposed == "not_component"
                 or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
                 or not 0 <= float(confidence) <= 1):
             continue
@@ -287,6 +354,7 @@ def review_components_with_qwen(
                        "geometry_review_required": bool(possible_duplicate_ids),
                        "review_status": "검수 필요", "source": "qwen_suggestion"})
     return {"class_reviews": class_reviews, "duplicate_reviews": duplicate_reviews,
+            "group_reviews": group_reviews,
             "missed_component_candidates": missed,
             "notes": [str(note)[:300] for note in content.get("notes", [])[:10]],
             "model": response.get("model", model), "image_size_px": [width, height],

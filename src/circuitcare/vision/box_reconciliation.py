@@ -89,6 +89,84 @@ def same_component_box_pair(
             or (metrics["smaller_coverage"] >= 0.90 and metrics["area_ratio"] >= 0.55))
 
 
+def find_group_box_candidates(
+    detections: list[dict[str, Any]], *, min_children: int = 2,
+) -> list[dict[str, Any]]:
+    """Find a large container box around multiple spatially independent boxes.
+
+    This is separate from duplicate detection: a parent is only flagged for Qwen
+    review, and no box is removed here. The relative size, containment, and center
+    spacing filters reduce duplicate and single-package false positives.
+    """
+    normalized = []
+    for row in detections:
+        box = row.get("bbox_xyxy")
+        if not isinstance(box, (list, tuple)):
+            box = [row.get(key) for key in ("x1", "y1", "x2", "y2")]
+        component_id = row.get("detection_id", row.get("component_id"))
+        if component_id and len(box) == 4 and all(isinstance(v, (int, float)) for v in box):
+            normalized.append({**row, "detection_id": str(component_id), "bbox_xyxy": list(map(float, box))})
+
+    groups = []
+    for parent in normalized:
+        child_metrics = []
+        parent_box = parent["bbox_xyxy"]
+        for child in normalized:
+            if child["detection_id"] == parent["detection_id"]:
+                continue
+            metrics = duplicate_box_metrics(parent_box, child["bbox_xyxy"])
+            if (metrics["area_ratio"] <= 0.45 and metrics["smaller_coverage"] >= 0.72
+                    and metrics["center_distance_norm"] <= 0.48):
+                child_metrics.append((child, metrics))
+        independent = []
+        for child, metrics in sorted(child_metrics, key=lambda item: item[1]["area_ratio"]):
+            child_box = child["bbox_xyxy"]
+            if any(same_component_box_pair(child_box, other["bbox_xyxy"])
+                   or box_iou(child_box, other["bbox_xyxy"]) >= 0.35 for other in independent):
+                continue
+            independent.append(child)
+        if len(independent) < min_children:
+            continue
+        child_pair_metrics = [duplicate_box_metrics(left["bbox_xyxy"], right["bbox_xyxy"])
+                              for index, left in enumerate(independent)
+                              for right in independent[index + 1:]]
+        if not child_pair_metrics or any(
+                pair["center_distance_norm"] < 0.28 and pair["iou"] > 0.15
+                for pair in child_pair_metrics):
+            continue
+        groups.append({
+            "parent": parent,
+            "children": independent,
+            "metrics": {
+                "child_count": len(independent),
+                "containment_min": min(duplicate_box_metrics(parent_box, row["bbox_xyxy"])["smaller_coverage"]
+                                        for row in independent),
+                "child_parent_area_ratio_max": max(duplicate_box_metrics(parent_box, row["bbox_xyxy"])["area_ratio"]
+                                                   for row in independent),
+                "child_center_distance_min": min(pair["center_distance_norm"] for pair in child_pair_metrics),
+                "child_iou_max": max(pair["iou"] for pair in child_pair_metrics),
+            },
+        })
+    return sorted(groups, key=lambda item: (item["metrics"]["child_count"],
+                                             item["metrics"]["containment_min"]), reverse=True)
+
+
+def remove_unreviewed_legacy_secondary_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop only unreviewed boxes from the removed YOLO second-pass feature."""
+    return [row for row in rows if not (
+        row.get("source") == "yolo_second_pass"
+        and row.get("상태") not in {"확인", "제외"}
+        and not row.get("user_edited")
+    )]
+
+
+def exclude_review_row(row: dict[str, Any], *, reason: str, review: dict[str, Any] | None = None) -> None:
+    """Record a user-confirmed exclusion without deleting the component history."""
+    row.update({"상태": "제외", "user_edited": True, "exclusion_reason": reason})
+    if review is not None:
+        row["ai_review"] = review
+
+
 def board_visible_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Hide excluded records from the default PCB overlay while retaining their history."""
     return [row for row in rows if isinstance(row, dict) and row.get("상태") != "제외"]
@@ -230,7 +308,9 @@ def preserve_review_rows(
                     if key in old:
                         row[key] = old[key]
             for key in ("ocr_records", "ocr_candidates", "reference_designators", "ocr_class_hints", "ocr_association_status",
-                        "ai_review", "ai_proposed_class", "duplicate_of"):
+                        "ai_review", "ai_proposed_class", "duplicate_of", "exclusion_reason",
+                        "group_split_member_ids", "group_parent_id", "group_review_confirmed",
+                        "group_review_decision"):
                 if key in old:
                     row[key] = old[key]
         result.append(row)

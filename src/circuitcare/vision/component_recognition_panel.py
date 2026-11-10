@@ -15,7 +15,7 @@ import streamlit as st
 
 from circuitcare.vision.box_reconciliation import (
     associate_ocr_with_components, boxes_overlap_candidate, preserve_review_rows,
-    same_component_box_pair,
+    exclude_review_row, remove_unreviewed_legacy_secondary_rows, same_component_box_pair,
 )
 from circuitcare.component_taxonomy import COMPONENT_LABELS, normalize_component_class
 
@@ -185,6 +185,10 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
     scope = review_scope(review_bytes, project_id, photo_id)
     _migrate_legacy_review_state(st_api.session_state, review_bytes, project_id, photo_id, scope)
     result_key, records_key, error_key = review_keys(scope)
+    old_rows = st_api.session_state.get(records_key, [])
+    cleaned_rows = remove_unreviewed_legacy_secondary_rows(old_rows)
+    if cleaned_rows != old_rows:
+        st_api.session_state[records_key] = cleaned_rows
     if result_key in st_api.session_state:
         return st_api.session_state[result_key], None
     if error_key in st_api.session_state:
@@ -319,6 +323,10 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
         else:
             st_api.info("선택한 사진에서 자동 탐지를 실행하고 있습니다.")
             return
+    old_rows = st_api.session_state.get(records_key, [])
+    cleaned_rows = remove_unreviewed_legacy_secondary_rows(old_rows)
+    if cleaned_rows != old_rows:
+        st_api.session_state[records_key] = cleaned_rows
     st_api.caption("이미지 위의 ‘박스 그리기’를 눌러 드래그하세요. 박스를 선택하면 오른쪽에서 종류·상태·위치를 수정할 수 있습니다.")
     if st_api.button("선택 사진 다시 탐지", key=f"cc_component_run_{scope}"):
         invalidate_qwen_review(st_api.session_state, scope)
@@ -384,7 +392,10 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 qwen_detections = [{"component_id": row["component_id"], "class_name": row.get("소자 종류", "unknown"),
                                     "confidence": row.get("신뢰도"),
                                     "bbox_xyxy": [row["x1"], row["y1"], row["x2"], row["y2"]],
-                                    "ocr_candidates": row.get("ocr_candidates", [])}
+                                    "ocr_candidates": row.get("ocr_candidates", []),
+                                    "ocr_class_hints": row.get("ocr_class_hints", []),
+                                    "reference_designators": row.get("reference_designators", []),
+                                    "body_marking": row.get("body_marking")}
                                    for row in live_rows]
                 with st_api.spinner("Qwen3.5 9B가 사진과 불확실한 후보를 검토하고 있습니다…"):
                     review = review_components_with_qwen(
@@ -414,7 +425,13 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     title += " · OCR/YOLO 불일치"
                 st_api.markdown(f"**{title}** · 점수 {proposal['confidence']:.2f} · 아직 미확인")
                 st_api.caption(proposal.get("evidence") or "시각 근거 없음")
-                if proposal.get("decision") == "suggest" and proposal["proposed_class"] in CLASS_OPTIONS:
+                if proposal.get("decision") == "suggest" and proposal["proposed_class"] == "not_component":
+                    if st_api.button("오탐으로 제외 확인", key=f"cc_qwen_false_positive_{scope}_{index}"):
+                        exclude_review_row(target, reason="qwen_not_component", review=proposal)
+                        st_api.session_state[records_key] = rows
+                        invalidate_qwen_review(st_api.session_state, scope)
+                        st_api.rerun()
+                elif proposal.get("decision") == "suggest" and proposal["proposed_class"] in CLASS_OPTIONS:
                     if st_api.button("종류 제안 반영 · 검수 필요 상태 유지", key=f"cc_qwen_class_apply_{scope}_{index}"):
                         target["소자 종류"] = proposal["proposed_class"]
                         target["상태"] = "검수 필요"
@@ -458,6 +475,36 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     st_api.session_state[records_key] = rows
                     invalidate_qwen_review(st_api.session_state, scope)
                     st_api.rerun()
+            for index, proposal in enumerate(qwen_review.get("group_reviews", [])):
+                parent_id = str(proposal.get("parent_id", ""))
+                parent = by_id.get(parent_id)
+                child_ids = [str(value) for value in proposal.get("child_ids", [])]
+                children = [by_id[value] for value in child_ids if value in by_id]
+                if parent is None:
+                    continue
+                st_api.markdown(f"**묶음 박스 검토 · {parent_id} · {proposal['decision']} · 아직 미확인**")
+                if children:
+                    st_api.caption("기존 개별 박스 재사용 · " + " · ".join(
+                        f"{child['component_id']} ({child.get('소자 종류', 'unknown')})" for child in children))
+                st_api.caption(proposal.get("evidence") or "큰 박스와 내부 소자 후보의 관계를 검토했습니다.")
+                if proposal.get("decision") == "multiple_components" and len(children) >= 2:
+                    if st_api.button("묶음 박스만 제외 · 개별 박스 유지", key=f"cc_qwen_group_exclude_{scope}_{index}"):
+                        review = {**proposal, "child_ids": [child["component_id"] for child in children]}
+                        exclude_review_row(parent, reason="qwen_group_container", review=review)
+                        parent["group_split_member_ids"] = review["child_ids"]
+                        for child in children:
+                            child["group_parent_id"] = parent_id
+                        st_api.session_state[records_key] = rows
+                        invalidate_qwen_review(st_api.session_state, scope)
+                        st_api.rerun()
+                elif proposal.get("decision") == "single_component":
+                    if st_api.button("하나의 부품 패키지로 확인", key=f"cc_qwen_group_single_{scope}_{index}"):
+                        parent["group_review_confirmed"] = True
+                        parent["group_review_decision"] = "single_component"
+                        parent["ai_review"] = proposal
+                        st_api.session_state[records_key] = rows
+                        invalidate_qwen_review(st_api.session_state, scope)
+                        st_api.rerun()
             for index, proposal in enumerate(qwen_review.get("missed_component_candidates", [])):
                 box = proposal.get("bbox_xyxy")
                 if not isinstance(box, list) or len(box) != 4:

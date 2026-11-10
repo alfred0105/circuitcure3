@@ -7,11 +7,12 @@ import json
 from PIL import Image
 
 from circuitcare.local_llm import OllamaClient
-from circuitcare.vision.ai_review_service import review_components_with_qwen
+from circuitcare.vision.ai_review_service import _review_images, review_components_with_qwen
 from circuitcare.vision.box_reconciliation import associate_ocr_with_components
 from circuitcare.vision.box_reconciliation import (
-    board_visible_review_rows, boxes_overlap_candidate, deduplicate_component_boxes, preserve_review_rows,
-    same_component_box_pair,
+    board_visible_review_rows, boxes_overlap_candidate, deduplicate_component_boxes,
+    exclude_review_row, find_group_box_candidates, preserve_review_rows,
+    remove_unreviewed_legacy_secondary_rows, same_component_box_pair,
 )
 from circuitcare.vision.component_recognition_panel import (
     CLASS_OPTIONS, _legacy_secondary_scope, _migrate_legacy_review_state, _review_fingerprint,
@@ -315,3 +316,134 @@ def test_user_excluded_duplicate_stays_hidden_after_new_detection_matches():
     assert {row["component_id"] for row in rows} == {"active", "duplicate"}
     assert next(row for row in rows if row["component_id"] == "duplicate")["상태"] == "제외"
     assert [row["component_id"] for row in board_visible_review_rows(rows)] == ["active"]
+
+
+def test_group_candidates_require_multiple_independent_contained_boxes():
+    group = find_group_box_candidates([
+        {"component_id": "outer", "bbox_xyxy": [0, 0, 200, 100]},
+        {"component_id": "r1", "bbox_xyxy": [20, 20, 50, 50]},
+        {"component_id": "c1", "bbox_xyxy": [120, 20, 150, 50]},
+    ])
+    assert len(group) == 1
+    assert group[0]["parent"]["detection_id"] == "outer"
+    assert {row["detection_id"] for row in group[0]["children"]} == {"r1", "c1"}
+    assert group[0]["metrics"]["containment_min"] >= .72
+
+
+def test_duplicate_boxes_and_single_connector_package_are_not_group_candidates():
+    duplicate_pair = [
+        {"component_id": "outer", "bbox_xyxy": [0, 0, 100, 100]},
+        {"component_id": "same", "bbox_xyxy": [10, 10, 90, 90]},
+    ]
+    connector_package = [
+        {"component_id": "connector", "bbox_xyxy": [0, 0, 140, 60]},
+        {"component_id": "package_crop", "bbox_xyxy": [12, 10, 128, 50]},
+    ]
+    assert find_group_box_candidates(duplicate_pair) == []
+    assert find_group_box_candidates(connector_package) == []
+
+
+def test_qwen_group_review_uses_focused_crop_and_rejects_unlisted_child_ids():
+    class GroupClient:
+        def chat_json(self, _model, messages, *, output_schema, images):
+            payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
+            assert len(payload["group_candidate_crops"]) == 1
+            assert payload["group_candidate_crops"][0]["child_ids"] == ["r1", "c1"]
+            assert len(images) >= 2
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [],
+                "group_reviews": [
+                    {"parent_id": "outer", "decision": "multiple_components", "child_ids": ["r1", "c1"],
+                     "confidence": .91, "evidence": "Two separate component bodies."},
+                    {"parent_id": "outer", "decision": "multiple_components", "child_ids": ["ghost", "c1"],
+                     "confidence": .99, "evidence": "Invalid child ID."},
+                ], "missed_component_candidates": [], "notes": [],
+            }}
+
+    result = review_components_with_qwen(GroupClient(), "qwen3.5:9b", _png(), [
+        {"component_id": "outer", "class_name": "unknown", "bbox_xyxy": [2, 2, 95, 75]},
+        {"component_id": "r1", "class_name": "resistor", "bbox_xyxy": [10, 10, 25, 25]},
+        {"component_id": "c1", "class_name": "capacitor", "bbox_xyxy": [65, 10, 80, 25]},
+    ], [])
+    assert len(result["group_reviews"]) == 1
+    assert result["group_reviews"][0]["decision"] == "multiple_components"
+
+
+def test_qwen_false_split_remains_a_suggestion_until_user_action():
+    class IncorrectSplitClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [],
+                "group_reviews": [{"parent_id": "connector", "decision": "multiple_components",
+                    "child_ids": ["pin_area_a", "pin_area_b"], "confidence": .99,
+                    "evidence": "Mistakenly treats sections of one connector as separate."}],
+                "missed_component_candidates": [], "notes": [],
+            }}
+
+    rows = [
+        {"component_id": "connector", "class_name": "connector", "bbox_xyxy": [0, 0, 100, 60],
+         "상태": "검수 필요"},
+        {"component_id": "pin_area_a", "class_name": "unknown", "bbox_xyxy": [10, 12, 25, 25]},
+        {"component_id": "pin_area_b", "class_name": "unknown", "bbox_xyxy": [68, 12, 83, 25]},
+    ]
+    result = review_components_with_qwen(IncorrectSplitClient(), "qwen3.5:9b", _png(), rows, [])
+    assert result["group_reviews"][0]["decision"] == "multiple_components"
+    assert rows[0]["상태"] == "검수 필요"
+    assert "exclusion_reason" not in rows[0]
+
+
+def test_not_component_is_exclusion_review_not_new_box_and_can_be_restored():
+    class FalsePositiveClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [{"detection_id": "noise", "decision": "suggest",
+                                   "proposed_class": "not_component", "confidence": .86,
+                                   "evidence": "This is a silkscreen mark, not a component."}],
+                "duplicate_reviews": [], "group_reviews": [],
+                "missed_component_candidates": [{"image_index": 0, "bbox_norm_999": [100, 100, 300, 300],
+                    "proposed_class": "not_component", "confidence": .99, "evidence": "Not a component."}],
+                "notes": [],
+            }}
+
+    result = review_components_with_qwen(FalsePositiveClient(), "qwen3.5:9b", _png(), [
+        {"component_id": "noise", "class_name": "unknown", "bbox_xyxy": [10, 10, 40, 30]},
+    ], [])
+    assert result["class_reviews"][0]["proposed_class"] == "not_component"
+    assert result["missed_component_candidates"] == []
+    row = {"component_id": "noise", "상태": "검수 필요", "source": "yolo"}
+    exclude_review_row(row, reason="qwen_not_component", review=result["class_reviews"][0])
+    assert row["상태"] == "제외" and row["user_edited"] is True
+    assert board_visible_review_rows([row]) == []
+    restored = dict(row, **{"상태": "검수 필요"})
+    assert board_visible_review_rows([restored]) == [restored]
+
+
+def test_group_parent_exclusion_keeps_children_and_review_history():
+    rows = [
+        {"component_id": "outer", "source": "yolo", "상태": "검수 필요"},
+        {"component_id": "r1", "source": "yolo", "상태": "확인"},
+        {"component_id": "c1", "source": "qwen_suggestion", "상태": "검수 필요"},
+    ]
+    exclude_review_row(rows[0], reason="qwen_group_container", review={"child_ids": ["r1", "c1"]})
+    assert {row["component_id"] for row in rows} == {"outer", "r1", "c1"}
+    assert [row["component_id"] for row in board_visible_review_rows(rows)] == ["r1", "c1"]
+    assert rows[0]["ai_review"]["child_ids"] == ["r1", "c1"]
+    rerun_rows = preserve_review_rows(rows, [
+        {"class_name": "unknown", "confidence": .8, "bbox_xyxy": [0, 0, 100, 100]},
+        {"class_name": "resistor", "confidence": .8, "bbox_xyxy": [10, 10, 20, 20]},
+        {"class_name": "capacitor", "confidence": .8, "bbox_xyxy": [60, 10, 70, 20]},
+    ])
+    saved_parent = next(row for row in rerun_rows if row["component_id"] == "outer")
+    assert saved_parent["exclusion_reason"] == "qwen_group_container"
+    assert saved_parent["ai_review"]["child_ids"] == ["r1", "c1"]
+
+
+def test_unreviewed_legacy_yolo2_rows_removed_but_user_reviewed_rows_remain():
+    rows = [
+        {"component_id": "old-unreviewed", "source": "yolo_second_pass", "상태": "검수 필요"},
+        {"component_id": "old-confirmed", "source": "yolo_second_pass", "상태": "확인"},
+        {"component_id": "old-edited", "source": "yolo_second_pass", "상태": "검수 필요", "user_edited": True},
+        {"component_id": "manual", "source": "manual", "상태": "검수 필요"},
+    ]
+    retained = remove_unreviewed_legacy_secondary_rows(rows)
+    assert {row["component_id"] for row in retained} == {"old-confirmed", "old-edited", "manual"}
