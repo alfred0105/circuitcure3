@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "circuitcare-ai"
 version = "0.1.0"
-description = "Local-first circuit fault influence and repair prioritization prototype"
+description = "Local Streamlit PCB component review and fault diagnosis"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Proprietary - no license granted"}

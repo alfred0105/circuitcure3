@@ -31,10 +31,13 @@ jobs:
           filters: |
             code:
               - 'src/**'
+              - 'apps/pcb-component-recognition/**'
               - 'tests/**'
               - 'scripts/**'
               - 'experiments/connectivity_candidates/**'
               - 'pyproject.toml'
+              - 'requirements-macos-arm64*.txt'
+              - 'README.md'
               - 'setup.cfg'
               - '.github/workflows/**'
   python:

@@ -361,7 +361,7 @@ def test_live_ngspice_result_manifest_is_verified_then_detects_tamper(tmp_path: 
         "--spice-mapping", case["mapping"], "--output", str(output), "--simulate", "--probes", case["probes"],
         "--ratings", case["ratings"], "--assess-risk"]
     completed = subprocess.run(command, check=False, cwd=root, capture_output=True, text=True, timeout=120)
-    from circuitcare.ui import _validate_live_result
+    from circuitcare.services.simulation_service import _validate_live_result
     verified_dir = _validate_live_result(completed, output, "R1", "resistance_drift", case=case, fault_value="10k")
     fingerprint = build_simulation_fingerprint(netlist=root / case["netlist"], spice_deck=root / case["base"],
         component_mapping=root / case["mapping"], probes=root / case["probes"],
@@ -426,24 +426,17 @@ def test_bundle_verifier_rejects_duplicate_and_traversal_paths() -> None:
         verify_bundle(traversal.getvalue())
 
 
-def test_streamlit_app_keeps_original_tabs_and_displays_workspace_reports() -> None:
+def test_streamlit_app_uses_photo_diagnosis_entry_only() -> None:
     pytest.importorskip("streamlit")
     from streamlit.testing.v1 import AppTest
 
     script = Path(__file__).resolve().parents[1] / "src/circuitcare/ui.py"
     app = AppTest.from_file(str(script), default_timeout=30).run()
     assert not app.exception
-    assert any("출처 확인 필요" in item.value for item in app.markdown)
-    assert app.session_state["active_analysis_view"] == "회로도 Workbench"
-    next(item for item in app.button if item.label == "AI 성능 평가").click().run()
-    assert not app.exception
-    assert app.session_state["active_analysis_view"] == "AI 성능 평가"
-    next(item for item in app.radio if item.key == "main_area").set_value("보고서").run()
-    assert any(button.label == "Evidence Bundle ZIP" for button in app.download_button)
-    selector = next(item for item in app.selectbox if item.key == "case_name")
-    selector.select("KiCad XML 업로드 (연결 그래프 전용)").run()
-    assert not app.exception
-    assert any("KiCad XML을 올리면" in item.value for item in app.info)
+    assert any("새 PCB 진단" in item.value for item in app.markdown)
+    assert len(app.file_uploader) == 2
+    assert any(item.label == "진단 시작" and item.disabled for item in app.button)
+    assert "active_analysis_view" not in app.session_state
 
 
 def test_git_sha_reads_checkout_metadata_without_subprocess(tmp_path, monkeypatch):

@@ -14,7 +14,6 @@ from circuitcare.frontend.intake import (
     SYMPTOM_CATEGORIES,
     add_image_batch,
     create_project_context,
-    create_preview_context,
     normalize_symptom_description,
     validate_circuit_upload,
 )
@@ -26,7 +25,6 @@ from circuitcare.frontend.state import (
     INTAKE_UPLOAD_BATCH_KEY,
     clear_intake_draft,
     draft_is_current,
-    reset_intake_for_new_project,
 )
 from circuitcare.frontend.workbench_state import SCREEN_KEY, enter_workbench
 from circuitcare.vision.image_loader import load_board_image
@@ -86,34 +84,8 @@ def _normalize_photo_state(images: list[dict[str, Any]]) -> list[dict[str, Any]]
     return normalized_images
 
 
-def _render_project_ready(st: Any, project: Any) -> None:
-    st.markdown('<div class="cc-entry-brand">CircuitCare AI</div>', unsafe_allow_html=True)
-    st.markdown('<div class="cc-entry-title">프로젝트 입력 완료</div>', unsafe_allow_html=True)
-    st.success("프로젝트 생성 완료 · 진단 미실행")
-    st.write(f"사진 {len(project.image_records)}장 · {SYMPTOM_CATEGORIES[project.symptom_category]}")
-    st.caption("촬영면·유형: " + " · ".join(
-        f"{PHOTO_SIDES[item.side]} / {CAPTURE_TYPES[item.capture_type]}"
-        for item in project.image_records
-    ))
-    if project.symptom_description:
-        st.caption(project.symptom_description)
-    if project.circuit_source:
-        st.caption(f"설계 자료 · {project.circuit_source['filename']} · 분석 미실행")
-    else:
-        st.caption("설계 자료 없음 · 전기적 분석 자료 추가 필요")
-    st.caption(f"프로젝트 ID · {project.project_id}")
-    st.info("작업공간 준비 · PCB/회로도 통합 Viewer는 다음 단계에서 연결됩니다.")
-    edit_col, new_col = st.columns(2)
-    if edit_col.button("입력 수정", use_container_width=True, key="cc_v2_edit_intake"):
-        clear_intake_draft(st.session_state)
-        st.rerun()
-    if new_col.button("새 프로젝트", use_container_width=True, key="cc_v2_new_project"):
-        reset_intake_for_new_project(st.session_state)
-        st.rerun()
-
-
-def render_diagnosis_entry(st: Any) -> str | None:
-    """Render the intake flow. Returns `demo` to route into the legacy demo UI."""
+def render_diagnosis_entry(st: Any) -> None:
+    """Render photo and symptom intake for the PCB diagnosis workbench."""
     _style(st)
     state = st.session_state
     images = _normalize_photo_state(state.setdefault(INTAKE_IMAGES_KEY, []))
@@ -128,8 +100,8 @@ def render_diagnosis_entry(st: Any) -> str | None:
     fingerprint = _current_fingerprint(state, category, description)
     project = state.get(INTAKE_PROJECT_KEY)
     if project and draft_is_current(state, fingerprint or ""):
-        _render_project_ready(st, project)
-        return None
+        enter_workbench(state, project)
+        st.rerun()
     if project:
         clear_intake_draft(state)
 
@@ -281,28 +253,4 @@ def render_diagnosis_entry(st: Any) -> str | None:
                 enter_workbench(state, project)
                 st.rerun()
 
-        if not images and description_error is None and st.button(
-            "사진 없이 작업공간 보기", use_container_width=True, key="cc_v2_photo_free_preview",
-        ):
-            try:
-                project = create_preview_context(
-                    symptom_category=category_code, symptom_description=description,
-                    circuit_source=state.get("circuitcare_v2_circuit_source"),
-                    project_id=state.get("circuitcare_v2_edit_project_id"),
-                    board_id=state.get("circuitcare_v2_edit_board_id"),
-                )
-            except ValueError as exc:
-                st.error(str(exc))
-            else:
-                state[INTAKE_PROJECT_KEY] = project
-                state["circuitcare_v2_analysis_status"] = "NOT_RUN"
-                state.pop("circuitcare_v2_edit_project_id", None)
-                state.pop("circuitcare_v2_edit_board_id", None)
-                enter_workbench(state, project, preview=True)
-                st.rerun()
-
-        if st.button("예제 회로 체험", use_container_width=True, key="cc_v2_demo"):
-            state["circuitcare_v2_legacy_demo"] = True
-            return "demo"
         st.caption("사진과 증상은 진단 보조 입력입니다. 이 단계에서는 AI 진단을 실행하지 않습니다.")
-    return None
