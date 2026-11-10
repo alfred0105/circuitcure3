@@ -15,7 +15,7 @@ from circuitcare.vision.component_recognition_panel import (
     invalidate_component_review_state, record_box_exclusion, restore_review_row,
     review_keys, undo_last_box_exclusion, update_review_row,
 )
-from circuitcare.frontend.workbench_state import SELECTION_KEY, update_selection
+from circuitcare.frontend.workbench_state import ACTIVE_PHOTO_KEY, SELECTION_KEY, update_selection
 
 MAP_VERSION_KEY = "circuitcare_v4_selection_map_key"
 COMPONENT_EDIT_KEY = "circuitcare_v4_component_edits"
@@ -213,7 +213,8 @@ def render_inspection_panel(
                     format_func=lambda value: "모델 식별됨" if value == "USER_CONFIRMED" else "모델 미확인",
                     horizontal=True, key=identity_key,
                     on_change=_sync_inventory_widget, args=(st, owner, selected_component.component_id,
-                                                            "part_identity_status", identity_key))
+                        "part_identity_status", identity_key, project.project_id, project.board_id,
+                        str(st.session_state.get(ACTIVE_PHOTO_KEY) or "target:default")))
                 inventory_item["part_identity_status"] = part_identity_status
                 role_key = f"cc_component_roles_{hash(owner)}_{selected_component.component_id}"
                 current_roles = inventory_item.get("confirmed_functional_roles", [])
@@ -223,7 +224,8 @@ def render_inspection_panel(
                     "이 부품에서 확인된 기능 역할", ROLE_OPTIONS, key=role_key,
                     help="직접 확인한 역할만 선택합니다. 선택하지 않은 배치/OCR 추정은 미확정 후보로 유지됩니다.",
                     on_change=_sync_inventory_widget, args=(st, owner, selected_component.component_id,
-                                                            "confirmed_functional_roles", role_key),
+                        "confirmed_functional_roles", role_key, project.project_id, project.board_id,
+                        str(st.session_state.get(ACTIVE_PHOTO_KEY) or "target:default")),
                 )
                 inventory_item["confirmed_functional_roles"] = list(confirmed_roles)
             inventories[owner] = inventory
@@ -272,6 +274,8 @@ def render_inspection_panel(
                                         "component_info": marking_result.get("inferred_value") or current_value,
                                     }
                                     st.session_state[COMPONENT_EDIT_KEY] = edits
+                                    invalidate_component_review_state(st.session_state, scope=review_scope,
+                                        project_id=project.project_id, board_id=project.board_id)
                                     st.rerun()
             if selected_component.fault_hypothesis:
                 st.caption(f"진단 후보 · {selected_component.diagnosis_display_status or '미확정'} · "
@@ -311,6 +315,9 @@ def render_inspection_panel(
                         "component_info": st.session_state[value_key].strip(),
                     }
                     st.session_state[COMPONENT_EDIT_KEY] = edits
+                    if review_scope:
+                        invalidate_component_review_state(st.session_state, scope=review_scope,
+                            project_id=project.project_id, board_id=project.board_id)
                     st.rerun()
             if current_marking or current_value:
                 st.caption(f"자동 판독 상태 · {display_identity_status(selected_component.identification_status)}")
@@ -349,12 +356,17 @@ def _diagnosis_status_label(st: Any, project: ProjectContext) -> str:
     return "진단 결과 확인 필요"
 
 
-def _sync_inventory_widget(st: Any, owner: str, component_id: str, field: str, widget_key: str) -> None:
+def _sync_inventory_widget(st: Any, owner: str, component_id: str, field: str, widget_key: str,
+                           project_id: str | None = None, board_id: str | None = None,
+                           review_scope: str | None = None) -> None:
     inventories = st.session_state.setdefault(COMPONENT_INVENTORY_KEY, {})
     inventory = inventories.setdefault(owner, {})
     item = inventory.setdefault(component_id, {})
     item[field] = st.session_state.get(widget_key)
     st.session_state[COMPONENT_INVENTORY_KEY] = inventories
+    if project_id:
+        invalidate_component_review_state(st.session_state, scope=review_scope or "target:default",
+                                          project_id=project_id, board_id=board_id)
 
 
 def _render_selected_marking(st: Any, context: dict[str, Any]) -> None:

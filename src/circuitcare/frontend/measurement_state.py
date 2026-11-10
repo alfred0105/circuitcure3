@@ -8,6 +8,8 @@ from typing import Any
 from circuitcare.frontend.measurement_models import (
     MeasurementRecord, assign_measurement_set, measurement_set_sha256,
 )
+from circuitcare.analysis.fingerprints import build_measurement_fingerprint
+from circuitcare.analysis.state_manager import invalidate_analysis
 
 MEASUREMENTS_KEY = "circuitcare_v5_measurements"
 DIAGNOSIS_STATE_KEY = "circuitcare_v5_diagnosis_state"
@@ -39,10 +41,12 @@ def save_measurement(state: dict[str, Any], record: MeasurementRecord) -> None:
     records = list(scoped.get(key, []))
     if any(item.measurement_id == record.measurement_id for item in records):
         raise ValueError("이미 저장된 Measurement ID입니다.")
+    before = build_measurement_fingerprint(records)
     records.append(record)
     scoped[key] = assign_measurement_set(records, project_id=record.project_id, board_id=record.board_id)
     state[MEASUREMENTS_KEY] = scoped
-    invalidate_diagnosis(state, project_id=record.project_id, board_id=record.board_id)
+    if before != build_measurement_fingerprint(scoped[key]):
+        invalidate_diagnosis(state, project_id=record.project_id, board_id=record.board_id)
 
 
 def update_measurement(state: dict[str, Any], updated: MeasurementRecord) -> None:
@@ -58,13 +62,15 @@ def update_measurement(state: dict[str, Any], updated: MeasurementRecord) -> Non
     if (original.component_map_version != updated.component_map_version
             or original.component_identity_status != updated.component_identity_status):
         raise ValueError("측정 기록의 Component Map 또는 Identity를 수정할 수 없습니다.")
+    before = build_measurement_fingerprint(records)
     records[index] = replace(updated, probe_id=original.probe_id, node_id=original.node_id,
                              mapping_status=original.mapping_status,
                              changed_at=updated.changed_at or updated.timestamp,
                              measurement_set_id=None)
     scoped[key] = assign_measurement_set(records, project_id=updated.project_id, board_id=updated.board_id)
     state[MEASUREMENTS_KEY] = scoped
-    invalidate_diagnosis(state, project_id=updated.project_id, board_id=updated.board_id)
+    if before != build_measurement_fingerprint(scoped[key]):
+        invalidate_diagnosis(state, project_id=updated.project_id, board_id=updated.board_id)
 
 
 def delete_measurement(state: dict[str, Any], *, project_id: str, board_id: str,
@@ -75,19 +81,33 @@ def delete_measurement(state: dict[str, Any], *, project_id: str, board_id: str,
     remaining = [record for record in records if record.measurement_id != measurement_id]
     if len(remaining) == len(records):
         return False
+    before = build_measurement_fingerprint(records)
     scoped[key] = assign_measurement_set(remaining, project_id=project_id, board_id=board_id)
     state[MEASUREMENTS_KEY] = scoped
     invalidate_diagnosis(state, project_id=project_id, board_id=board_id)
     return True
 
 
-def invalidate_diagnosis(state: dict[str, Any], *, project_id: str, board_id: str) -> None:
+def invalidate_legacy_diagnosis(state: dict[str, Any], *, project_id: str, board_id: str) -> None:
     scoped = dict(state.get(DIAGNOSIS_STATE_KEY, {}))
-    scoped[owner_key(project_id, board_id)] = {
-        "status": "STALE_RESULT", "result": None, "context": None,
+    owner = owner_key(project_id, board_id)
+    previous = dict(scoped.get(owner, {}))
+    history = list(previous.get("history", []))
+    if previous.get("result") is not None:
+        history.append({"result": previous["result"], "context": previous.get("context"),
+                        "measurement_set_sha256": previous.get("measurement_set_sha256")})
+    scoped[owner] = {
+        **previous, "status": "STALE_RESULT", "result": None, "context": None,
         "measurement_set_sha256": None,
+        "history": history[-100:],
     }
     state[DIAGNOSIS_STATE_KEY] = scoped
+
+
+def invalidate_diagnosis(state: dict[str, Any], *, project_id: str, board_id: str) -> None:
+    invalidate_legacy_diagnosis(state, project_id=project_id, board_id=board_id)
+    invalidate_analysis(state, project_id=project_id, board_id=board_id,
+                        reason="측정 기록이 변경되었습니다.")
 
 
 def diagnosis_state(state: dict[str, Any], *, project_id: str, board_id: str) -> dict[str, Any]:

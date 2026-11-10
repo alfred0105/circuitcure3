@@ -25,6 +25,8 @@ from circuitcare.frontend.diagnosis_adapter import (
 )
 from circuitcare.frontend.measurement_models import measurement_set_sha256
 from circuitcare.frontend.measurement_state import diagnosis_state, get_measurements
+from circuitcare.analysis.models import AnalysisScope, AnalysisStatus
+from circuitcare.analysis.state_manager import get_current_state_for_scope
 from circuitcare.frontend.component_map_adapter import (
     COMPONENT_MAP_STATE_KEY, LOGGER, REGISTRATION_LABELS,
     clear_component_map_state,
@@ -528,18 +530,27 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
                 )
             updated_models.append(model)
         component_models = tuple(updated_models)
-    candidate_state_by_project = st.session_state.get("circuitcare_v4_diagnosis_candidates_by_project", {})
-    candidate_state = current_overlay_candidates(
-        candidate_state_by_project.get(project.project_id) if isinstance(candidate_state_by_project, dict) else {},
-        project_id=project.project_id, board_id=project.board_id,
-        component_map_version=st.session_state.get(MAP_VERSION_KEY),
-        input_fingerprint=st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {}).get("input_fingerprint"),
-    )
+    target_id = str(st.session_state.get(ACTIVE_PHOTO_KEY) or "target:default")
+    analysis_scope = AnalysisScope(project.project_id, project.board_id or "", target_id)
+    analysis_state = get_current_state_for_scope(st.session_state, analysis_scope)
+    candidate_state_by_scope = st.session_state.get("circuitcare_v6_diagnosis_candidates_by_scope", {})
+    scoped_overlay = (candidate_state_by_scope.get(analysis_scope.key)
+                     if isinstance(candidate_state_by_scope, dict) else {})
+    candidate_state = {}
+    if analysis_state.get("status") == AnalysisStatus.CURRENT.value:
+        candidate_state = current_overlay_candidates(
+            scoped_overlay,
+            project_id=project.project_id, board_id=project.board_id,
+            component_map_version=st.session_state.get(MAP_VERSION_KEY),
+            input_fingerprint=(scoped_overlay.get("input_fingerprint")
+                               if isinstance(scoped_overlay, dict) else None),
+        )
     verified_history = current_verified_component_history(
-        candidate_state_by_project.get(project.project_id) if isinstance(candidate_state_by_project, dict) else {},
+        scoped_overlay,
         project_id=project.project_id, board_id=project.board_id,
         component_map_version=st.session_state.get(MAP_VERSION_KEY),
-        input_fingerprint=st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {}).get("input_fingerprint"),
+        input_fingerprint=(scoped_overlay.get("input_fingerprint")
+                           if isinstance(scoped_overlay, dict) else None),
     )
     history_by_id: dict[str, list[dict[str, Any]]] = {}
     for history_row in verified_history:

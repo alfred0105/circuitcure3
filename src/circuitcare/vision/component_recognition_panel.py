@@ -20,7 +20,10 @@ from circuitcare.vision.box_reconciliation import (
 )
 from circuitcare.component_taxonomy import COMPONENT_LABELS, normalize_component_class
 from circuitcare.vision.ai_review_service import AIReviewStageError
-from circuitcare.frontend.measurement_state import invalidate_diagnosis
+from circuitcare.frontend.measurement_state import invalidate_legacy_diagnosis
+from circuitcare.analysis.models import AnalysisScope
+from circuitcare.analysis.state_manager import invalidate_analysis
+from circuitcare.frontend.workbench_state import ACTIVE_PHOTO_KEY
 
 APP_DIR = Path(__file__).resolve().parents[3] / "apps" / "pcb-component-recognition"
 MODULE_NAME = "circuitcare_pcb_component_app_server"
@@ -119,10 +122,21 @@ def invalidate_qwen_review(state: Any, scope: str) -> None:
 def invalidate_component_review_state(state: Any, *, scope: str, project_id: str, board_id: str | None) -> None:
     """Invalidate derived AI/diagnosis results while leaving measurement records untouched."""
     invalidate_qwen_review(state, scope)
-    invalidate_diagnosis(state, project_id=project_id, board_id=board_id or "")
+    invalidate_legacy_diagnosis(state, project_id=project_id, board_id=board_id or "")
+    invalidate_analysis(
+        state,
+        scope=AnalysisScope(project_id, board_id or "",
+                            str(state.get(ACTIVE_PHOTO_KEY) or "target:default")),
+        reason="소자 검수 정보가 변경되었습니다.",
+    )
     diagnosis_key = f"cc_symptom_diagnosis_{project_id}"
     diagnosis = state.get(diagnosis_key)
     if isinstance(diagnosis, dict):
+        if diagnosis.get("result") is not None:
+            history = list(diagnosis.get("history", []))
+            history.append({"result": diagnosis["result"],
+                            "reason": "소자 검수 정보가 변경되었습니다."})
+            diagnosis["history"] = history[-100:]
         diagnosis["result"] = None
         diagnosis.pop("input_fingerprint", None)
         state[diagnosis_key] = diagnosis

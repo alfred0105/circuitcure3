@@ -11,6 +11,11 @@ from circuitcare.frontend.measurement_state import (
 from circuitcare.dashboard.views.measurement_panel import (
     _measurement_verification_gaps, _sigma_for_input_unit,
 )
+from circuitcare.analysis.fingerprints import build_analysis_fingerprints
+from circuitcare.analysis.models import AnalysisScope, AnalysisStatus
+from circuitcare.analysis.state_manager import (
+    begin_analysis, commit_analysis_result, get_current_result, get_current_state,
+)
 
 
 def _measurement(**overrides):
@@ -101,6 +106,28 @@ def test_measurement_cannot_be_relinked_to_a_new_map_or_identity_on_edit():
         update_measurement(state, replace(row, component_map_version="map-v2"))
     with pytest.raises(ValueError, match="Component Map"):
         update_measurement(state, replace(row, component_identity_status="USER_CONFIRMED"))
+
+
+def test_same_measurement_facts_keep_current_analysis_but_changed_facts_stale_it():
+    state = {}
+    row = _measurement()
+    save_measurement(state, row)
+    scope = AnalysisScope("p1", "b1", "photo-1")
+    fingerprint = build_analysis_fingerprints(
+        input_payload={"symptoms": ["no_power"]}, measurements=[row],
+    )
+    run_id = begin_analysis(state, scope=scope, fingerprints=fingerprint)
+    assert commit_analysis_result(state, scope=scope, run_id=run_id,
+                                  fingerprints=fingerprint, result={"status": "OK"})
+
+    update_measurement(state, replace(row, changed_at="later", measurement_set_id="different"))
+    assert get_current_result(state, scope=scope, fingerprints=fingerprint) == {"status": "OK"}
+    assert get_current_state(state, scope)["status"] == AnalysisStatus.CURRENT
+
+    update_measurement(state, replace(row, value=2.5, entered_value=2.5, changed_at="changed"))
+    assert get_current_result(state, scope=scope, fingerprints=fingerprint) is None
+    assert get_current_state(state, scope)["status"] == AnalysisStatus.STALE
+    assert get_current_state(state, scope)["history"][-1]["results"]["symptom"] == {"status": "OK"}
 
 
 def test_ui_uncertainty_stays_in_base_unit_when_measurement_unit_changes():

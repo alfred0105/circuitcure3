@@ -6,12 +6,9 @@ from typing import Any
 import time
 from pathlib import Path
 from uuid import uuid4
-import hashlib
-import json
 
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.frontend.measurement_state import get_measurements
-from circuitcare.frontend.measurement_models import measurement_set_sha256
 from circuitcare.local_llm import LocalLLMError, OllamaClient
 from circuitcare.symptom_diagnosis import diagnose, load_knowledge
 from circuitcare.symptom_diagnosis.llm_assist import (
@@ -22,6 +19,15 @@ from circuitcare.symptom_diagnosis.diagnosis_state import build_overlay_state
 from circuitcare.symptom_diagnosis.schemas import ComponentRecord, Observation
 from circuitcare.symptom_diagnosis.symptom_parser import parse_user_report
 from circuitcare.frontend.workbench_state import ACTIVE_PHOTO_KEY, update_selection
+from circuitcare.analysis.models import AnalysisScope
+from circuitcare.analysis.fingerprints import (
+    build_analysis_fingerprints, build_measurement_fingerprint,
+    build_symptom_input_fingerprint,
+)
+from circuitcare.analysis.state_manager import (
+    begin_analysis, commit_analysis_result, fail_analysis, get_current_result,
+    get_current_state, migrate_legacy_result,
+)
 
 
 def _project_key(project: ProjectContext) -> str:
@@ -36,54 +42,35 @@ def _diagnosis_fingerprint(
     inventory_complete: bool = False,
     component_inventory: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    component_rows = [{
-        "id": getattr(row, "component_id", None),
-        "type": getattr(row, "component_type", None),
-        "bbox": getattr(row, "bbox_xyxy", None),
-        "marking": getattr(row, "ocr_marking", None),
-        "part_number": getattr(row, "possible_part_number", None),
-        "info": getattr(row, "component_info", None),
-    } for row in components]
-    photo_rows = [{
-        "id": getattr(row, "photo_id", getattr(row, "image_id", None)),
-        "filename": getattr(row, "filename", None),
-        "dimensions": getattr(row, "image_dimensions", None),
-        "side": getattr(row, "side", None),
-        "content_sha256": getattr(row, "content_sha256", None),
-    } for row in project.image_records]
-    payload = {
-        "project_id": project.project_id, "board_id": project.board_id,
-        "symptom_category": project.symptom_category,
-        "symptom_description": project.symptom_description,
-        "symptom_text": symptom_text, "symptoms": sorted(symptoms),
-        "observations": observations, "answers": answers,
-        "components": component_rows, "photos": photo_rows,
-        "confirmed_component_ids": sorted(confirmed_component_ids or []),
-        "component_inventory_complete": bool(inventory_complete),
-        "component_inventory": component_inventory or {},
-        "active_photo_id": state.get(ACTIVE_PHOTO_KEY),
-        "silkscreen_labels": silkscreen_labels,
-        "component_map_version": state.get("circuitcare_v4_selection_map_key"),
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, allow_nan=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return build_symptom_input_fingerprint(
+        project=project, components=components, symptoms=symptoms, symptom_text=symptom_text,
+        observations=observations, answers=answers, silkscreen_labels=silkscreen_labels,
+        component_inventory=component_inventory, confirmed_component_ids=confirmed_component_ids,
+        inventory_complete=inventory_complete,
+        target_id=str(state.get(ACTIVE_PHOTO_KEY) or "target:default"),
+    )
+
+
+def _analysis_scope(project: ProjectContext, state: Any) -> AnalysisScope:
+    return AnalysisScope(project.project_id, project.board_id or "",
+                         str(state.get(ACTIVE_PHOTO_KEY) or "target:default"))
 
 
 def _measurement_fingerprint(project: ProjectContext, measurements: list[Any]) -> str:
-    return measurement_set_sha256(measurements, project_id=project.project_id,
-                                  board_id=project.board_id or "")
+    return build_measurement_fingerprint(measurements)
 
 
 def _sync_component_candidates(st: Any, project: ProjectContext, result: dict[str, Any]) -> None:
-    projects = dict(st.session_state.get("circuitcare_v4_diagnosis_candidates_by_project", {}))
+    projects = dict(st.session_state.get("circuitcare_v6_diagnosis_candidates_by_scope", {}))
     diagnosis_state = st.session_state.get(_project_key(project), {})
-    projects[project.project_id] = build_overlay_state(
+    scope = _analysis_scope(project, st.session_state)
+    projects[scope.key] = build_overlay_state(
         project_id=project.project_id, board_id=project.board_id,
         component_map_version=st.session_state.get("circuitcare_v4_selection_map_key"),
         result={**result, "input_fingerprint": diagnosis_state.get("input_fingerprint")},
-        previous=projects.get(project.project_id),
+        previous=projects.get(scope.key),
     )
-    st.session_state["circuitcare_v4_diagnosis_candidates_by_project"] = projects
+    st.session_state["circuitcare_v6_diagnosis_candidates_by_scope"] = projects
 
 
 def _component_rows(components: tuple[Any, ...],
@@ -134,7 +121,11 @@ def _combined_observations(state: dict[str, Any], answers: dict[str, Any] | None
 
 def _persist_diagnosis(project: ProjectContext, state: dict[str, Any], result: dict[str, Any],
                        components: tuple[Any, ...], observations: list[dict[str, Any]]) -> None:
-    diagnosis_id = state.setdefault("diagnosis_id", str(uuid4()))
+    target_id = str(state.get("analysis_target_id") or "target:default")
+    ids_by_target = state.setdefault("diagnosis_ids_by_target", {})
+    legacy_id = state.get("diagnosis_id") if state.get("analysis_target_id") in (None, target_id) else None
+    diagnosis_id = ids_by_target.setdefault(target_id, legacy_id or str(uuid4()))
+    state["diagnosis_id"] = diagnosis_id  # legacy readers still use the most recent ID
     result["diagnosis_id"] = diagnosis_id
     component_records = [ComponentRecord.from_mapping({
         "component_id": item.component_id, "label": item.component_type,
@@ -249,61 +240,61 @@ def render_symptom_diagnosis_panel(
         component_inventory,
     )
     measurement_fingerprint = _measurement_fingerprint(project, measurements)
-    if state.get("input_fingerprint") != fingerprint:
-        had_result = state.get("result") is not None
-        old_measurement_fingerprint = state.get("measurement_fingerprint")
-        if had_result:
-            if old_measurement_fingerprint and old_measurement_fingerprint != measurement_fingerprint:
-                reason = "측정 기록 변경"
-            elif state.get("symptoms") != selected_codes:
-                reason = "증상 입력 변경"
-            else:
-                reason = "소자 검수 또는 분석 조건 변경"
-            state["invalidated_reason"] = reason
-        state["result"] = None
-        state["answers"] = {}
-        state["input_fingerprint"] = fingerprint
-        state["measurement_fingerprint"] = measurement_fingerprint
-        state["diagnosis_id"] = str(uuid4())
-        st.session_state[key] = state
-        st.rerun()
     llm_enabled = bool(st.session_state.get(f"{key}_llm_enabled", False))
     selected_model = st.session_state.get(f"{key}_model")
-    if (state.get("result") and state.get("input_fingerprint") == fingerprint
-            and state.get("measurement_fingerprint") != measurement_fingerprint):
-        state["measurement_refresh_notice"] = True
-        combined_observations = _combined_observations(state)
-        result = diagnose(
-            symptoms=state.get("symptoms", selected_codes), symptom_text="",
-            observations=combined_observations, components=_component_rows(components, component_inventory),
-            confirmed_component_ids=state.get("confirmed_component_ids", confirmed_component_ids),
-            inventory_complete=bool(state.get("inventory_complete", inventory_complete)),
-            measurements=[row.to_dict() for row in measurements],
-            current_context=_current_analysis_context(project, st.session_state, component_inventory),
-            silkscreen_labels=silkscreen_labels, connectivity_status="none",
-        )
-        result["llm_parser"] = state.get("result", {}).get("llm_parser", {})
-        if llm_enabled and selected_model and result.get("component_candidates"):
-            try:
-                result["llm_component_explanations"] = explain_component_candidates(
-                    OllamaClient(timeout_seconds=120), selected_model,
-                    candidates=result["component_candidates"],
-                )
-            except (LocalLLMError, ValueError, TypeError, OSError) as exc:
-                result["llm_component_error"] = str(exc)
-        state["result"] = result
-        state.pop("invalidated_reason", None)
+    analysis_scope = _analysis_scope(project, st.session_state)
+    analysis_fingerprints = build_analysis_fingerprints(
+        input_payload={"input_sha256": fingerprint}, measurements=measurements,
+        extra_rules_payload={"llm_enabled": llm_enabled,
+                             "llm_model": selected_model if llm_enabled else None},
+    )
+    central_state = get_current_state(st.session_state, analysis_scope)
+    legacy_result_matches_inputs = (
+        state.get("input_fingerprint") == fingerprint
+        and state.get("measurement_fingerprint") == measurement_fingerprint
+        and state.get("rules_sha256") == analysis_fingerprints.rules_sha256
+    )
+    if state.get("result") and not central_state.get("results"):
+        migrated = False
+        if legacy_result_matches_inputs:
+            migrated = migrate_legacy_result(
+                st.session_state, scope=analysis_scope, fingerprints=analysis_fingerprints,
+                result=state["result"], legacy_fingerprint=state.get("input_fingerprint"),
+            )
+        if not migrated:
+            legacy_history = list(state.get("history", []))
+            legacy_history.append({"result": state["result"],
+                                   "reason": "중앙 상태 버전 전환 전의 진단 기록"})
+            state["history"] = legacy_history[-100:]
+            state["result"] = None
+    central_state = get_current_state(st.session_state, analysis_scope, analysis_fingerprints)
+    current_result = get_current_result(
+        st.session_state, scope=analysis_scope, fingerprints=analysis_fingerprints,
+    )
+    if state.get("input_fingerprint") != fingerprint or state.get("measurement_fingerprint") != measurement_fingerprint:
+        if state.get("result") and not current_result:
+            state["invalidated_reason"] = central_state.get("reason") or "분석 입력 변경"
+        state["input_fingerprint"] = fingerprint
         state["measurement_fingerprint"] = measurement_fingerprint
-        _persist_diagnosis(project, state, result, components, combined_observations)
-        _sync_component_candidates(st, project, result)
+        state["result"] = current_result
+        state["analysis_status"] = central_state.get("status", "NOT_RUN")
         st.session_state[key] = state
-        st.rerun()
+    elif current_result is not None:
+        state["result"] = current_result
+        state["analysis_status"] = "CURRENT"
+    else:
+        state["result"] = None
+        state["analysis_status"] = central_state.get("status", "NOT_RUN")
     if st.button("원인 후보 분석" if not state.get("result") else "다시 분석", type="primary", disabled=preview,
                  key=f"{key}_run"):
         state["symptoms"] = selected_codes
         state["confirmed_component_ids"] = confirmed_component_ids
         state["inventory_complete"] = inventory_complete
         state["manual_observations"] = {fact: value for fact, value in observations.items() if value is not None}
+        run_id = begin_analysis(
+            st.session_state, scope=analysis_scope, fingerprints=analysis_fingerprints,
+            result_kind="symptom",
+        )
         component_rows = _component_rows(components, component_inventory)
         parsed = {"observations": [], "uncertain_facts": [], "parser_status": "SKIPPED"}
         if llm_enabled and selected_model and symptom_text.strip():
@@ -321,17 +312,25 @@ def render_symptom_diagnosis_panel(
         parsed_symptoms = [row["code"] for row in state["parsed_observations"]
                            if row.get("status") in {"observed", "measured"} and row.get("value") is True
                            and row.get("code") in symptom_items]
-        result = diagnose(
-            symptoms=list(dict.fromkeys([*selected_codes, *parsed_symptoms])),
-            symptom_text=symptom_text,
-            observations=combined_observations, components=component_rows,
-            confirmed_component_ids=confirmed_component_ids,
-            inventory_complete=inventory_complete,
-            measurements=[row.to_dict() for row in measurements],
-            current_context=_current_analysis_context(project, st.session_state, component_inventory),
-            silkscreen_labels=silkscreen_labels,
-            connectivity_status="none",
-        )
+        try:
+            result = diagnose(
+                symptoms=list(dict.fromkeys([*selected_codes, *parsed_symptoms])),
+                symptom_text=symptom_text,
+                observations=combined_observations, components=component_rows,
+                confirmed_component_ids=confirmed_component_ids,
+                inventory_complete=inventory_complete,
+                measurements=[row.to_dict() for row in measurements],
+                current_context=_current_analysis_context(project, st.session_state, component_inventory),
+                silkscreen_labels=silkscreen_labels,
+                connectivity_status="none",
+            )
+        except Exception as exc:
+            fail_analysis(st.session_state, scope=analysis_scope, run_id=run_id, error=str(exc))
+            state["result"] = None
+            state["analysis_status"] = "FAILED"
+            st.session_state[key] = state
+            st.error(f"규칙 기반 분석을 완료하지 못했습니다: {exc}")
+            return
         result["llm_parser"] = parsed
         if len(result.get("hypotheses", [])) < 3 and llm_enabled and selected_model:
             try:
@@ -360,9 +359,23 @@ def render_symptom_diagnosis_panel(
                     )
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 result["llm_component_error"] = str(exc)
+        committed = commit_analysis_result(
+            st.session_state, scope=analysis_scope, run_id=run_id,
+            fingerprints=analysis_fingerprints, current_fingerprints=analysis_fingerprints,
+            result=result, result_kind="symptom",
+        )
+        if not committed:
+            state["result"] = None
+            state["analysis_status"] = "STALE"
+            state["invalidated_reason"] = "분석 중 입력이 바뀌어 이전 버전 결과를 저장하지 않았습니다."
+            st.session_state[key] = state
+            st.warning(state["invalidated_reason"])
+            return
+        state["analysis_target_id"] = analysis_scope.target_id
         _persist_diagnosis(project, state, result, components, combined_observations)
         _sync_component_candidates(st, project, result)
         state["result"] = result
+        state["analysis_status"] = "CURRENT"
         state.pop("invalidated_reason", None)
         state["input_fingerprint"] = fingerprint
         state["measurement_fingerprint"] = measurement_fingerprint
@@ -513,23 +526,40 @@ def render_symptom_diagnosis_panel(
                 answers.update(outcome.get("observations", {}))
         if st.button("답변 반영하고 다시 추론", key=f"{key}_apply_answers", disabled=preview):
             state["answers"] = answers
-            state["input_fingerprint"] = _diagnosis_fingerprint(
+            answer_input_fingerprint = _diagnosis_fingerprint(
                 project, components, selected_codes, symptom_text,
                 observations, answers, measurements,
                 silkscreen_labels, st.session_state, confirmed_component_ids, inventory_complete,
                 component_inventory,
             )
-            combined_observations = _combined_observations(state, answers)
-            state["result"] = diagnose(
-                symptoms=state.get("symptoms", []), symptom_text="",
-                observations=combined_observations,
-                components=_component_rows(components, component_inventory),
-                confirmed_component_ids=confirmed_component_ids,
-                inventory_complete=inventory_complete,
-                measurements=[row.to_dict() for row in measurements],
-                current_context=_current_analysis_context(project, st.session_state, component_inventory),
-                silkscreen_labels=silkscreen_labels, connectivity_status="none",
+            answer_fingerprints = build_analysis_fingerprints(
+                input_payload={"input_sha256": answer_input_fingerprint}, measurements=measurements,
+                extra_rules_payload={"llm_enabled": llm_enabled,
+                                     "llm_model": selected_model if llm_enabled else None},
             )
+            followup_run_id = begin_analysis(
+                st.session_state, scope=analysis_scope, fingerprints=answer_fingerprints,
+                result_kind="symptom",
+            )
+            combined_observations = _combined_observations(state, answers)
+            try:
+                state["result"] = diagnose(
+                    symptoms=state.get("symptoms", []), symptom_text="",
+                    observations=combined_observations,
+                    components=_component_rows(components, component_inventory),
+                    confirmed_component_ids=confirmed_component_ids,
+                    inventory_complete=inventory_complete,
+                    measurements=[row.to_dict() for row in measurements],
+                    current_context=_current_analysis_context(project, st.session_state, component_inventory),
+                    silkscreen_labels=silkscreen_labels, connectivity_status="none",
+                )
+            except Exception as exc:
+                fail_analysis(st.session_state, scope=analysis_scope, run_id=followup_run_id, error=str(exc))
+                state["result"] = None
+                state["analysis_status"] = "FAILED"
+                st.session_state[key] = state
+                st.error(f"추가 답변 분석을 완료하지 못했습니다: {exc}")
+                return
             if llm_enabled and selected_model and state["result"].get("hypotheses"):
                 try:
                     with st.spinner(f"{selected_model}이 갱신된 근거를 정리하는 중…"):
@@ -547,9 +577,25 @@ def render_symptom_diagnosis_panel(
                     )
                 except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                     state["result"]["llm_component_error"] = str(exc)
-            _persist_diagnosis(project, state, state["result"], components, combined_observations)
+            answer_result = state["result"]
+            committed = commit_analysis_result(
+                st.session_state, scope=analysis_scope, run_id=followup_run_id,
+                fingerprints=answer_fingerprints, current_fingerprints=answer_fingerprints,
+                result=answer_result, result_kind="symptom",
+            )
+            if not committed:
+                state["result"] = None
+                state["analysis_status"] = "STALE"
+                state["invalidated_reason"] = "추가 답변 처리 중 분석 입력이 변경되어 결과를 저장하지 않았습니다."
+                st.session_state[key] = state
+                st.warning(state["invalidated_reason"])
+                return
+            state["input_fingerprint"] = answer_input_fingerprint
             state["measurement_fingerprint"] = measurement_fingerprint
-            _sync_component_candidates(st, project, state["result"])
+            state["analysis_status"] = "CURRENT"
+            state["analysis_target_id"] = analysis_scope.target_id
+            _persist_diagnosis(project, state, answer_result, components, combined_observations)
+            _sync_component_candidates(st, project, answer_result)
             st.session_state[key] = state
             st.rerun()
     visuals = [item for item in result.get("next_tests", []) if item.get("type") == "visual_inspection"]
