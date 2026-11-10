@@ -43,16 +43,17 @@ def render_inspection_panel(
     detection_status: str = "UNKNOWN",
     selected_marking_context: dict[str, Any] | None = None,
     component_map_version: str | None = None,
+    inventory_scope: str | None = None,
     review_image_bytes: bytes | None = None,
     review_scope: str | None = None,
 ) -> None:
-    owner = f"{project.project_id}|{project.board_id or ''}|{component_map_version or ''}"
+    owner = f"{project.project_id}|{project.board_id or ''}|{inventory_scope or component_map_version or ''}"
     inventories = st.session_state.setdefault(COMPONENT_INVENTORY_KEY, {})
     inventory = inventories.setdefault(owner, {})
     with st.container(border=True):
         st.markdown('<span class="cc-inspection-marker"></span>', unsafe_allow_html=True)
         st.markdown("### 전체 진단")
-        st.info("미리보기 · 진단 미실행" if preview else "진단 미실행")
+        st.info("미리보기 · 진단 미실행" if preview else _diagnosis_status_label(st, project))
         st.caption(f"사진 · {len(project.image_records)}장")
         symptom = {
             "power_failure": "전원 불량", "output_anomaly": "출력 이상",
@@ -99,6 +100,8 @@ def render_inspection_panel(
             presence_status = st.radio(
                 "PCB에서 선택 부품 상태", presence_options,
                 format_func=presence_labels.get, horizontal=True, key=presence_key,
+                on_change=_sync_inventory_widget, args=(st, owner, selected_component.component_id,
+                                                        "presence_status", presence_key),
             )
             inventory_item["presence_status"] = presence_status
             st.caption("확인한 소자만 진단 후보로 사용합니다. 오검출은 제외하고, 아직 판단이 안 되면 미확인으로 두세요.")
@@ -108,24 +111,31 @@ def render_inspection_panel(
                 st.session_state[type_status_key] = inventory_item.get("component_type_status", "UNCONFIRMED")
             component_type_status = st.radio("부품 종류 확인", type_status_options,
                 format_func=lambda value: "종류 확인됨" if value == "USER_CONFIRMED" else "종류 미확인",
-                horizontal=True, key=type_status_key)
+                horizontal=True, key=type_status_key,
+                on_change=_sync_inventory_widget, args=(st, owner, selected_component.component_id,
+                                                        "component_type_status", type_status_key))
             inventory_item["component_type_status"] = component_type_status
-            identity_key = f"cc_part_identity_status_{hash(owner)}_{selected_component.component_id}"
-            if st.session_state.get(identity_key) not in type_status_options:
-                st.session_state[identity_key] = inventory_item.get("part_identity_status", "UNCONFIRMED")
-            part_identity_status = st.radio("부품 모델/부품번호 확인", type_status_options,
-                format_func=lambda value: "모델 식별됨" if value == "USER_CONFIRMED" else "모델 미확인",
-                horizontal=True, key=identity_key)
-            inventory_item["part_identity_status"] = part_identity_status
-            role_key = f"cc_component_roles_{hash(owner)}_{selected_component.component_id}"
-            current_roles = inventory_item.get("confirmed_functional_roles", [])
-            if role_key not in st.session_state:
-                st.session_state[role_key] = [role for role in current_roles if role in ROLE_OPTIONS]
-            confirmed_roles = st.multiselect(
-                "이 부품에서 확인된 기능 역할", ROLE_OPTIONS, key=role_key,
-                help="직접 확인한 역할만 선택합니다. 선택하지 않은 배치/OCR 추정은 미확정 후보로 유지됩니다.",
-            )
-            inventory_item["confirmed_functional_roles"] = list(confirmed_roles)
+            with st.expander("상세 식별·기능 확인", expanded=False):
+                identity_key = f"cc_part_identity_status_{hash(owner)}_{selected_component.component_id}"
+                if st.session_state.get(identity_key) not in type_status_options:
+                    st.session_state[identity_key] = inventory_item.get("part_identity_status", "UNCONFIRMED")
+                part_identity_status = st.radio("부품 모델/부품번호 확인", type_status_options,
+                    format_func=lambda value: "모델 식별됨" if value == "USER_CONFIRMED" else "모델 미확인",
+                    horizontal=True, key=identity_key,
+                    on_change=_sync_inventory_widget, args=(st, owner, selected_component.component_id,
+                                                            "part_identity_status", identity_key))
+                inventory_item["part_identity_status"] = part_identity_status
+                role_key = f"cc_component_roles_{hash(owner)}_{selected_component.component_id}"
+                current_roles = inventory_item.get("confirmed_functional_roles", [])
+                if role_key not in st.session_state:
+                    st.session_state[role_key] = [role for role in current_roles if role in ROLE_OPTIONS]
+                confirmed_roles = st.multiselect(
+                    "이 부품에서 확인된 기능 역할", ROLE_OPTIONS, key=role_key,
+                    help="직접 확인한 역할만 선택합니다. 선택하지 않은 배치/OCR 추정은 미확정 후보로 유지됩니다.",
+                    on_change=_sync_inventory_widget, args=(st, owner, selected_component.component_id,
+                                                            "confirmed_functional_roles", role_key),
+                )
+                inventory_item["confirmed_functional_roles"] = list(confirmed_roles)
             inventories[owner] = inventory
             st.session_state[COMPONENT_INVENTORY_KEY] = inventories
             selected_component = replace(
@@ -137,6 +147,10 @@ def render_inspection_panel(
             if selected_component.fault_hypothesis:
                 st.caption(f"진단 후보 · {selected_component.diagnosis_display_status or '미확정'} · "
                            f"가설 {selected_component.fault_hypothesis}")
+                if selected_component.fault_role_status == "INFERRED":
+                    st.caption("기능 역할 추정 · 미확정 후보이며 추가 역할 확인이 필요합니다.")
+                elif selected_component.fault_role_status == "CONFIRMED":
+                    st.caption("기능 역할 확인됨")
                 if selected_component.fault_score is not None:
                     st.caption(f"상대 점수 · {selected_component.fault_score:g} · 확률이 아닌 후보 정렬 점수")
                 if selected_component.measurement_status:
@@ -146,6 +160,11 @@ def render_inspection_panel(
                     st.caption("후보 근거 · " + " · ".join(selected_component.fault_evidence[:5]))
                 if selected_component.recommended_tests:
                     st.caption("권장 확인 · " + " · ".join(selected_component.recommended_tests[:3]))
+            for history_item in selected_component.fault_history[-3:]:
+                st.caption(
+                    f"검사 이력 · {history_item.get('fault_title', history_item.get('fault_hypothesis', '고장 가설'))} · "
+                    f"{history_item.get('measurement_verdict', '판정 기록')}"
+                )
             type_key = f"cc_v4_edit_type_{selected_component.component_id}"
             marking_key = f"cc_v4_edit_marking_{selected_component.component_id}"
             value_key = f"cc_v4_edit_value_{selected_component.component_id}"
@@ -155,20 +174,21 @@ def render_inspection_panel(
                 st.session_state[marking_key] = current_marking
             if value_key not in st.session_state:
                 st.session_state[value_key] = current_value
-            st.selectbox("인식 부품 종류", COMPONENT_TYPE_OPTIONS,
-                         format_func=_component_label, key=type_key)
-            st.text_input("OCR 인식값 · 각인/부품번호", key=marking_key,
-                          placeholder="예: 103, LM358")
-            st.text_input("소자 값 · OCR 유추값 또는 직접 입력", key=value_key,
-                          placeholder="예: 10 kΩ, 100 nF, 3.3 V")
-            if st.button("인식 정보 저장", type="primary", key=f"cc_v4_save_component_{selected_component.component_id}"):
-                edits[selected_component.component_id] = {
-                    "component_type": st.session_state[type_key],
-                    "ocr_marking": st.session_state[marking_key].strip(),
-                    "component_info": st.session_state[value_key].strip(),
-                }
-                st.session_state[COMPONENT_EDIT_KEY] = edits
-                st.rerun()
+            with st.expander("인식 정보 편집", expanded=False):
+                st.selectbox("인식 부품 종류", COMPONENT_TYPE_OPTIONS,
+                             format_func=_component_label, key=type_key)
+                st.text_input("OCR 인식값 · 각인/부품번호", key=marking_key,
+                              placeholder="예: 103, LM358")
+                st.text_input("소자 값 · OCR 유추값 또는 직접 입력", key=value_key,
+                              placeholder="예: 10 kΩ, 100 nF, 3.3 V")
+                if st.button("인식 정보 저장", type="primary", key=f"cc_v4_save_component_{selected_component.component_id}"):
+                    edits[selected_component.component_id] = {
+                        "component_type": st.session_state[type_key],
+                        "ocr_marking": st.session_state[marking_key].strip(),
+                        "component_info": st.session_state[value_key].strip(),
+                    }
+                    st.session_state[COMPONENT_EDIT_KEY] = edits
+                    st.rerun()
             if current_marking or current_value:
                 st.caption(f"자동 판독 상태 · {display_identity_status(selected_component.identification_status)}")
             if selected_marking_context and selected_component.component_id.startswith("auto-"):
@@ -190,16 +210,38 @@ def render_inspection_panel(
             st.session_state, project_id=project.project_id, board_id=project.board_id or "",
         )
         map_version = st.session_state.get(MAP_VERSION_KEY)
-        render_measurement_panel(
-            st, project, selected_component=selected_component, preview=preview,
-            component_map_version=map_version,
-        )
-        selection = st.session_state.get("circuitcare_v2_selection")
-        render_diagnosis_panel(
-            st, project, measurements=measurements,
-            analysis_context_id=getattr(selection, "analysis_context_id", None),
-            component_map_version=map_version,
-        )
+        with st.expander("측정 및 회로 모델 상세", expanded=False):
+            render_measurement_panel(
+                st, project, selected_component=selected_component, preview=preview,
+                component_map_version=map_version,
+            )
+            selection = st.session_state.get("circuitcare_v2_selection")
+            render_diagnosis_panel(
+                st, project, measurements=measurements,
+                analysis_context_id=getattr(selection, "analysis_context_id", None),
+                component_map_version=map_version,
+            )
+
+
+def _diagnosis_status_label(st: Any, project: ProjectContext) -> str:
+    state = st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {})
+    result = state.get("result") if isinstance(state, dict) else None
+    if not isinstance(result, dict):
+        return "진단 미실행"
+    status = result.get("status")
+    if status == "CANDIDATES_AVAILABLE":
+        return f"진단 완료 · 후보 {len(result.get('component_candidates', []))}개"
+    if status == "ABSTAIN_INSUFFICIENT_EVIDENCE":
+        return "추론 보류 · 추가 정보 필요"
+    return "진단 결과 확인 필요"
+
+
+def _sync_inventory_widget(st: Any, owner: str, component_id: str, field: str, widget_key: str) -> None:
+    inventories = st.session_state.setdefault(COMPONENT_INVENTORY_KEY, {})
+    inventory = inventories.setdefault(owner, {})
+    item = inventory.setdefault(component_id, {})
+    item[field] = st.session_state.get(widget_key)
+    st.session_state[COMPONENT_INVENTORY_KEY] = inventories
 
 
 def _render_selected_marking(st: Any, context: dict[str, Any]) -> None:

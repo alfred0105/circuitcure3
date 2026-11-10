@@ -57,6 +57,8 @@ def validate_component_hypothesis(
     reasons: list[str] = []
     if not component_id or component_id not in confirmed_component_ids:
         reasons.append("COMPONENT_PRESENCE_UNCONFIRMED")
+    if component.get("component_type_status") not in (None, "USER_CONFIRMED"):
+        reasons.append("COMPONENT_TYPE_UNCONFIRMED")
     if allowed_types and component_type not in allowed_types:
         reasons.append("INCOMPATIBLE_COMPONENT_TYPE")
     required_types = {str(value).casefold() for value in mode.get("required_component_types", [])}

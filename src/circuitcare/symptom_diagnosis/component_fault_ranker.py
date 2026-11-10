@@ -42,12 +42,15 @@ def rank_component_candidates(
     measurements: list[dict[str, Any]] | None, knowledge: dict[str, Any],
     confirmed_component_ids: set[str] | list[str] | tuple[str, ...] | None = None,
     profiles: dict[str, Any] | None = None, current_context: dict[str, Any] | None = None,
-    limit: int = 3,
+    limit: int = 3, include_refuted: bool = False, distinct_components: bool = True,
 ) -> list[dict[str, Any]]:
     """Return at most three distinct, present component IDs without forced slots."""
     confirmed_ids = {str(value) for value in (confirmed_component_ids or [])}
-    confirmed_types = {str(part.get("component_type", part.get("label", "unknown"))).casefold()
-                       for part in components if str(part.get("component_id") or "") in confirmed_ids}
+    confirmed_types = {
+        str(part.get("component_type", part.get("label", "unknown"))).casefold()
+        for part in components if str(part.get("component_id") or "") in confirmed_ids
+        and part.get("component_type_status") in (None, "USER_CONFIRMED")
+    }
     block_by_id = {str(row.get("component_id")): row for row in functional_blocks}
     modes = knowledge.get("fault_modes", {}).get("fault_modes", {})
     tests = knowledge.get("test_catalog", {}).get("tests", {})
@@ -141,7 +144,9 @@ def rank_component_candidates(
             raw_score = symptom_score + role_score + observation_score + measurement_score
             # A verified refuting measurement is still a useful, displayable result:
             # retain the component as a green, hypothesis-specific history candidate.
-            score = max(0.1, raw_score) if verdict["verdict"] == "refutes" else max(0.0, raw_score)
+            if verdict["verdict"] == "refutes" and not include_refuted:
+                continue
+            score = max(0.1 if verdict["verdict"] == "refutes" else 0.0, raw_score)
             if score <= 0:
                 continue
             visual_status = {
@@ -193,11 +198,14 @@ def rank_component_candidates(
 
     results.sort(key=lambda row: (-row["score"], row["component_id"], row["fault_hypothesis"]))
     selected: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str] | str] = set()
     for row in results:
-        if row["component_id"] in seen:
+        unique_key = row["component_id"] if distinct_components else (
+            row["component_id"], row["fault_hypothesis"]
+        )
+        if unique_key in seen:
             continue
-        seen.add(row["component_id"])
+        seen.add(unique_key)
         row["candidate_rank"] = len(selected) + 1
         row["rank"] = len(selected) + 1
         selected.append(row)

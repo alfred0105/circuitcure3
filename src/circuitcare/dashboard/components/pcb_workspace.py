@@ -189,6 +189,9 @@ def render_component_viewer(
         "possible_part_number": item.possible_part_number,
         "fault_candidate_status": item.fault_candidate_status,
         "diagnosis_display_status": item.diagnosis_display_status,
+        "fault_hypothesis": item.fault_hypothesis,
+        "fault_role_status": item.fault_role_status,
+        "fault_history": list(item.fault_history),
     } for item in components]
     result = render_pcb_viewer(
         st, image_png_base64=image_b64, image_size_px=image_size_px, components=payload,

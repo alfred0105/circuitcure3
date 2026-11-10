@@ -37,4 +37,9 @@ profiles:
         fault_relations:
           DIODE_SHORT_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
           DIODE_OPEN_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
+      reverse_leakage:
+        measurement_type: current
+        target_keywords: [역방향 누설, reverse leakage, 역누설]
+        condition_keywords: [전원 차단, power off, 회로에서 분리, isolated]
+        fault_relations:
           DIODE_LEAKAGE_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}

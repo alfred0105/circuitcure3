@@ -85,9 +85,12 @@ export default function(component) {
     const rows = [typeLabels[item.component_type?.toLowerCase()] || item.component_type];
     if (item.display_label) rows.push(`Reference ${item.display_label}`);
     rows.push(`식별 ${item.display_status || "미확인"}`);
+    if (item.fault_role_status === "INFERRED") rows.push("기능 역할 추정 · 미확정");
+    else if (item.fault_role_status === "CONFIRMED") rows.push("기능 역할 확인됨");
     if (item.ocr_marking) rows.push(`표기 ${item.ocr_marking}`);
-    const faultLabels = { SUSPECTED_FAULT:"고장 의심 후보", RELATED_COMPONENT:"관련 점검 후보",
-      CONFIRMED_FAULT:"검사 근거 확인" };
+    const faultLabels = { SUSPECTED_FAULT:"고장 의심 후보 · 검사 필요", RELATED_COMPONENT:"관련 점검 후보",
+      CONFIRMED_FAULT:"검사 근거 확인", FAULT_SUPPORTED:"검증 검사 · 고장 가설 지지",
+      FAULT_REFUTED:"검증 검사 · 고장 가설 반박", INCONCLUSIVE:"검사 판정 불가" };
     if (faultLabels[item.fault_candidate_status]) {
       rows.push(faultLabels[item.fault_candidate_status]);
     } else {
@@ -100,6 +103,10 @@ export default function(component) {
       };
       rows.push(diagnosisLabels[item.diagnosis_display_status] || "고장 진단 미실행");
     }
+    for (const history of item.fault_history || []) {
+      const historyLabel = faultLabels[history.visual_status];
+      if (historyLabel) rows.push(`이전 검사 · ${historyLabel}`);
+    }
     tooltip.textContent = rows.join("\n"); tooltip.hidden = false;
     const rect = viewport.getBoundingClientRect();
     tooltip.style.left = `${Math.min(Math.max(8, event.clientX - rect.left + 12), rect.width - 220)}px`;
@@ -111,7 +118,7 @@ export default function(component) {
     for (const item of data.components || []) {
       const [x1,y1,x2,y2] = item.bbox_xyxy;
       const shape = svgElement("rect", { x:x1, y:y1, width:x2-x1, height:y2-y1,
-        class:`cc-pcb-component${item.component_id === data.selected_component_id ? " cc-selected" : ""}${item.overlay_status === "EXCLUDED" ? " cc-excluded" : ""}${item.fault_candidate_status === "SUSPECTED_FAULT" ? " cc-fault-suspected" : item.fault_candidate_status === "RELATED_COMPONENT" ? " cc-fault-related" : item.fault_candidate_status === "CONFIRMED_FAULT" ? " cc-fault-confirmed" : ""}`,
+        class:`cc-pcb-component${item.component_id === data.selected_component_id ? " cc-selected" : ""}${item.overlay_status === "EXCLUDED" ? " cc-excluded" : ""}${item.fault_candidate_status === "SUSPECTED_FAULT" ? " cc-fault-suspected" : item.fault_candidate_status === "RELATED_COMPONENT" ? " cc-fault-related" : item.fault_candidate_status === "CONFIRMED_FAULT" ? " cc-fault-confirmed" : item.fault_candidate_status === "FAULT_SUPPORTED" ? " cc-fault-supported" : item.fault_candidate_status === "FAULT_REFUTED" ? " cc-fault-refuted" : item.fault_candidate_status === "INCONCLUSIVE" ? " cc-fault-inconclusive" : ""}`,
         "data-component-id":item.component_id, tabindex:"0", role:"button",
         "aria-label":`${item.display_label || item.component_type} 부품 선택` });
       fragment.appendChild(shape);

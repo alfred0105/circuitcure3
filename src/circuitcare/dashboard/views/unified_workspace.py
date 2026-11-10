@@ -11,7 +11,10 @@ import tempfile
 from typing import Any
 
 from circuitcare.frontend.models import ProjectContext
-from circuitcare.symptom_diagnosis.diagnosis_state import current_overlay_candidates
+from circuitcare.symptom_diagnosis.diagnosis_state import (
+    component_inventory_version, current_overlay_candidates,
+    current_verified_component_history,
+)
 from circuitcare.frontend.component_overlay_adapter import (
     adapt_component_map_components, adapt_original_photo_components,
 )
@@ -35,6 +38,7 @@ from circuitcare.dashboard.components.pcb_workspace import (
 )
 from circuitcare.dashboard.views.inspection_panel import (
     COMPONENT_EDIT_KEY, MAP_VERSION_KEY, render_inspection_panel,
+    _diagnosis_status_label,
 )
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
@@ -235,6 +239,19 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             photo_id=selected, review_image_bytes=detector_image_bytes,
             review_image_size=display_size,
         )
+        review_scope = component_review_scope(detector_image_bytes, project.project_id, selected)
+        _result_key, records_key, _error_key = review_keys(review_scope)
+        review_rows = st.session_state.get(records_key, [])
+        active_inventory_version = component_inventory_version(
+            project_id=project.project_id, board_id=project.board_id, photo_id=selected,
+            image_sha256=hashlib.sha256(image_data).hexdigest(), components=[
+                {"component_id": row.get("component_id"), "component_type": row.get("소자 종류", "unknown"),
+                 "bbox_xyxy": [row.get("x1", 0), row.get("y1", 0), row.get("x2", 0), row.get("y2", 0)]}
+                for row in review_rows if isinstance(row, dict)
+            ],
+        )
+        st.session_state[MAP_VERSION_KEY] = active_inventory_version
+        st.session_state["circuitcare_v4_component_inventory_scope"] = review_scope
     side_result = side_result if isinstance(side_result, dict) else {}
     detection_status = str(side_result.get("detection_status", "UNKNOWN"))
     if auto_detection_error:
@@ -278,7 +295,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
     live_context = current_diagnosis_context(
         st.session_state, project_id=project.project_id, board_id=project.board_id or "",
         analysis_context_id=getattr(selection_context, "analysis_context_id", None),
-        component_map_version=cache_key if component_map else None,
+        component_map_version=st.session_state.get(MAP_VERSION_KEY),
     )
     scoped_diagnosis = diagnosis_state(
         st.session_state, project_id=project.project_id, board_id=project.board_id or "",
@@ -375,6 +392,9 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         st.session_state["circuitcare_v4_selected_marking_context"] = None
     else:
         review_scope = None
+        active_inventory_version = cache_key if component_map else None
+        st.session_state[MAP_VERSION_KEY] = active_inventory_version
+        st.session_state["circuitcare_v4_component_inventory_scope"] = active_inventory_version
         st.session_state.pop("cc_active_component_review_scope", None)
         st.session_state.pop("cc_active_component_review_image", None)
         st.session_state["circuitcare_v4_selected_marking_context"] = None
@@ -403,9 +423,18 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
     candidate_state = current_overlay_candidates(
         candidate_state_by_project.get(project.project_id) if isinstance(candidate_state_by_project, dict) else {},
         project_id=project.project_id, board_id=project.board_id,
-        component_map_version=st.session_state.get("circuitcare_v4_selection_map_key"),
+        component_map_version=st.session_state.get(MAP_VERSION_KEY),
         input_fingerprint=st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {}).get("input_fingerprint"),
     )
+    verified_history = current_verified_component_history(
+        candidate_state_by_project.get(project.project_id) if isinstance(candidate_state_by_project, dict) else {},
+        project_id=project.project_id, board_id=project.board_id,
+        component_map_version=st.session_state.get(MAP_VERSION_KEY),
+        input_fingerprint=st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {}).get("input_fingerprint"),
+    )
+    history_by_id: dict[str, list[dict[str, Any]]] = {}
+    for history_row in verified_history:
+        history_by_id.setdefault(str(history_row.get("component_id") or ""), []).append(history_row)
     if isinstance(candidate_state, dict) and candidate_state:
         status_map = {
             "SUSPECTED": ("SUSPECTED_FAULT", "의심 후보 · 미확정"),
@@ -421,12 +450,31 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
                     diagnosis_display_status=status_map.get(candidate_state[model.component_id].get("visual_status"),
                                                             ("INCONCLUSIVE", "판정 불가"))[1],
                     fault_hypothesis=candidate_state[model.component_id].get("fault_hypothesis"),
+                    fault_role_status=candidate_state[model.component_id].get("role_status"),
                     measurement_status=candidate_state[model.component_id].get("measurement_status"),
                     solder_status=candidate_state[model.component_id].get("solder_status"),
                     fault_score=candidate_state[model.component_id].get("score"),
                     fault_evidence=tuple(candidate_state[model.component_id].get("evidence", [])),
-                    recommended_tests=tuple(candidate_state[model.component_id].get("recommended_tests", [])))
+                    recommended_tests=tuple(candidate_state[model.component_id].get("recommended_tests", [])),
+                    fault_history=tuple(history_by_id.get(model.component_id, [])))
             if model.component_id in candidate_state else model
+            for model in component_models
+        )
+    if history_by_id:
+        component_models = tuple(
+            replace(
+                model,
+                fault_history=tuple(history_by_id[model.component_id]),
+                fault_candidate_status=(
+                    history_by_id[model.component_id][-1].get("visual_status")
+                    if model.component_id not in candidate_state else model.fault_candidate_status
+                ),
+                diagnosis_display_status=(
+                    history_by_id[model.component_id][-1].get("visual_status")
+                    if model.component_id not in candidate_state else model.diagnosis_display_status
+                ),
+            )
+            if model.component_id in history_by_id and model.component_id not in candidate_state else model
             for model in component_models
         )
     st.session_state["circuitcare_v4_current_components"] = tuple(component_models)
@@ -538,7 +586,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
     title, add_photo, edit, new = st.columns([5, 1, 1, 1])
     with title:
         st.markdown('<div class="cc-wb-header">CircuitCare AI</div>', unsafe_allow_html=True)
-        st.caption(f"{project.project_id[:8]} · 사진 {len(project.image_records)}장 · 진단 미실행")
+        st.caption(f"{project.project_id[:8]} · 사진 {len(project.image_records)}장 · {_diagnosis_status_label(st, project)}")
     if add_photo.button("사진 추가", use_container_width=True, key="cc_v2_workbench_add_photo"):
         st.session_state["circuitcare_v2_edit_project_id"] = project.project_id
         st.session_state["circuitcare_v2_edit_board_id"] = project.board_id
@@ -564,7 +612,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
 
     preview = st.session_state.get(MODE_KEY) == "PREVIEW_ONLY"
     with st.container(key="cc_workbench_body"):
-        left, right = st.columns([3.6, 1.25], gap="medium")
+        left, right = st.columns([3.2, 1.55], gap="medium")
         with left:
             st.session_state.pop("circuitcare_v2_active_tab", None)
             update_selection(
@@ -581,7 +629,8 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                 selected_component=selected_component,
                 detection_status=st.session_state.get("circuitcare_v4_detection_status", "UNKNOWN"),
                 selected_marking_context=st.session_state.get("circuitcare_v4_selected_marking_context"),
-                component_map_version=st.session_state.get("circuitcare_v4_selection_map_key"),
+                component_map_version=st.session_state.get(MAP_VERSION_KEY),
+                inventory_scope=st.session_state.get("circuitcare_v4_component_inventory_scope"),
                 review_image_bytes=st.session_state.get("cc_active_component_review_image"),
                 review_scope=st.session_state.get("cc_active_component_review_scope"),
             )

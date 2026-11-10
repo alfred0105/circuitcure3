@@ -350,7 +350,8 @@ def diagnose(
     unconfirmed_ids = [str(part.get("component_id")) for part in normalized_parts
                        if str(part.get("component_id") or "") not in confirmed_ids]
     normalized_parts = confirmed_parts
-    detected_types = {part["component_type"] for part in normalized_parts}
+    detected_types = {part["component_type"] for part in normalized_parts
+                      if part.get("component_type_status") in (None, "USER_CONFIRMED")}
     if "fuse" in detected_types:
         facts.setdefault("FUSE_PRESENT", True)
     elif inventory_complete:
@@ -545,12 +546,23 @@ def diagnose(
                        "status": "UNVERIFIED_CANDIDATE"})
     level_priority = {"component": 0, "functional_block": 1, "board": 2, "system": 3}
     ranked.sort(key=lambda row: (level_priority.get(row["level"], 4), -row["score"], row["title"]))
+    ranked_component_evidence = rank_component_candidates(
+        hypotheses=ranked, components=normalized_parts, functional_blocks=functional_blocks,
+        observations=(observations if isinstance(observations, list) else []),
+        measurements=contextual_measurements,
+        confirmed_component_ids=confirmed_ids, profiles=kb.get("component_test_profiles", {}),
+        current_context=current_context, knowledge=kb,
+        limit=max(3, len(normalized_parts) * max(1, len(ranked))),
+        include_refuted=True, distinct_components=False,
+    )
+    verified_component_history = [row for row in ranked_component_evidence
+                                  if row.get("visual_status") in {"FAULT_SUPPORTED", "FAULT_REFUTED"}]
     component_candidates = rank_component_candidates(
         hypotheses=ranked, components=normalized_parts, functional_blocks=functional_blocks,
         observations=(observations if isinstance(observations, list) else []),
         measurements=contextual_measurements,
         confirmed_component_ids=confirmed_ids, profiles=kb.get("component_test_profiles", {}),
-        current_context=current_context, knowledge=kb, limit=3,
+        current_context=current_context, knowledge=kb, limit=3, include_refuted=False,
     )
     joint_candidates = rank_joint_candidates(
         hypotheses=ranked, component_candidates=component_candidates, observations=facts,
@@ -648,7 +660,7 @@ def diagnose(
         "used_for_ranking": any(candidate.get("component_id") == row.get("component_id")
                                  and candidate.get("fault_hypothesis") == row.get("fault_hypothesis")
                                  and candidate.get("measurement_verdict") in {"supports", "refutes"}
-                                 for candidate in component_candidates),
+                                 for candidate in [*component_candidates, *verified_component_history]),
         "reason": measurement_assessments.get((str(row.get("component_id") or ""),
                                                  str(row.get("fault_hypothesis") or ""),
                                                  str(row.get("test_id") or ""),
@@ -669,7 +681,9 @@ def diagnose(
                               for rule in sorted(matched_rules, key=lambda item: -item.get("priority", 0))],
             "hypotheses": ranked, "functional_blocks": functional_blocks,
             "hypothesis_groups": hypothesis_groups,
-            "component_candidates": component_candidates, "joint_candidates": joint_candidates,
+            "component_candidates": component_candidates,
+            "verified_component_history": verified_component_history,
+            "joint_candidates": joint_candidates,
             "measurement_evidence": measurement_evidence,
             "next_tests": recommended[:5], "connectivity_status": connectivity_status,
             "verified_connectivity_evidence_count": len(verified_edges) if connectivity_status in {"verified", "partial_verified"} else 0,

@@ -93,6 +93,9 @@ def _component_rows(components: tuple[Any, ...],
              "bbox_xyxy": list(item.bbox_xyxy), "ocr_marking": item.ocr_marking,
              "component_info": getattr(item, "component_info", None),
              "presence_status": inventory.get(item.component_id, {}).get("presence_status", "UNCONFIRMED"),
+             "component_type_status": inventory.get(item.component_id, {}).get(
+                 "component_type_status", getattr(item, "component_type_status", "UNCONFIRMED")),
+             "part_identity_status": inventory.get(item.component_id, {}).get("part_identity_status", "UNCONFIRMED"),
              "confirmed_functional_roles": inventory.get(item.component_id, {}).get("confirmed_functional_roles", []),
              "role_status": "CONFIRMED" if inventory.get(item.component_id, {}).get("confirmed_functional_roles") else "UNKNOWN",
              "role_evidence": ("사용자가 선택한 기능 역할",) if inventory.get(item.component_id, {}).get("confirmed_functional_roles") else ()}

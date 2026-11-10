@@ -29,11 +29,13 @@ class ComponentOverlayViewModel:
     fault_candidate_status: str | None = None
     diagnosis_display_status: str | None = None
     fault_hypothesis: str | None = None
+    fault_role_status: str | None = None
     measurement_status: str | None = None
     solder_status: str | None = None
     fault_score: float | None = None
     fault_evidence: tuple[str, ...] = ()
     recommended_tests: tuple[str, ...] = ()
+    fault_history: tuple[dict, ...] = ()
     component_info: str | None = None
     ocr_status: str | None = None
     ocr_candidates: tuple[str, ...] = ()
