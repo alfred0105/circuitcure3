@@ -1,0 +1,320 @@
+"""Conservative board-level component identities across independent PCB photos.
+
+Photo detections remain the source of geometry. Registry identities are merged
+only through an explicit user-confirmed relation; geometric proximity is never
+used to join detections from different coordinate frames.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+from typing import Any
+
+
+REGISTRY_KEY = "circuitcare_v7_board_component_registry"
+
+
+@dataclass(frozen=True)
+class BoardDiagnosisComponent:
+    """Engine-facing board identity without cross-photo pixel coordinates."""
+    component_id: str
+    board_component_id: str
+    component_type: str
+    bbox_xyxy: None
+    ocr_marking: str | None
+    possible_part_number: str | None
+    component_info: str | None
+    identification_status: str
+    component_type_status: str
+    presence_status: str
+    confirmed_functional_roles: tuple[str, ...]
+    evidence: tuple[str, ...]
+    source_photo_ids: tuple[str, ...]
+    identity_status: str
+    overlay_source: str = "board_registry"
+    detection_confidence: float | None = None
+
+
+def diagnosis_components(registry: dict[str, Any]) -> tuple[BoardDiagnosisComponent, ...]:
+    """Project registry rows to the diagnosis engine using only confirmed facts."""
+    result = []
+    for row in registry.get("components", []):
+        if row.get("presence_status") == "EXCLUDED":
+            continue
+        confirmed = row.get("presence_status") == "CONFIRMED"
+        type_confirmed = row.get("component_type_status") == "USER_CONFIRMED"
+        source_rows = sorted(row.get("source_components", []),
+                             key=lambda item: item.get("review_status") == "EXCLUDED")
+        markings = [source.get("ocr_marking") for source in source_rows
+                    if source.get("review_status") in {"USER_CONFIRMED", "user_confirmed"}
+                    and source.get("ocr_marking")]
+        result.append(BoardDiagnosisComponent(
+            component_id=str(row["board_component_id"]),
+            board_component_id=str(row["board_component_id"]),
+            component_type=str(row["component_type"] if type_confirmed else "unknown"),
+            bbox_xyxy=None,
+            ocr_marking=markings[0] if markings else None,
+            possible_part_number=None,
+            component_info=None,
+            identification_status="USER_CONFIRMED" if confirmed else "SUGGESTED_CLASS_ONLY",
+            component_type_status="USER_CONFIRMED" if type_confirmed else "UNCONFIRMED",
+            presence_status="CONFIRMED" if confirmed else "UNCONFIRMED",
+            confirmed_functional_roles=tuple(row.get("functional_roles", ())) if confirmed else (),
+            evidence=tuple(row.get("evidence", ())),
+            source_photo_ids=tuple(row.get("source_photo_ids", ())),
+            identity_status=str(row.get("identity_status", "PHOTO_LOCAL")),
+            detection_confidence=None,
+        ))
+    return tuple(result)
+
+
+def measurement_component_aliases(registry: dict[str, Any]) -> dict[str, str | None]:
+    """Map legacy local measurement IDs only when their identity is unambiguous."""
+    candidates: dict[str, set[str]] = {}
+    for row in registry.get("components", []):
+        board_id = str(row.get("board_component_id") or "")
+        for source in row.get("source_components", []):
+            local_id = str(source.get("component_id") or "")
+            if local_id:
+                candidates.setdefault(local_id, set()).add(board_id)
+    return {local_id: (next(iter(board_ids)) if len(board_ids) == 1 else None)
+            for local_id, board_ids in candidates.items()}
+
+
+def _owner(project_id: str, board_id: str | None) -> str:
+    return json.dumps([str(project_id), str(board_id or "")], separators=(",", ":"))
+
+
+def source_component_key(photo_id: str, component_id: str) -> str:
+    return json.dumps([str(photo_id), str(component_id)], ensure_ascii=False,
+                      separators=(",", ":"))
+
+
+def _base_id(project_id: str, board_id: str | None, source_key: str) -> str:
+    raw = json.dumps([str(project_id), str(board_id or ""), source_key],
+                     ensure_ascii=False, separators=(",", ":")).encode()
+    return "bc-" + hashlib.sha256(raw).hexdigest()[:24]
+
+
+def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    sources: dict[str, dict[str, Any]] = {}
+    for photo_id, snapshot in sorted(photo_snapshots.items()):
+        for item in snapshot.get("registry_components", snapshot.get("components", ())):
+            get = item.get if isinstance(item, dict) else lambda name, default=None: getattr(item, name, default)
+            local_id = str(get("component_id", "") or "")
+            if not local_id:
+                continue
+            key = source_component_key(photo_id, local_id)
+            bbox = get("bbox_xyxy", ()) or ()
+            sources[key] = {
+                "source_key": key, "photo_id": str(photo_id), "component_id": local_id,
+                "image_fingerprint": snapshot.get("image_fingerprint"),
+                "board_side": str(snapshot.get("side", "unknown")),
+                "capture_type": str(snapshot.get("capture_type", "unknown")),
+                "detection_id": local_id, "component_type": str(get("component_type", "unknown")),
+                "bbox_xyxy": list(bbox),
+                "coordinate_frame": str(get("coordinate_frame", "SOURCE_PHOTO_PIXEL")),
+                "review_status": str(get("identification_status", "UNCONFIRMED")),
+                "presence_status": str(get("presence_status", "UNCONFIRMED")),
+                "type_status": str(get("component_type_status", "UNCONFIRMED")),
+                "ocr_marking": get("ocr_marking"),
+                "ocr_candidates": list(get("ocr_candidates", ()) or ()),
+                "possible_part_number": get("possible_part_number"),
+                "functional_roles": list(get("confirmed_functional_roles", ()) or ()),
+                "evidence": list(get("evidence", ()) or ()),
+                "source": get("overlay_source"),
+            }
+    return sources
+
+
+def build_board_component_registry(
+    state: Any, *, project_id: str, board_id: str | None,
+    photo_snapshots: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the registry, preserving local IDs and confirmed identity links.
+
+    ``confirmed_links`` stores source-key pairs after explicit user confirmation.
+    Existing source-to-board IDs keep the canonical ID stable when a photo is
+    added or removed. On a split, the lexicographically first remaining group
+    retains the old ID and other groups receive their deterministic base IDs.
+    """
+    owner = _owner(project_id, board_id)
+    root = state.get(REGISTRY_KEY, {})
+    entry = dict(root.get(owner, {})) if isinstance(root, dict) else {}
+    sources = _source_rows(photo_snapshots)
+    source_ids = {key: _base_id(project_id, board_id, key) for key in sources}
+    stable_ids = dict(entry.get("source_identity_ids", {}))
+    for key, value in source_ids.items():
+        stable_ids.setdefault(key, value)
+    all_links = [tuple(sorted((str(link[0]), str(link[1])))) for link in entry.get("confirmed_links", [])
+                 if isinstance(link, (list, tuple)) and len(link) == 2 and link[0] != link[1]]
+    merge_anchors = entry.get("merge_anchors", {})
+    if not isinstance(merge_anchors, dict):
+        merge_anchors = {}
+    link_versions = entry.get("link_versions", {})
+    if not isinstance(link_versions, dict):
+        link_versions = {}
+    active_links = []
+    for link in all_links:
+        if link[0] not in sources or link[1] not in sources:
+            continue
+        expected_versions = link_versions.get(json.dumps(list(link), separators=(",", ":")))
+        if expected_versions and expected_versions == [
+            sources[link[0]].get("image_fingerprint"), sources[link[1]].get("image_fingerprint")
+        ]:
+            active_links.append(link)
+    links = active_links
+
+    parent = {key: key for key in sources}
+    def find(key: str) -> str:
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+    for left, right in links:
+        a, b = find(left), find(right)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+    groups: dict[str, list[str]] = {}
+    for key in sorted(sources):
+        groups.setdefault(find(key), []).append(key)
+
+    components: list[dict[str, Any]] = []
+    source_to_board: dict[str, str] = {}
+    used_ids: set[str] = set()
+    for keys in sorted(groups.values(), key=lambda values: values[0]):
+        group_links = [tuple(link) for link in links if link[0] in keys and link[1] in keys]
+        preferred = [merge_anchors.get(json.dumps(list(link), separators=(",", ":")))
+                     for link in group_links]
+        anchor = next((key for key in preferred if key in keys), keys[0])
+        board_component_id = str(stable_ids.get(anchor, source_ids[anchor]))
+        if board_component_id in used_ids:
+            board_component_id = _base_id(project_id, board_id, anchor + ":split")
+        used_ids.add(board_component_id)
+        for key in keys:
+            source_to_board[key] = board_component_id
+        group_sources = [sources[key] for key in keys]
+        confirmed = any(row["review_status"] in {"USER_CONFIRMED", "user_confirmed"}
+                        or row["presence_status"] == "CONFIRMED" for row in group_sources)
+        confirmed_types = {row["component_type"] for row in group_sources
+                           if row["review_status"] != "EXCLUDED"
+                           and (row["type_status"] in {"USER_CONFIRMED", "CONFIRMED"}
+                                or row["review_status"] in {"USER_CONFIRMED", "user_confirmed"})}
+        group_presence = ("EXCLUDED" if all(row["review_status"] == "EXCLUDED" for row in group_sources)
+                          else "CONFIRMED" if confirmed else "UNCONFIRMED")
+        component_type = next(iter(confirmed_types)) if len(confirmed_types) == 1 else "unknown"
+        functional_roles = sorted({role for row in group_sources if row["review_status"] != "EXCLUDED"
+                                   for role in row["functional_roles"]})
+        components.append({
+            "board_component_id": board_component_id,
+            "project_id": str(project_id), "board_id": str(board_id or ""),
+            "source_components": group_sources,
+            "source_photo_ids": list(dict.fromkeys(row["photo_id"] for row in group_sources)),
+            "detection_ids": [row["detection_id"] for row in group_sources],
+            "component_type": component_type,
+            "component_type_status": "USER_CONFIRMED" if len(confirmed_types) == 1 else "UNCONFIRMED",
+            "presence_status": group_presence,
+            "identity_status": "USER_CONFIRMED" if len(keys) > 1 else "PHOTO_LOCAL",
+            "ocr_markings": list(dict.fromkeys(row["ocr_marking"] for row in group_sources if row["ocr_marking"])),
+            "functional_roles": functional_roles,
+            "evidence": list(dict.fromkeys(e for row in group_sources for e in row["evidence"])),
+            "source_keys": keys,
+        })
+    photo_manifest = [{
+        "photo_id": str(photo_id), "image_fingerprint": snapshot.get("image_fingerprint"),
+        "review_version": snapshot.get("review_version"),
+        "detection_status": snapshot.get("detection_status"),
+        "side": snapshot.get("side", "unknown"),
+        "capture_type": snapshot.get("capture_type", "unknown"),
+    } for photo_id, snapshot in sorted(photo_snapshots.items())]
+    payload = {"project_id": str(project_id), "board_id": str(board_id or ""),
+               "photos": photo_manifest, "components": components, "source_to_board_id": source_to_board,
+               "confirmed_links": [list(link) for link in sorted(set(all_links))]}
+    version_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":"), default=str).encode()
+    version = "board-registry:" + hashlib.sha256(version_payload).hexdigest()
+    registry = {**payload, "version": version}
+    root = dict(root) if isinstance(root, dict) else {}
+    root[owner] = {**entry, "source_to_board_id": source_to_board,
+                   "source_identity_ids": stable_ids,
+                   "confirmed_links": payload["confirmed_links"], "registry": registry}
+    state[REGISTRY_KEY] = root
+    return registry
+
+
+def confirm_component_match(
+    state: Any, *, project_id: str, board_id: str | None,
+    left_source_key: str, right_source_key: str,
+) -> None:
+    """Record a user-confirmed relation between two photo-local observations."""
+    if left_source_key == right_source_key:
+        raise ValueError("서로 다른 사진 관측을 선택해야 합니다.")
+    owner = _owner(project_id, board_id)
+    root = dict(state.get(REGISTRY_KEY, {}))
+    entry = dict(root.get(owner, {}))
+    registry = entry.get("registry", {})
+    source_keys = set(registry.get("source_to_board_id", {}))
+    if left_source_key not in source_keys or right_source_key not in source_keys:
+        raise ValueError("현재 보드 Registry에서 두 소자 관측을 찾을 수 없습니다.")
+    links = {tuple(sorted((str(a), str(b)))) for a, b in entry.get("confirmed_links", [])}
+    link = tuple(sorted((left_source_key, right_source_key)))
+    links.add(link)
+    entry["confirmed_links"] = [list(link) for link in sorted(links)]
+    anchors = dict(entry.get("merge_anchors", {}))
+    link_key = json.dumps(list(link), separators=(",", ":"))
+    anchors[link_key] = left_source_key
+    entry["merge_anchors"] = anchors
+    source_rows = {
+        source.get("source_key"): source
+        for row in registry.get("components", [])
+        for source in row.get("source_components", [])
+    }
+    left_photo = source_rows[left_source_key].get("photo_id")
+    right_photo = source_rows[right_source_key].get("photo_id")
+    if left_photo == right_photo:
+        raise ValueError("서로 다른 사진의 관측만 보드 소자로 연결할 수 있습니다.")
+    versions = dict(entry.get("link_versions", {}))
+    versions[link_key] = [source_rows[key].get("image_fingerprint") for key in link]
+    entry["link_versions"] = versions
+    root[owner] = entry
+    state[REGISTRY_KEY] = root
+
+
+def remove_component_match(
+    state: Any, *, project_id: str, board_id: str | None,
+    left_source_key: str, right_source_key: str,
+) -> bool:
+    owner = _owner(project_id, board_id)
+    root = dict(state.get(REGISTRY_KEY, {}))
+    entry = dict(root.get(owner, {}))
+    target = tuple(sorted((left_source_key, right_source_key)))
+    links = [tuple(link) for link in entry.get("confirmed_links", [])
+             if isinstance(link, (list, tuple)) and len(link) == 2]
+    if target not in links:
+        return False
+    entry["confirmed_links"] = [list(link) for link in links if link != target]
+    versions = dict(entry.get("link_versions", {}))
+    versions.pop(json.dumps(list(target), separators=(",", ":")), None)
+    entry["link_versions"] = versions
+    root[owner] = entry
+    state[REGISTRY_KEY] = root
+    return True
+
+
+def source_key_for_component(photo_id: str, component_id: str) -> str:
+    return source_component_key(photo_id, component_id)
+
+
+def board_component_for_id(registry: dict[str, Any] | None, board_component_id: str) -> dict[str, Any] | None:
+    if not isinstance(registry, dict):
+        return None
+    return next((row for row in registry.get("components", [])
+                 if row.get("board_component_id") == board_component_id), None)
+
+
+def primary_source_for_component(registry: dict[str, Any] | None, board_component_id: str) -> dict[str, Any] | None:
+    row = board_component_for_id(registry, board_component_id)
+    sources = row.get("source_components", []) if row else []
+    return sources[0] if sources else None

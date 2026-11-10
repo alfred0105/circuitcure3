@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from circuitcare.analysis.fingerprints import build_analysis_fingerprints
 from circuitcare.analysis.models import AnalysisScope, AnalysisStatus
 from circuitcare.analysis.state_manager import (
@@ -6,6 +8,9 @@ from circuitcare.analysis.state_manager import (
 )
 from circuitcare.dashboard.views.symptom_diagnosis_panel import current_analysis_snapshot
 from circuitcare.frontend.models import ImageRecord, ProjectContext, SelectionState
+from circuitcare.frontend.board_component_registry import (
+    build_board_component_registry, diagnosis_components, measurement_component_aliases,
+)
 
 
 def _fingerprints(*, symptoms="no_power", measurements=(), rules="rules-v1"):
@@ -139,3 +144,66 @@ def test_live_snapshot_ignores_viewer_controls_and_isolates_photo_scope():
     other_photo = current_analysis_snapshot(st, project)
     assert other_photo["scope"].target_id == "photo-2"
     assert other_photo["result"] is None
+
+
+def test_board_analysis_scope_survives_photo_switch_and_stales_on_registry_change():
+    project = ProjectContext("p-board", "b-board", image_records=(
+        ImageRecord("front"), ImageRecord("back"),
+    ))
+    snapshots = {
+        "front": {"image_fingerprint": "front-v1", "review_version": "rv1",
+                  "components": (SimpleNamespace(
+                      component_id="D1", component_type="diode", bbox_xyxy=(1, 2, 5, 7),
+                      coordinate_frame="SOURCE_PHOTO_PIXEL", identification_status="USER_CONFIRMED",
+                      presence_status="CONFIRMED", component_type_status="USER_CONFIRMED",
+                      ocr_marking=None, possible_part_number=None, component_info=None,
+                      confirmed_functional_roles=(), evidence=("front review",),
+                      overlay_source="yolo", ocr_candidates=(),
+                  ),)},
+        "back": {"image_fingerprint": "back-v1", "review_version": "rv2", "components": ()},
+    }
+    state = {"circuitcare_v2_active_photo_id": "front",
+             "circuitcare_v2_photo_choice": "front"}
+    registry = build_board_component_registry(
+        state, project_id=project.project_id, board_id=project.board_id,
+        photo_snapshots=snapshots,
+    )
+    components = diagnosis_components(registry)
+    inventory = {"__board_registry__": {"registry_version": registry["version"]}}
+    aliases = measurement_component_aliases(registry)
+    st = type("FakeStreamlit", (), {"session_state": state})()
+    scope_id = "board:registry:v1"
+    first = current_analysis_snapshot(st, project, components=components,
+                                      component_inventory=inventory,
+                                      analysis_target_id=scope_id,
+                                      component_id_aliases=aliases)
+    run_id = begin_analysis(state, scope=first["scope"], fingerprints=first["fingerprints"])
+    assert commit_analysis_result(state, scope=first["scope"], run_id=run_id,
+                                  fingerprints=first["fingerprints"], current_fingerprints=first["fingerprints"],
+                                  current_scope=first["scope"], result={"status": "CURRENT"})
+
+    state["circuitcare_v2_active_photo_id"] = "back"
+    state["circuitcare_v2_photo_choice"] = "back"
+    state["circuitcare_v2_view_zoom"] = 2.0
+    state["circuitcare_v2_selection"] = SelectionState("p-board", "b-board", selected_component="D1")
+    unchanged = current_analysis_snapshot(st, project, components=components,
+                                          component_inventory=inventory,
+                                          analysis_target_id=scope_id,
+                                          component_id_aliases=aliases)
+    assert unchanged["scope"].key == first["scope"].key
+    assert unchanged["result"] == {"status": "CURRENT"}
+
+    changed = {**snapshots, "close-up": {"image_fingerprint": "close-v1",
+                                         "review_version": "rv3", "components": ()}}
+    next_registry = build_board_component_registry(
+        state, project_id=project.project_id, board_id=project.board_id,
+        photo_snapshots=changed,
+    )
+    stale = current_analysis_snapshot(
+        st, project, components=diagnosis_components(next_registry),
+        component_inventory={"__board_registry__": {"registry_version": next_registry["version"]}},
+        analysis_target_id=scope_id,
+        component_id_aliases=measurement_component_aliases(next_registry),
+    )
+    assert stale["result"] is None
+    assert stale["record"]["status"] == AnalysisStatus.STALE

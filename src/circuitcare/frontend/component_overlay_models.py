@@ -49,6 +49,7 @@ class ComponentOverlayViewModel:
     overlay_source: str | None = None
     ocr_class_hints: tuple[str, ...] = ()
     reference_designators: tuple[str, ...] = ()
+    board_component_id: str | None = None
 
 
 @dataclass(frozen=True)

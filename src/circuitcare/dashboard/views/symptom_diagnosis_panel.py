@@ -41,8 +41,9 @@ def _diagnosis_fingerprint(
     confirmed_component_ids: list[str] | None = None,
     inventory_complete: bool = False,
     component_inventory: dict[str, dict[str, Any]] | None = None,
+    analysis_target_id: str | None = None,
 ) -> str:
-    target_id = str(state.get(ACTIVE_PHOTO_KEY) or "target:default")
+    target_id = str(analysis_target_id or state.get(ACTIVE_PHOTO_KEY) or "target:default")
     analysis_scope = AnalysisScope(project.project_id, project.board_id or "", target_id)
     photo_snapshots = state.get("circuitcare_v6_photo_component_snapshots", {})
     photo_snapshot = photo_snapshots.get(analysis_scope.key) if isinstance(photo_snapshots, dict) else None
@@ -57,9 +58,10 @@ def _diagnosis_fingerprint(
     )
 
 
-def _analysis_scope(project: ProjectContext, state: Any) -> AnalysisScope:
+def _analysis_scope(project: ProjectContext, state: Any, analysis_target_id: str | None = None) -> AnalysisScope:
     return AnalysisScope(project.project_id, project.board_id or "",
-                         str(state.get(ACTIVE_PHOTO_KEY) or "target:default"))
+                         str(analysis_target_id or state.get("circuitcare_v7_analysis_target_id")
+                             or state.get(ACTIVE_PHOTO_KEY) or "target:default"))
 
 
 def current_analysis_snapshot(
@@ -67,8 +69,10 @@ def current_analysis_snapshot(
     component_inventory: dict[str, dict[str, Any]] | None = None,
     symptom_text: str | None = None, selected_codes: list[str] | None = None,
     observations: dict[str, Any] | None = None, inventory_complete: bool | None = None,
+    analysis_target_id: str | None = None,
+    component_id_aliases: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
-    """Rebuild and validate the active photo's analysis version before rendering results."""
+    """Rebuild and validate a photo-scoped or board-scoped analysis version."""
     key = _project_key(project)
     state = st.session_state.get(key, {})
     if not isinstance(state, dict):
@@ -104,13 +108,20 @@ def current_analysis_snapshot(
     measurements = get_measurements(
         st.session_state, project_id=project.project_id, board_id=project.board_id or "",
     )
+    if component_id_aliases is not None:
+        from dataclasses import replace
+        measurements = [replace(
+            row, component_id=component_id_aliases.get(row.component_id) or "",
+            component_identity_status=(row.component_identity_status
+                                       if component_id_aliases.get(row.component_id) else "UNKNOWN"),
+        ) for row in measurements]
     silkscreen = st.session_state.get("circuitcare_v4_silkscreen_labels", [])
     if not isinstance(silkscreen, list):
         silkscreen = []
     input_fingerprint = _diagnosis_fingerprint(
         project, components, selected_codes, symptom_text, observations, state.get("answers", {}),
         measurements, silkscreen, st.session_state, confirmed_ids,
-        bool(inventory_complete), inventory,
+        bool(inventory_complete), inventory, analysis_target_id,
     )
     llm_enabled = bool(st.session_state.get(f"{key}_llm_enabled", False))
     selected_model = st.session_state.get(f"{key}_model")
@@ -119,7 +130,7 @@ def current_analysis_snapshot(
         extra_rules_payload={"llm_enabled": llm_enabled,
                              "llm_model": selected_model if llm_enabled else None},
     )
-    scope = _analysis_scope(project, st.session_state)
+    scope = _analysis_scope(project, st.session_state, analysis_target_id)
     record = get_current_state(st.session_state, scope)
     legacy_matches = (
         state.get("input_fingerprint") == input_fingerprint
@@ -142,6 +153,7 @@ def current_analysis_snapshot(
         "inventory_complete": bool(inventory_complete), "components": components,
         "component_inventory": inventory, "llm_enabled": llm_enabled,
         "selected_model": selected_model,
+        "component_id_aliases": component_id_aliases,
     }
 
 
@@ -171,26 +183,48 @@ def _sync_component_candidates(st: Any, project: ProjectContext, result: dict[st
     st.session_state["circuitcare_v6_diagnosis_candidates_by_scope"] = projects
 
 
+def _focus_board_component(st: Any, project: ProjectContext, registry: dict[str, Any] | None,
+                           board_component_id: str) -> bool:
+    rows = registry.get("components", []) if isinstance(registry, dict) else []
+    row = next((item for item in rows if item.get("board_component_id") == board_component_id), None)
+    sources = row.get("source_components", []) if row else []
+    if not sources:
+        return False
+    source = sources[0]
+    photo_id, local_id = source.get("photo_id"), source.get("component_id")
+    st.session_state["circuitcare_v2_photo_choice"] = photo_id
+    update_selection(st.session_state, project=project,
+                     active_photo_id=photo_id, selected_component=local_id)
+    st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
+    return True
+
+
 def _component_rows(components: tuple[Any, ...],
                     component_inventory: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     inventory = component_inventory or {}
     result = []
     for item in components:
-        review_owned = getattr(item, "overlay_source", None) in {"yolo", "manual", "qwen_suggestion"}
+        review_owned = getattr(item, "overlay_source", None) in {"yolo", "manual", "qwen_suggestion", "board_registry"}
         presence_status = ("CONFIRMED" if item.identification_status == "USER_CONFIRMED" else "UNCONFIRMED") \
             if review_owned else inventory.get(item.component_id, {}).get("presence_status", "UNCONFIRMED")
         type_status = ("USER_CONFIRMED" if item.identification_status == "USER_CONFIRMED" else "UNCONFIRMED") \
             if review_owned else inventory.get(item.component_id, {}).get(
                 "component_type_status", getattr(item, "component_type_status", "UNCONFIRMED"))
+        roles = (list(getattr(item, "confirmed_functional_roles", ()) or ())
+                 if review_owned else inventory.get(item.component_id, {}).get("confirmed_functional_roles", []))
         result.append({"component_id": item.component_id, "component_type": item.component_type,
-             "bbox_xyxy": list(item.bbox_xyxy), "ocr_marking": item.ocr_marking,
+             "bbox_xyxy": (list(item.bbox_xyxy) if getattr(item, "bbox_xyxy", None) else None),
+             "ocr_marking": item.ocr_marking,
              "component_info": getattr(item, "component_info", None),
+             "board_component_id": getattr(item, "board_component_id", None),
+             "source_photo_ids": list(getattr(item, "source_photo_ids", ()) or ()),
+             "identity_status": getattr(item, "identity_status", None),
              "presence_status": presence_status,
              "component_type_status": type_status,
              "part_identity_status": inventory.get(item.component_id, {}).get("part_identity_status", "UNCONFIRMED"),
-             "confirmed_functional_roles": inventory.get(item.component_id, {}).get("confirmed_functional_roles", []),
-             "role_status": "CONFIRMED" if inventory.get(item.component_id, {}).get("confirmed_functional_roles") else "UNKNOWN",
-             "role_evidence": ("사용자가 선택한 기능 역할",) if inventory.get(item.component_id, {}).get("confirmed_functional_roles") else ()})
+             "confirmed_functional_roles": roles,
+             "role_status": "CONFIRMED" if roles else "UNKNOWN",
+             "role_evidence": ("사용자가 선택한 기능 역할",) if roles else ()})
     return result
 
 
@@ -227,7 +261,8 @@ def _persist_diagnosis(project: ProjectContext, state: dict[str, Any], result: d
     result["diagnosis_id"] = diagnosis_id
     component_records = [ComponentRecord.from_mapping({
         "component_id": item.component_id, "label": item.component_type,
-        "bbox_xyxy": list(item.bbox_xyxy), "detection_confidence": item.detection_confidence,
+        "bbox_xyxy": (list(item.bbox_xyxy) if getattr(item, "bbox_xyxy", None) else None),
+        "detection_confidence": item.detection_confidence,
         "marking": item.ocr_marking,
     }).to_dict() for item in components]
     normalized_observations = [Observation.from_dict(row).to_dict() for row in observations]
@@ -243,6 +278,9 @@ def _persist_diagnosis(project: ProjectContext, state: dict[str, Any], result: d
 def render_symptom_diagnosis_panel(
     st: Any, project: ProjectContext, *, components: tuple[Any, ...] = (), preview: bool = False,
     component_inventory: dict[str, dict[str, Any]] | None = None,
+    analysis_target_id: str | None = None,
+    component_id_aliases: dict[str, str | None] | None = None,
+    board_registry: dict[str, Any] | None = None,
 ) -> None:
     """Collect symptoms, run local rules, and render candidates and safe next questions."""
     kb = load_knowledge()
@@ -329,6 +367,7 @@ def render_symptom_diagnosis_panel(
         st, project, components=components, component_inventory=component_inventory,
         symptom_text=symptom_text, selected_codes=selected_codes,
         observations=observations, inventory_complete=inventory_complete,
+        analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
     )
     measurements = snapshot["measurements"]
     silkscreen_labels = st.session_state.get("circuitcare_v4_silkscreen_labels", [])
@@ -459,6 +498,7 @@ def render_symptom_diagnosis_panel(
             st, project, components=components, component_inventory=component_inventory,
             symptom_text=symptom_text, selected_codes=selected_codes,
             observations=observations, inventory_complete=inventory_complete,
+            analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
         )
         committed = commit_analysis_result(
             st.session_state, scope=analysis_scope, run_id=run_id,
@@ -474,6 +514,7 @@ def render_symptom_diagnosis_panel(
             st.warning(state["invalidated_reason"])
             return
         state["analysis_target_id"] = analysis_scope.target_id
+        st.session_state["circuitcare_v7_analysis_target_id"] = analysis_scope.target_id
         _persist_diagnosis(project, state, result, components, combined_observations)
         _sync_component_candidates(st, project, result)
         state["result"] = result
@@ -533,9 +574,12 @@ def render_symptom_diagnosis_panel(
                     st.caption("부품 종류와 증상으로 좁힌 미확정 검사 후보입니다.")
             if any(item.component_id == candidate.get("component_id") for item in components):
                 if st.button("PCB에서 위치 보기", key=f"cc_symptom_candidate_focus_{project.project_id}_{candidate.get('component_id')}"):
-                    update_selection(st.session_state, project=project,
-                                     selected_component=candidate.get("component_id"))
-                    st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
+                    focused = (_focus_board_component(st, project, board_registry,
+                               str(candidate.get("component_id"))) if board_registry else False)
+                    if not focused:
+                        update_selection(st.session_state, project=project,
+                                         selected_component=candidate.get("component_id"))
+                        st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
                     st.rerun()
         if result.get("llm_component_explanations"):
             st.caption(f"후보별 설명 · {result['llm_component_explanations'].get('model', '')} · 후보 추가/확정 없음")
@@ -632,7 +676,7 @@ def render_symptom_diagnosis_panel(
                 project, components, selected_codes, symptom_text,
                 observations, answers, measurements,
                 silkscreen_labels, st.session_state, confirmed_component_ids, inventory_complete,
-                component_inventory,
+                component_inventory, analysis_target_id,
             )
             answer_fingerprints = build_analysis_fingerprints(
                 input_payload={"input_sha256": answer_input_fingerprint}, measurements=measurements,
@@ -684,6 +728,7 @@ def render_symptom_diagnosis_panel(
                 st, project, components=components, component_inventory=component_inventory,
                 symptom_text=symptom_text, selected_codes=selected_codes,
                 observations=observations, inventory_complete=inventory_complete,
+                analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
             )
             committed = commit_analysis_result(
                 st.session_state, scope=analysis_scope, run_id=followup_run_id,
@@ -702,6 +747,7 @@ def render_symptom_diagnosis_panel(
             state["measurement_fingerprint"] = measurement_fingerprint
             state["analysis_status"] = "CURRENT"
             state["analysis_target_id"] = analysis_scope.target_id
+            st.session_state["circuitcare_v7_analysis_target_id"] = analysis_scope.target_id
             _persist_diagnosis(project, state, answer_result, components, combined_observations)
             _sync_component_candidates(st, project, answer_result)
             st.session_state[key] = state

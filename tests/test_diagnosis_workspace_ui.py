@@ -71,6 +71,22 @@ def test_cause_candidate_selection_opens_same_pcb_viewer_and_updates_shared_sele
     assert state["cc_analysis_viewer_open_project-2"] is True
 
 
+def test_board_candidate_focus_changes_to_its_source_photo_and_photo_local_box():
+    project = ProjectContext("project-board", "board-board")
+    state = {}
+    enter_workbench(state, project)
+    registry = {"components": [{
+        "board_component_id": "bc-1",
+        "source_components": [{"photo_id": "close-2", "component_id": "det-17"}],
+    }]}
+    st = _StreamlitStub(state=state)
+
+    assert workspace._focus_board_registry_component(st, project, registry, "bc-1")
+    assert state["circuitcare_v2_photo_choice"] == "close-2"
+    assert state[SELECTION_KEY].active_photo_id == "close-2"
+    assert state[SELECTION_KEY].selected_component == "det-17"
+
+
 def test_review_navigation_callback_sets_radio_state_before_next_render():
     state = {"cc_workbench_view_project-3": "고장 분석"}
 

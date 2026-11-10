@@ -10,7 +10,7 @@ from circuitcare.dashboard.components.pcb_workspace import (
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.frontend.component_overlay_models import display_identity_status
 from circuitcare.dashboard.views.unified_workspace import (
-    _bind_review_models_to_map, _prepare_photo_component_snapshot,
+    _bind_review_models_to_map, _prepare_board_registry_snapshot, _prepare_photo_component_snapshot,
 )
 from circuitcare.frontend.models import ImageRecord, ProjectContext, SelectionState
 from circuitcare.vision.box_reconciliation import board_visible_review_rows
@@ -294,6 +294,49 @@ def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(mon
     assert first["analysis_scope_key"] != second["analysis_scope_key"]
     assert snapshots[first["analysis_scope_key"]]["photo_id"] == "photo-1"
     assert snapshots[second["analysis_scope_key"]]["photo_id"] == "photo-2"
+
+
+def test_board_registry_prepares_every_photo_and_keeps_each_local_snapshot(monkeypatch):
+    image_bytes = []
+    for color in ("red", "blue", "green"):
+        output = io.BytesIO()
+        Image.new("RGB", (40, 30), color).save(output, format="PNG")
+        image_bytes.append(output.getvalue())
+    photo_ids = ("front", "back", "close-up")
+    project = ProjectContext(
+        "p-board", "b-board",
+        image_records=tuple(ImageRecord(photo_id, side="unknown",
+                                       capture_type=("close_up" if photo_id == "close-up" else "full_view"))
+                            for photo_id in photo_ids),
+    )
+    state = {"circuitcare_v2_active_photo_id": "front",
+             "circuitcare_v2_photo_choice": "front"}
+    st = SimpleNamespace(session_state=state)
+
+    def fake_detection(st_api, *, image_bytes, project_id, photo_id,
+                       review_image_bytes=None, review_image_size=None):
+        scope = unified_workspace.component_review_scope(review_image_bytes, project_id, photo_id)
+        _result_key, rows_key, _error_key = review_keys(scope)
+        st_api.session_state[rows_key] = [{
+            "component_id": f"det-{photo_id}", "소자 종류": "resistor",
+            "상태": "확인" if photo_id == "front" else "검수 필요",
+            "x1": 1, "y1": 1, "x2": 10, "y2": 10,
+        }]
+        return {"detections": []}, None
+
+    from circuitcare.dashboard.views import unified_workspace
+    monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
+    photos = [{"image_id": photo_id, "data": data}
+              for photo_id, data in zip(photo_ids, image_bytes)]
+
+    registry, selected = _prepare_board_registry_snapshot(st, project, photos)
+
+    assert selected["photo_id"] == "front"
+    assert {item["photo_id"] for item in registry["photos"]} == set(photo_ids)
+    assert {source["photo_id"] for row in registry["components"]
+            for source in row["source_components"]} == set(photo_ids)
+    assert len(state["circuitcare_v6_photo_component_snapshots"]) == 3
+    assert {item["photo_id"] for item in state["circuitcare_v7_photo_snapshots_by_id"].values()} == set(photo_ids)
 
 
 def test_redetection_keeps_exclusion_and_does_not_create_a_resurrection_duplicate():

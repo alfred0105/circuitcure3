@@ -253,6 +253,7 @@ def render_component_viewer(
 
     payload = [{
         "component_id": item.component_id,
+        "board_component_id": item.board_component_id,
         "component_type": item.component_type,
         "overlay_source": item.overlay_source,
         "display_label": item.display_label,

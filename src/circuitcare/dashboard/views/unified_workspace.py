@@ -19,6 +19,12 @@ from circuitcare.frontend.component_overlay_adapter import (
     adapt_component_map_components, adapt_original_photo_components,
 )
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
+from circuitcare.frontend.board_component_registry import (
+    REGISTRY_KEY, build_board_component_registry, confirm_component_match,
+    diagnosis_components, measurement_component_aliases, remove_component_match,
+    source_key_for_component,
+)
+BOARD_COMPONENT_SELECTION_KEY = "circuitcare_v7_selected_board_component_id"
 from circuitcare.frontend.measurement_state import get_measurements
 from circuitcare.analysis.models import AnalysisScope, AnalysisStatus
 from circuitcare.frontend.component_map_adapter import (
@@ -182,22 +188,24 @@ def _attach_verified_history(
 
 
 def _prepare_photo_component_snapshot(
-    st: Any, project: ProjectContext, photos: list[dict[str, Any]],
+    st: Any, project: ProjectContext, photos: list[dict[str, Any]], *,
+    photo_id: str | None = None, activate: bool = True,
 ) -> dict[str, Any]:
-    """Prepare selected-photo review components without depending on Viewer rendering."""
+    """Prepare one photo's review snapshot without depending on Viewer rendering."""
     records = {item.image_id: item for item in project.image_records}
     valid = [item for item in photos if item.get("image_id") in records
              and isinstance(item.get("data"), bytes)]
     if not valid:
         return {"photo_id": None, "components": (), "review_scope": None, "error": None}
     ids = [item["image_id"] for item in valid]
-    photo_id = st.session_state.get("circuitcare_v2_photo_choice")
+    photo_id = photo_id or st.session_state.get("circuitcare_v2_photo_choice")
     if photo_id not in ids:
         photo_id = st.session_state.get(ACTIVE_PHOTO_KEY)
     if photo_id not in ids:
         photo_id = ids[0]
-    st.session_state["circuitcare_v2_photo_choice"] = photo_id
-    if st.session_state.get(ACTIVE_PHOTO_KEY) != photo_id:
+    if activate:
+        st.session_state["circuitcare_v2_photo_choice"] = photo_id
+    if activate and st.session_state.get(ACTIVE_PHOTO_KEY) != photo_id:
         update_selection(st.session_state, project=project, active_photo_id=photo_id)
     image_data = next(item["data"] for item in valid if item["image_id"] == photo_id)
     try:
@@ -223,8 +231,9 @@ def _prepare_photo_component_snapshot(
             for row in rows if isinstance(row, dict)
         ],
     )
-    st.session_state[MAP_VERSION_KEY] = inventory_version
-    st.session_state["circuitcare_v4_component_inventory_scope"] = review_scope
+    if activate:
+        st.session_state[MAP_VERSION_KEY] = inventory_version
+        st.session_state["circuitcare_v4_component_inventory_scope"] = review_scope
     visible_rows = board_visible_review_rows(rows)
     review_hash = hashlib.sha256(detector_image_bytes).hexdigest()[:16]
     side = {"front": "TOP", "back": "BOTTOM"}.get(records[photo_id].side, records[photo_id].side)
@@ -287,6 +296,26 @@ def _prepare_photo_component_snapshot(
                 "photo_id": photo_id, "review_scope": review_scope,
                 "image_fingerprint": image_fingerprint,
                 "review_version": review_version, "review_components": review_models,
+                "registry_components": tuple({
+                    "component_id": str(row.get("component_id") or ""),
+                    "component_type": str(row.get("소자 종류", "unknown")),
+                    "bbox_xyxy": [row.get("x1", 0), row.get("y1", 0), row.get("x2", 0), row.get("y2", 0)],
+                    "coordinate_frame": "SOURCE_PHOTO_PIXEL",
+                    "identification_status": ("EXCLUDED" if row.get("상태") == "제외" else
+                                              "USER_CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED"),
+                    "presence_status": ("EXCLUDED" if row.get("상태") == "제외" else
+                                        "CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED"),
+                    "component_type_status": "USER_CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED",
+                    "ocr_marking": row.get("body_marking"),
+                    "ocr_candidates": row.get("ocr_candidates", []),
+                    "possible_part_number": None,
+                    "confirmed_functional_roles": inventory.get(str(row.get("component_id")), {}).get(
+                        "confirmed_functional_roles", []),
+                    "evidence": ("사용자 제외 기록",) if row.get("상태") == "제외" else
+                                ("사용자 검수 확인",) if row.get("상태") == "확인" else
+                                ("사진별 탐지 후보",),
+                    "overlay_source": row.get("source", "yolo"),
+                } for row in rows if row.get("component_id")),
                 "components": models, "component_ids": tuple(item.component_id for item in models),
                 "detection_status": ("BLOCKED_MODEL_UNAVAILABLE" if auto_error else
                                      "INFERENCE_COMPLETE" if auto_result is not None else "UNKNOWN"),
@@ -294,11 +323,84 @@ def _prepare_photo_component_snapshot(
                 "analysis_scope_key": scope.key}
     by_scope[scope.key] = snapshot
     st.session_state["circuitcare_v6_photo_component_snapshots"] = by_scope
-    st.session_state["circuitcare_v4_current_components"] = models
-    st.session_state["circuitcare_v6_current_component_scope"] = scope.key
-    st.session_state["circuitcare_v4_detection_status"] = snapshot["detection_status"]
-    st.session_state["circuitcare_v4_component_inventory_scope"] = review_scope
+    if activate:
+        st.session_state["circuitcare_v4_current_components"] = models
+        st.session_state["circuitcare_v6_current_component_scope"] = scope.key
+        st.session_state["circuitcare_v4_detection_status"] = snapshot["detection_status"]
+        st.session_state["circuitcare_v4_component_inventory_scope"] = review_scope
     return snapshot
+
+
+def _prepare_board_registry_snapshot(
+    st: Any, project: ProjectContext, photos: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Refresh cached photo snapshots, then build the independent board registry."""
+    records = {item.image_id: item for item in project.image_records}
+    selection_before = st.session_state.get(SELECTION_KEY)
+    previous_photo_id = getattr(selection_before, "active_photo_id", None)
+    previous_local_id = getattr(selection_before, "selected_component", None)
+    by_photo: dict[str, dict[str, Any]] = {}
+    for photo in photos:
+        photo_id = str(photo.get("image_id") or "")
+        if photo_id not in records or not isinstance(photo.get("data"), bytes):
+            continue
+        by_photo[photo_id] = _prepare_photo_component_snapshot(
+            st, project, photos, photo_id=photo_id, activate=False,
+        )
+    selected_id = st.session_state.get("circuitcare_v2_photo_choice")
+    if selected_id not in by_photo:
+        selected_id = st.session_state.get(ACTIVE_PHOTO_KEY)
+    if selected_id not in by_photo:
+        selected_id = next(iter(by_photo), None)
+    by_photo = {photo_id: {**snapshot,
+                           "side": records[photo_id].side,
+                           "capture_type": records[photo_id].capture_type}
+                for photo_id, snapshot in by_photo.items()}
+    selected_snapshot = by_photo.get(selected_id)
+    if selected_snapshot is not None:
+        st.session_state["circuitcare_v2_photo_choice"] = selected_id
+        if st.session_state.get(ACTIVE_PHOTO_KEY) != selected_id:
+            update_selection(st.session_state, project=project, active_photo_id=selected_id)
+        st.session_state[MAP_VERSION_KEY] = selected_snapshot.get("version")
+        st.session_state["circuitcare_v4_component_inventory_scope"] = selected_snapshot.get("review_scope")
+        st.session_state["circuitcare_v4_current_components"] = tuple(selected_snapshot.get("components", ()))
+        st.session_state["circuitcare_v6_current_component_scope"] = selected_snapshot.get("analysis_scope_key")
+        st.session_state["circuitcare_v4_detection_status"] = selected_snapshot.get("detection_status", "UNKNOWN")
+    registry = build_board_component_registry(
+        st.session_state, project_id=project.project_id, board_id=project.board_id,
+        photo_snapshots=by_photo,
+    )
+    for photo_id, snapshot in by_photo.items():
+        models = tuple(replace(item, board_component_id=registry["source_to_board_id"].get(
+            source_key_for_component(photo_id, item.component_id))) for item in snapshot.get("components", ()))
+        by_photo[photo_id] = {**snapshot, "components": models,
+                              "component_ids": tuple(item.component_id for item in models)}
+    registry_scopes = dict(st.session_state.get("circuitcare_v6_photo_component_snapshots", {}))
+    for snapshot in by_photo.values():
+        registry_scopes[snapshot["analysis_scope_key"]] = snapshot
+    st.session_state["circuitcare_v6_photo_component_snapshots"] = registry_scopes
+    selected_snapshot = by_photo.get(selected_id)
+    if selected_snapshot is not None:
+        st.session_state["circuitcare_v4_current_components"] = tuple(selected_snapshot.get("components", ()))
+    st.session_state["circuitcare_v7_photo_snapshots_by_id"] = by_photo
+    st.session_state["circuitcare_v7_active_board_registry"] = registry
+    selected_board_id = st.session_state.get(BOARD_COMPONENT_SELECTION_KEY)
+    if not selected_board_id and previous_photo_id and previous_local_id:
+        selected_board_id = registry["source_to_board_id"].get(
+            source_key_for_component(previous_photo_id, previous_local_id))
+    if selected_board_id:
+        st.session_state[BOARD_COMPONENT_SELECTION_KEY] = selected_board_id
+        target_source = next((source for row in registry.get("components", [])
+                             if row.get("board_component_id") == selected_board_id
+                             for source in row.get("source_components", [])
+                             if source.get("photo_id") == selected_id
+                             and source.get("review_status") != "EXCLUDED"), None)
+        local_id = target_source.get("component_id") if target_source else None
+        if (getattr(selection_before, "active_photo_id", None) != selected_id
+                or getattr(selection_before, "selected_component", None) != local_id):
+            update_selection(st.session_state, project=project, active_photo_id=selected_id,
+                             selected_component=local_id)
+    return registry, selected_snapshot
 
 
 def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) -> None:
@@ -551,20 +653,33 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             updated_models.append(model)
         component_models = tuple(updated_models)
     target_id = str(selected or st.session_state.get(ACTIVE_PHOTO_KEY) or "target:default")
-    analysis_scope = AnalysisScope(project.project_id, project.board_id or "", target_id)
     snapshots = st.session_state.get("circuitcare_v6_photo_component_snapshots", {})
-    scoped_snapshot = snapshots.get(analysis_scope.key) if isinstance(snapshots, dict) else None
-    analysis_components = tuple(scoped_snapshot.get("components", ())) if isinstance(scoped_snapshot, dict) else tuple(component_models)
+    photo_scope = AnalysisScope(project.project_id, project.board_id or "", target_id)
+    scoped_snapshot = snapshots.get(photo_scope.key) if isinstance(snapshots, dict) else None
+    board_registry = st.session_state.get("circuitcare_v7_active_board_registry")
+    board_mode = (isinstance(board_registry, dict)
+                  and board_registry.get("project_id") == project.project_id
+                  and board_registry.get("board_id") == (project.board_id or ""))
+    analysis_scope = (AnalysisScope(project.project_id, project.board_id or "", "board:registry:v1")
+                      if board_mode else photo_scope)
+    analysis_components = (diagnosis_components(board_registry) if board_mode else
+                           tuple(scoped_snapshot.get("components", ())) if isinstance(scoped_snapshot, dict)
+                           else tuple(component_models))
     review_scope = (scoped_snapshot.get("review_scope") if isinstance(scoped_snapshot, dict) else review_scope)
     inventory_owner = f"{project.project_id}|{project.board_id or ''}|{review_scope or ''}"
     inventory_rows = st.session_state.get(COMPONENT_INVENTORY_KEY, {})
-    analysis_inventory = inventory_rows.get(inventory_owner, {}) if isinstance(inventory_rows, dict) else {}
+    analysis_inventory = ({"__board_registry__": {"registry_version": board_registry.get("version")}}
+                          if board_mode else
+                          inventory_rows.get(inventory_owner, {}) if isinstance(inventory_rows, dict) else {})
+    aliases = measurement_component_aliases(board_registry) if board_mode else None
     analysis_snapshot = current_analysis_snapshot(
         st, project, components=analysis_components, component_inventory=analysis_inventory,
+        analysis_target_id=analysis_scope.target_id,
+        component_id_aliases=aliases,
     )
     analysis_state = analysis_snapshot["record"]
-    # Component Map and the legacy measurement workspace can carry old visual
-    # verdicts. Only the current photo-scoped Analysis State Manager may paint
+    # Legacy photo analyses and Component Map verdicts do not paint the board.
+    # Only the current Analysis State Manager scope may paint live statuses.
     # the live PCB; retained verdicts stay in fault_history.
     component_models = tuple(replace(
         model, fault_candidate_status=None, diagnosis_display_status="DIAGNOSIS_NOT_RUN",
@@ -599,19 +714,21 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         }
         component_models = tuple(
             replace(model,
-                    fault_candidate_status=status_map.get(candidate_state[model.component_id].get("visual_status"),
+                    fault_candidate_status=status_map.get(candidate_state[str(
+                        model.board_component_id if board_mode else model.component_id)].get("visual_status"),
                                                           ("INCONCLUSIVE", "판정 불가"))[0],
-                    diagnosis_display_status=status_map.get(candidate_state[model.component_id].get("visual_status"),
+                    diagnosis_display_status=status_map.get(candidate_state[str(
+                        model.board_component_id if board_mode else model.component_id)].get("visual_status"),
                                                             ("INCONCLUSIVE", "판정 불가"))[1],
-                    fault_hypothesis=candidate_state[model.component_id].get("fault_hypothesis"),
-                    fault_role_status=candidate_state[model.component_id].get("role_status"),
-                    measurement_status=candidate_state[model.component_id].get("measurement_status"),
-                    solder_status=candidate_state[model.component_id].get("solder_status"),
-                    fault_score=candidate_state[model.component_id].get("score"),
-                    fault_evidence=tuple(candidate_state[model.component_id].get("evidence", [])),
-                    recommended_tests=tuple(candidate_state[model.component_id].get("recommended_tests", [])),
-                    fault_history=tuple(history_by_id.get(model.component_id, [])))
-            if model.component_id in candidate_state else model
+                    fault_hypothesis=candidate_state[str(model.board_component_id if board_mode else model.component_id)].get("fault_hypothesis"),
+                    fault_role_status=candidate_state[str(model.board_component_id if board_mode else model.component_id)].get("role_status"),
+                    measurement_status=candidate_state[str(model.board_component_id if board_mode else model.component_id)].get("measurement_status"),
+                    solder_status=candidate_state[str(model.board_component_id if board_mode else model.component_id)].get("solder_status"),
+                    fault_score=candidate_state[str(model.board_component_id if board_mode else model.component_id)].get("score"),
+                    fault_evidence=tuple(candidate_state[str(model.board_component_id if board_mode else model.component_id)].get("evidence", [])),
+                    recommended_tests=tuple(candidate_state[str(model.board_component_id if board_mode else model.component_id)].get("recommended_tests", [])),
+                    fault_history=tuple(history_by_id.get(str(model.board_component_id if board_mode else model.component_id), [])))
+            if str(model.board_component_id if board_mode else model.component_id) in candidate_state else model
             for model in component_models
         )
     if history_by_id:
@@ -628,6 +745,32 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
                                if selected_id in row.get("associated_component_ids", [])), None)
         if replacement_id:
             update_selection(st.session_state, project=project, selected_component=replacement_id)
+    if board_mode and candidate_state:
+        status_map = {
+            "SUSPECTED": ("SUSPECTED_FAULT", "의심 후보 · 미확정"),
+            "FAULT_SUPPORTED": ("FAULT_SUPPORTED", "검증 검사 결과 · 해당 고장 가설 지지"),
+            "FAULT_REFUTED": ("FAULT_REFUTED", "검증 검사 결과 · 해당 고장 가설 반박"),
+            "INCONCLUSIVE": ("INCONCLUSIVE", "측정 판정 불가"),
+            "CONFLICTED": ("CONFLICTED", "측정 결과 충돌 · 판단 보류"),
+        }
+        projected = []
+        for model in component_models:
+            candidate = candidate_state.get(str(model.board_component_id or ""))
+            if candidate is None:
+                projected.append(model)
+                continue
+            status, label = status_map.get(candidate.get("visual_status"), ("INCONCLUSIVE", "판정 불가"))
+            projected.append(replace(
+                model, fault_candidate_status=status, diagnosis_display_status=label,
+                fault_hypothesis=candidate.get("fault_hypothesis"),
+                fault_role_status=candidate.get("role_status"),
+                measurement_status=candidate.get("measurement_status"),
+                solder_status=candidate.get("solder_status"), fault_score=candidate.get("score"),
+                fault_evidence=tuple(candidate.get("evidence", [])),
+                recommended_tests=tuple(candidate.get("recommended_tests", [])),
+                fault_history=tuple(history_by_id.get(str(model.board_component_id), [])),
+            ))
+        component_models = tuple(projected)
     component_models = tuple(component_models)
     target_scope = AnalysisScope(project.project_id, project.board_id or "", str(selected))
     snapshot_map = dict(st.session_state.get("circuitcare_v6_photo_component_snapshots", {}))
@@ -695,6 +838,15 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         on_box_draw=add_manual_box if mode == "원본 사진" and detector_image_bytes is not None else None,
     )
     st.session_state["cc_active_component_overlap_key"] = f"{OVERLAPPING_SELECTION_KEY}_{_viewer_key}"
+    current_selection = st.session_state.get(SELECTION_KEY)
+    current_local_id = getattr(current_selection, "selected_component", None)
+    if board_mode and current_local_id:
+        board_component_id = board_registry.get("source_to_board_id", {}).get(
+            source_key_for_component(str(selected), current_local_id))
+        if board_component_id:
+            st.session_state[BOARD_COMPONENT_SELECTION_KEY] = board_component_id
+        else:
+            st.session_state.pop(BOARD_COMPONENT_SELECTION_KEY, None)
     if candidate_state:
         st.caption("진단 색상 · 노랑: 검사 후보 · 빨강: 해당 가설 측정 이상 · 초록: 해당 검사 정상 · 회색: 판정 불가. "
                    "초록은 소자 전체의 정상 판정을 뜻하지 않습니다.")
@@ -737,14 +889,15 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
             preview=st.session_state.get(MODE_KEY) == "PREVIEW_ONLY",
         )
     photos = st.session_state.get(INTAKE_IMAGES_KEY, [])
-    photo_snapshot = _prepare_photo_component_snapshot(st, project, photos)
-    snapshot_components = tuple(photo_snapshot.get("components", ()))
-    snapshot_scope = photo_snapshot.get("review_scope")
-    owner = f"{project.project_id}|{project.board_id or ''}|{snapshot_scope or ''}"
-    inventory_rows = st.session_state.get(COMPONENT_INVENTORY_KEY, {})
-    component_inventory = inventory_rows.get(owner, {}) if isinstance(inventory_rows, dict) else {}
+    board_registry, photo_snapshot = _prepare_board_registry_snapshot(st, project, photos)
+    snapshot_components = diagnosis_components(board_registry)
+    measurement_aliases = measurement_component_aliases(board_registry)
+    analysis_target_id = "board:registry:v1"
+    st.session_state["circuitcare_v7_analysis_target_id"] = analysis_target_id
+    component_inventory = {"__board_registry__": {"registry_version": board_registry.get("version")}}
     live_analysis_snapshot = current_analysis_snapshot(
         st, project, components=snapshot_components, component_inventory=component_inventory,
+        analysis_target_id=analysis_target_id, component_id_aliases=measurement_aliases,
     )
 
     title, add_photo, edit, new = st.columns([5, 1, 1, 1])
@@ -792,7 +945,11 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
         else:
             _render_fault_analysis_workspace(st, project, preview,
                                              analysis_snapshot=live_analysis_snapshot,
-                                             photo_snapshot=photo_snapshot)
+                                             photo_snapshot=photo_snapshot,
+                                             board_registry=board_registry,
+                                             board_components=snapshot_components,
+                                             component_id_aliases=measurement_aliases,
+                                             analysis_target_id=analysis_target_id)
 
 
 def _selected_component(st: Any) -> ComponentOverlayViewModel | None:
@@ -800,6 +957,24 @@ def _selected_component(st: Any) -> ComponentOverlayViewModel | None:
     selection = st.session_state.get(SELECTION_KEY)
     selected_id = getattr(selection, "selected_component", None)
     return next((item for item in current_components if item.component_id == selected_id), None)
+
+
+def _focus_board_registry_component(
+    st: Any, project: ProjectContext, registry: dict[str, Any] | None, board_component_id: str,
+) -> bool:
+    rows = registry.get("components", []) if isinstance(registry, dict) else []
+    row = next((item for item in rows if item.get("board_component_id") == board_component_id), None)
+    sources = sorted(row.get("source_components", []),
+                     key=lambda item: item.get("review_status") == "EXCLUDED") if row else []
+    if not sources:
+        return False
+    source = sources[0]
+    photo_id, local_id = source.get("photo_id"), source.get("component_id")
+    st.session_state[BOARD_COMPONENT_SELECTION_KEY] = board_component_id
+    st.session_state["circuitcare_v2_photo_choice"] = photo_id
+    update_selection(st.session_state, project=project, active_photo_id=photo_id,
+                     selected_component=local_id)
+    return True
 
 
 def _set_workbench_view(state: Any, *, project_id: str, view: str) -> None:
@@ -840,6 +1015,51 @@ def _render_component_inspector(st: Any, project: ProjectContext, preview: bool)
                 auto_result=st.session_state.get("circuitcare_v4_auto_detection_result"),
                 auto_error=st.session_state.get("circuitcare_v4_auto_detection_error"),
             )
+    _render_board_identity_controls(st, project)
+
+
+def _render_board_identity_controls(st: Any, project: ProjectContext) -> None:
+    registry = st.session_state.get("circuitcare_v7_active_board_registry")
+    if not isinstance(registry, dict) or len(registry.get("source_to_board_id", {})) < 2:
+        return
+    sources = [source for row in registry.get("components", [])
+               for source in row.get("source_components", [])]
+    if len({source.get("photo_id") for source in sources}) < 2:
+        return
+    labels = {source["source_key"]: (
+        f"{source['photo_id']} · {source['component_id']} · "
+        f"{source.get('component_type', 'unknown')} · {source.get('review_status', 'UNCONFIRMED')}"
+    ) for source in sources}
+    entry_owner = json.dumps([project.project_id, project.board_id or ""], separators=(",", ":"))
+    entry = st.session_state.get(REGISTRY_KEY, {}).get(entry_owner, {})
+    links = entry.get("confirmed_links", [])
+    with st.expander("여러 사진에서 같은 소자 확인", expanded=False):
+        st.caption("사진 간 자동 위치 병합은 하지 않습니다. 같은 소자임을 직접 확인한 관측만 연결됩니다.")
+        left = st.selectbox("사진 관측 A", list(labels), format_func=labels.get,
+                            key=f"cc_registry_left_{project.project_id}")
+        right = st.selectbox("사진 관측 B", list(labels), format_func=labels.get,
+                             key=f"cc_registry_right_{project.project_id}")
+        if st.button("같은 보드 소자로 연결", key=f"cc_registry_merge_{project.project_id}",
+                     disabled=left == right or labels[left].split(" · ")[0] == labels[right].split(" · ")[0]):
+            try:
+                confirm_component_match(st.session_state, project_id=project.project_id,
+                                        board_id=project.board_id, left_source_key=left,
+                                        right_source_key=right)
+                st.rerun()
+            except ValueError as exc:
+                st.warning(str(exc))
+        if links:
+            st.caption("사용자 확인으로 연결한 관계")
+            for index, link in enumerate(links):
+                if len(link) != 2:
+                    continue
+                a, b = link
+                st.caption(f"{labels.get(a, a)} ↔ {labels.get(b, b)}")
+                if st.button("연결 해제", key=f"cc_registry_unlink_{project.project_id}_{index}"):
+                    remove_component_match(st.session_state, project_id=project.project_id,
+                                           board_id=project.board_id, left_source_key=a,
+                                           right_source_key=b)
+                    st.rerun()
 
 
 def _render_selected_component_summary(st: Any, project: ProjectContext) -> None:
@@ -849,7 +1069,9 @@ def _render_selected_component_summary(st: Any, project: ProjectContext) -> None
         if item is None:
             st.caption("PCB 박스 또는 원인 후보를 선택하세요.")
             return
-        st.markdown(f"`{item.component_id}` · **{item.component_type}**")
+        st.markdown(f"`{item.board_component_id or item.component_id}` · **{item.component_type}**")
+        if item.board_component_id and item.board_component_id != item.component_id:
+            st.caption(f"현재 사진 탐지 ID · {item.component_id}")
         st.caption(f"신뢰도 {item.detection_confidence:.2f} · {item.identification_status}")
         if item.ocr_marking:
             st.caption(f"각인 후보 · {item.ocr_marking}")
@@ -865,6 +1087,10 @@ def _render_fault_analysis_workspace(
     st: Any, project: ProjectContext, preview: bool, *,
     analysis_snapshot: dict[str, Any] | None = None,
     photo_snapshot: dict[str, Any] | None = None,
+    board_registry: dict[str, Any] | None = None,
+    board_components: tuple[Any, ...] | None = None,
+    component_id_aliases: dict[str, str | None] | None = None,
+    analysis_target_id: str | None = None,
 ) -> None:
     if photo_snapshot is None:
         target_id = str(st.session_state.get(ACTIVE_PHOTO_KEY) or "target:default")
@@ -874,15 +1100,20 @@ def _render_fault_analysis_workspace(
         if not isinstance(photo_snapshot, dict):
             photo_snapshot = {"components": tuple(st.session_state.get("circuitcare_v4_current_components", ())),
                               "review_scope": st.session_state.get("circuitcare_v4_component_inventory_scope")}
+    if board_components is None and isinstance(board_registry, dict):
+        board_components = diagnosis_components(board_registry)
+    if board_components is not None:
+        components = tuple(board_components)
+    else:
+        components = tuple(photo_snapshot.get("components", ()))
     if analysis_snapshot is None:
-        owner = f"{project.project_id}|{project.board_id or ''}|{photo_snapshot.get('review_scope') or ''}"
-        inventories = st.session_state.get(COMPONENT_INVENTORY_KEY, {})
-        inventory = inventories.get(owner, {}) if isinstance(inventories, dict) else {}
+        inventory = ({"__board_registry__": {"registry_version": board_registry.get("version")}}
+                     if isinstance(board_registry, dict) else {})
         analysis_snapshot = current_analysis_snapshot(
-            st, project, components=tuple(photo_snapshot.get("components", ())),
+            st, project, components=components,
             component_inventory=inventory,
+            analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
         )
-    components = tuple(photo_snapshot.get("components", ()))
     selection = st.session_state.get(SELECTION_KEY)
     selected = _selected_component(st)
     review_scope = st.session_state.get("circuitcare_v4_component_inventory_scope")
@@ -898,24 +1129,30 @@ def _render_fault_analysis_workspace(
     with symptom_tab:
         render_symptom_diagnosis_panel(
             st, project, components=components, preview=preview,
-            component_inventory=inventory,
+            component_inventory=({"__board_registry__": {"registry_version": board_registry.get("version")}}
+                                 if isinstance(board_registry, dict) else inventory),
+            analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
+            board_registry=board_registry,
         )
     with cause_tab:
-        _render_cause_dashboard(st, project, result, analysis_snapshot=analysis_snapshot)
+        _render_cause_dashboard(st, project, result, analysis_snapshot=analysis_snapshot,
+                                board_registry=board_registry)
     with measurement_tab:
         st.markdown("#### 측정 기록과 가설 검증")
         if components:
             component_ids = [item.component_id for item in components]
             option_labels = {item.component_id: f"{item.component_id} · {item.component_type}" for item in components}
             selected_id = getattr(selection, "selected_component", None)
-            default_id = selected_id if selected_id in component_ids else component_ids[0]
+            default_id = (component_id_aliases or {}).get(selected_id) if selected_id else None
+            if default_id not in component_ids:
+                default_id = component_ids[0]
             picked_id = st.selectbox(
                 "측정 대상 소자", component_ids, index=component_ids.index(default_id),
                 format_func=option_labels.get,
                 key=f"cc_measurement_target_{project.project_id}_{selected_id or 'none'}",
             )
-            if picked_id != selected_id:
-                update_selection(st.session_state, project=project, selected_component=picked_id)
+            if picked_id != default_id:
+                _focus_board_registry_component(st, project, board_registry, picked_id)
                 st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
                 st.rerun()
         render_measurement_panel(
@@ -942,6 +1179,7 @@ def _render_fault_analysis_workspace(
 def _render_cause_dashboard(
     st: Any, project: ProjectContext, result: Any, *,
     analysis_snapshot: dict[str, Any] | None = None,
+    board_registry: dict[str, Any] | None = None,
 ) -> None:
     """Compact, evidence-aware view of the existing symptom diagnosis result."""
     if not isinstance(result, dict):
@@ -970,9 +1208,21 @@ def _render_cause_dashboard(
             opposing = top.get("opposing_evidence", [])
             if opposing:
                 st.write("**반대 근거** · " + " · ".join(opposing[:3]))
-            if any(item.component_id == top.get("component_id") for item in st.session_state.get("circuitcare_v4_current_components", ())):
+            available_in_registry = any(
+                item.get("board_component_id") == top.get("component_id")
+                for item in (board_registry or {}).get("components", [])
+            )
+            available_in_legacy_photo = any(
+                item.component_id == top.get("component_id")
+                for item in st.session_state.get("circuitcare_v4_current_components", ())
+            )
+            if available_in_registry or (board_registry is None and available_in_legacy_photo):
                 if st.button("PCB에서 이 후보 보기", key=f"cc_analysis_dashboard_focus_{project.project_id}_{top.get('component_id')}", type="primary"):
-                    update_selection(st.session_state, project=project, selected_component=top.get("component_id"))
+                    focused = (_focus_board_registry_component(st, project, board_registry,
+                               str(top.get("component_id"))) if board_registry else False)
+                    if not focused:
+                        update_selection(st.session_state, project=project,
+                                         selected_component=top.get("component_id"))
                     st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
                     st.rerun()
         else:
