@@ -87,6 +87,26 @@ def test_board_candidate_focus_changes_to_its_source_photo_and_photo_local_box()
     assert state[SELECTION_KEY].selected_component == "det-17"
 
 
+def test_measurement_target_changes_shared_selection_only_when_callback_runs():
+    project = ProjectContext("project-measure", "board-measure")
+    state = {}
+    enter_workbench(state, project)
+    registry = {"components": [{
+        "board_component_id": "bc-2",
+        "source_components": [{"photo_id": "back-photo", "component_id": "R8"}],
+    }]}
+    st = _StreamlitStub(state=state)
+    target_key = "measurement-target"
+    state[target_key] = "bc-2"
+
+    workspace._handle_measurement_target_change(state, project, registry, target_key)
+
+    assert state[workspace.BOARD_COMPONENT_SELECTION_KEY] == "bc-2"
+    assert state["circuitcare_v2_photo_choice"] == "back-photo"
+    assert state[SELECTION_KEY].selected_component == "R8"
+    assert state["cc_analysis_viewer_open_project-measure"] is True
+
+
 def test_review_navigation_callback_sets_radio_state_before_next_render():
     state = {"cc_workbench_view_project-3": "고장 분석"}
 

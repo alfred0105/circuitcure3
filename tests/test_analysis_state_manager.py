@@ -11,6 +11,8 @@ from circuitcare.frontend.models import ImageRecord, ProjectContext, SelectionSt
 from circuitcare.frontend.board_component_registry import (
     build_board_component_registry, diagnosis_components, measurement_component_aliases,
 )
+from circuitcare.frontend.measurement_models import create_measurement_record
+from circuitcare.frontend.measurement_state import save_measurement
 
 
 def _fingerprints(*, symptoms="no_power", measurements=(), rules="rules-v1"):
@@ -207,3 +209,54 @@ def test_board_analysis_scope_survives_photo_switch_and_stales_on_registry_chang
     )
     assert stale["result"] is None
     assert stale["record"]["status"] == AnalysisStatus.STALE
+
+
+def test_board_analysis_projects_verified_measurements_and_drops_replaced_photo_links():
+    project = ProjectContext("p-measure", "b-measure", image_records=(ImageRecord("front"),))
+    component = SimpleNamespace(
+        component_id="R1", component_type="resistor", bbox_xyxy=(1, 2, 5, 7),
+        coordinate_frame="SOURCE_PHOTO_PIXEL", identification_status="USER_CONFIRMED",
+        presence_status="CONFIRMED", component_type_status="USER_CONFIRMED",
+        ocr_marking="103", possible_part_number=None, component_info=None,
+        confirmed_functional_roles=(), evidence=(), overlay_source="yolo", ocr_candidates=(),
+    )
+    snapshots = {"front": {"image_fingerprint": "front-v1", "components": (component,)}}
+    state = {"circuitcare_v2_active_photo_id": "front", "circuitcare_v2_photo_choice": "front"}
+    registry = build_board_component_registry(
+        state, project_id=project.project_id, board_id=project.board_id, photo_snapshots=snapshots,
+    )
+    board_id = registry["source_to_board_id"]['["front","R1"]']
+    measurement = create_measurement_record(
+        project_id=project.project_id, board_id=project.board_id, component_id="R1",
+        component_identity_status="USER_CONFIRMED", measurement_type="resistance",
+        value="10", unit="Ω", source="user_measurement",
+        component_map_version=registry["version"], measurement_id="m-r1",
+        board_component_id=board_id, source_photo_id="front",
+        source_photo_fingerprint="front-v1", source_component_id="R1",
+        identity_resolution_status="USER_SELECTED_VERIFIED",
+    )
+    save_measurement(state, measurement)
+    st = type("FakeStreamlit", (), {"session_state": state})()
+    args = dict(
+        components=diagnosis_components(registry),
+        component_inventory={"__board_registry__": {"registry_version": registry["version"]}},
+        analysis_target_id="board:registry:v1",
+        component_id_aliases=measurement_component_aliases(registry),
+        board_registry=registry,
+    )
+    current = current_analysis_snapshot(st, project, **args)
+    assert len(current["measurements"]) == 1
+    assert current["measurements"][0].component_id == board_id
+    assert current["measurements"][0].component_map_version == registry["version"]
+
+    replaced_snapshots = {"front": {"image_fingerprint": "front-v2", "components": (component,)}}
+    replaced_registry = build_board_component_registry(
+        state, project_id=project.project_id, board_id=project.board_id,
+        photo_snapshots=replaced_snapshots,
+    )
+    args["components"] = diagnosis_components(replaced_registry)
+    args["component_inventory"] = {"__board_registry__": {"registry_version": replaced_registry["version"]}}
+    args["component_id_aliases"] = measurement_component_aliases(replaced_registry)
+    args["board_registry"] = replaced_registry
+    stale_measurement = current_analysis_snapshot(st, project, **args)
+    assert stale_measurement["measurements"] == []

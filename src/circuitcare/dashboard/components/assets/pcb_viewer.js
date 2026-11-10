@@ -126,7 +126,8 @@ export default function(component) {
     rows.push("클릭하면 오른쪽 패널에서 박스를 수정하거나 제외할 수 있습니다.");
     const faultLabels = { SUSPECTED_FAULT:"고장 의심 후보 · 검사 필요", RELATED_COMPONENT:"관련 점검 후보",
       CONFIRMED_FAULT:"검사 근거 확인", FAULT_SUPPORTED:"검증 검사 · 고장 가설 지지",
-      FAULT_REFUTED:"검증 검사 · 고장 가설 반박", INCONCLUSIVE:"검사 판정 불가" };
+      FAULT_REFUTED:"검증 검사 · 고장 가설 반박", INCONCLUSIVE:"검사 판정 불가",
+      CONFLICTED:"측정 결과 충돌 · 판단 보류" };
     if (faultLabels[item.fault_candidate_status]) {
       rows.push(faultLabels[item.fault_candidate_status]);
     } else {
@@ -157,6 +158,7 @@ export default function(component) {
         class:`cc-pcb-component${item.component_id === (state.selectedComponentId !== undefined ? state.selectedComponentId : data.selected_component_id) ? " cc-selected" : ""}${item.overlay_status === "EXCLUDED" ? " cc-excluded" : ""}${item.overlay_source === "qwen_suggestion" ? " cc-ai-suggested" : item.overlay_source === "yolo_second_pass" ? " cc-second-pass" : item.overlay_source === "manual" ? " cc-manual-box" : ""}${item.fault_candidate_status === "SUSPECTED_FAULT" ? " cc-fault-suspected" : item.fault_candidate_status === "RELATED_COMPONENT" ? " cc-fault-related" : item.fault_candidate_status === "CONFIRMED_FAULT" ? " cc-fault-confirmed" : item.fault_candidate_status === "FAULT_SUPPORTED" ? " cc-fault-supported" : item.fault_candidate_status === "FAULT_REFUTED" ? " cc-fault-refuted" : item.fault_candidate_status === "INCONCLUSIVE" ? " cc-fault-inconclusive" : ""}`,
         "data-component-id":item.component_id, tabindex:"0", role:"button",
         "aria-label":`${item.display_label || item.component_type} 부품 선택` });
+      shape.classList.toggle("cc-fault-conflicted", item.fault_candidate_status === "CONFLICTED");
       fragment.appendChild(shape);
       if (item.display_label) {
         const label = svgElement("text", { x:(x1+x2)/2, y:Math.max(12,y1-4), class:"cc-pcb-label" });

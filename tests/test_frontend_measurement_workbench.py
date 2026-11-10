@@ -6,7 +6,7 @@ import pytest
 from circuitcare.frontend.measurement_models import create_measurement_record
 from circuitcare.frontend.measurement_state import (
     diagnosis_state, get_measurements, save_measurement, update_measurement,
-    delete_measurement, current_measurement_set_sha256,
+    delete_measurement, current_measurement_set_sha256, MEASUREMENT_HISTORY_KEY,
 )
 from circuitcare.dashboard.views.measurement_panel import (
     _measurement_verification_gaps, _sigma_for_input_unit,
@@ -88,6 +88,27 @@ def test_measurement_history_is_project_board_and_component_scoped_and_mutations
     assert get_measurements(state, project_id="p1", board_id="b1")[0].value == 2.5
     assert delete_measurement(state, project_id="p1", board_id="b1", measurement_id="m1")
     assert get_measurements(state, project_id="p1", board_id="b1") == []
+    history = state[MEASUREMENT_HISTORY_KEY]
+    assert [event["event_type"] for event in history] == ["CREATED", "UPDATED", "DELETED"]
+    assert history[0]["record"]["value"] == 0.0
+    assert history[1]["previous_record"]["value"] == 0.0
+    assert history[1]["record"]["value"] == 2.5
+    assert history[2]["record"]["value"] == 2.5
+
+
+def test_board_measurement_requires_source_photo_and_local_id_and_preserves_identity():
+    state = {}
+    row = _measurement(board_component_id="bc-1", source_photo_id="photo-front",
+                       source_component_id="local-1",
+                       identity_resolution_status="USER_SELECTED_VERIFIED")
+    save_measurement(state, row)
+    stored = get_measurements(state, project_id="p1", board_id="b1", board_component_id="bc-1")
+    assert len(stored) == 1
+    assert stored[0].board_component_id == row.board_component_id
+    assert stored[0].source_photo_id == row.source_photo_id
+    assert stored[0].source_component_id == row.source_component_id
+    with pytest.raises(ValueError, match="원본 사진"):
+        save_measurement(state, _measurement(measurement_id="m2", board_component_id="bc-2"))
 
 
 def test_measurement_cannot_be_relinked_to_another_component_on_edit():

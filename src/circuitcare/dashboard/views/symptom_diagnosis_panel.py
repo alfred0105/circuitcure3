@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 import time
 from pathlib import Path
@@ -71,6 +72,7 @@ def current_analysis_snapshot(
     observations: dict[str, Any] | None = None, inventory_complete: bool | None = None,
     analysis_target_id: str | None = None,
     component_id_aliases: dict[str, str | None] | None = None,
+    board_registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Rebuild and validate a photo-scoped or board-scoped analysis version."""
     key = _project_key(project)
@@ -108,8 +110,53 @@ def current_analysis_snapshot(
     measurements = get_measurements(
         st.session_state, project_id=project.project_id, board_id=project.board_id or "",
     )
-    if component_id_aliases is not None:
-        from dataclasses import replace
+    if isinstance(board_registry, dict):
+        from circuitcare.frontend.board_component_registry import resolve_measurement_board_component
+        board_version = str(board_registry.get("version") or "")
+        projected = []
+        known_board_ids = {str(item.get("board_component_id"))
+                           for item in board_registry.get("components", [])}
+        for row in measurements:
+            source_photo = getattr(row, "source_photo_id", None)
+            source_local = getattr(row, "source_component_id", None) or row.component_id
+            if getattr(row, "board_component_id", None):
+                resolved = row.board_component_id
+                resolution = "VERIFIED_SOURCE_IDENTITY"
+                if source_photo:
+                    actual, status = resolve_measurement_board_component(
+                        board_registry, photo_id=source_photo, component_id=source_local,
+                        photo_fingerprint=getattr(row, "source_photo_fingerprint", None),
+                        component_map_version=(row.component_map_version
+                                               if not getattr(row, "source_photo_fingerprint", None)
+                                               else None))
+                    if actual is None:
+                        resolved, resolution = None, "UNRESOLVED"
+                    else:
+                        # A confirmed merge or split may change the current board ID;
+                        # the immutable photo/local source identity remains authoritative.
+                        resolved = actual
+                        resolution = status
+                elif not source_photo or resolved not in known_board_ids or not source_local:
+                    resolved, resolution = None, "UNRESOLVED"
+            else:
+                resolved, resolution = resolve_measurement_board_component(
+                    board_registry, photo_id=source_photo, component_id=source_local,
+                    photo_fingerprint=getattr(row, "source_photo_fingerprint", None),
+                    component_map_version=row.component_map_version)
+            projected.append(replace(
+                row, component_id=str(resolved or ""),
+                component_map_version=board_version if resolved else row.component_map_version,
+                board_component_id=str(resolved) if resolved else None,
+                source_photo_id=source_photo,
+                source_component_id=source_local,
+                identity_resolution_status=resolution,
+                component_identity_status=(row.component_identity_status if resolved else "IDENTITY_AMBIGUOUS"),
+            ))
+        # Unresolved/retired identities stay in the measurement archive and UI,
+        # but are not evidence for the current diagnosis.
+        measurements = [row for row in projected
+                        if str(row.identity_resolution_status).startswith("VERIFIED_")]
+    elif component_id_aliases is not None:
         measurements = [replace(
             row, component_id=component_id_aliases.get(row.component_id) or "",
             component_identity_status=(row.component_identity_status
@@ -153,7 +200,7 @@ def current_analysis_snapshot(
         "inventory_complete": bool(inventory_complete), "components": components,
         "component_inventory": inventory, "llm_enabled": llm_enabled,
         "selected_model": selected_model,
-        "component_id_aliases": component_id_aliases,
+        "component_id_aliases": component_id_aliases, "board_registry": board_registry,
     }
 
 
@@ -230,15 +277,22 @@ def _component_rows(components: tuple[Any, ...],
 
 def _current_analysis_context(project: ProjectContext, state: Any,
                               component_inventory: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    registry = state.get("circuitcare_v7_active_board_registry", {})
+    statuses = {
+        str(row.get("board_component_id")): "USER_CONFIRMED"
+        for row in registry.get("components", [])
+        if isinstance(registry, dict) and row.get("presence_status") == "CONFIRMED"
+    } if isinstance(registry, dict) else {
+        component_id: "USER_CONFIRMED"
+        for component_id, row in component_inventory.items()
+        if isinstance(row, dict) and row.get("presence_status") == "CONFIRMED"
+    }
     return {
         "project_id": project.project_id,
         "board_id": project.board_id or "",
-        "component_map_version": state.get("circuitcare_v4_selection_map_key"),
-        "component_identity_statuses": {
-            component_id: "USER_CONFIRMED"
-            for component_id, row in component_inventory.items()
-            if isinstance(row, dict) and row.get("presence_status") == "CONFIRMED"
-        },
+        "component_map_version": (registry.get("version") if isinstance(registry, dict)
+                                  else state.get("circuitcare_v4_selection_map_key")),
+        "component_identity_statuses": statuses,
     }
 
 
@@ -368,6 +422,7 @@ def render_symptom_diagnosis_panel(
         symptom_text=symptom_text, selected_codes=selected_codes,
         observations=observations, inventory_complete=inventory_complete,
         analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
+        board_registry=board_registry,
     )
     measurements = snapshot["measurements"]
     silkscreen_labels = st.session_state.get("circuitcare_v4_silkscreen_labels", [])
@@ -499,6 +554,7 @@ def render_symptom_diagnosis_panel(
             symptom_text=symptom_text, selected_codes=selected_codes,
             observations=observations, inventory_complete=inventory_complete,
             analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
+            board_registry=board_registry,
         )
         committed = commit_analysis_result(
             st.session_state, scope=analysis_scope, run_id=run_id,
@@ -729,6 +785,7 @@ def render_symptom_diagnosis_panel(
                 symptom_text=symptom_text, selected_codes=selected_codes,
                 observations=observations, inventory_complete=inventory_complete,
                 analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
+                board_registry=board_registry,
             )
             committed = commit_analysis_result(
                 st.session_state, scope=analysis_scope, run_id=followup_run_id,

@@ -62,6 +62,13 @@ class MeasurementRecord:
     reference_conditions: str | None = None
     location_verified: bool = False
     uncertainty_source: str | None = None
+    component_type: str = "unknown"
+    board_component_id: str | None = None
+    source_photo_id: str | None = None
+    source_photo_fingerprint: str | None = None
+    source_component_id: str | None = None
+    measurement_location: str | None = None
+    identity_resolution_status: str = "UNRESOLVED"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -93,6 +100,11 @@ def create_measurement_record(
     reference_verification_status: str = "UNVERIFIED",
     operating_conditions: str | None = None, reference_conditions: str | None = None,
     location_verified: bool = False, uncertainty_source: str | None = None,
+    component_type: str = "unknown",
+    board_component_id: str | None = None, source_photo_id: str | None = None,
+    source_photo_fingerprint: str | None = None, source_component_id: str | None = None,
+    measurement_location: str | None = None,
+    identity_resolution_status: str = "UNRESOLVED",
 ) -> MeasurementRecord:
     if not project_id.strip() or not board_id.strip() or not component_id.strip():
         raise ValueError("프로젝트, 보드, 부품 정보가 필요합니다.")
@@ -154,6 +166,13 @@ def create_measurement_record(
         reference_conditions=(reference_conditions or "").strip() or None,
         location_verified=bool(location_verified),
         uncertainty_source=(uncertainty_source or "").strip() or None,
+        component_type=str(component_type or "unknown"),
+        board_component_id=(board_component_id or "").strip() or None,
+        source_photo_id=(source_photo_id or "").strip() or None,
+        source_photo_fingerprint=(source_photo_fingerprint or "").strip() or None,
+        source_component_id=(source_component_id or component_id).strip() or None,
+        measurement_location=(measurement_location or measurement_target or "").strip() or None,
+        identity_resolution_status=str(identity_resolution_status or "UNRESOLVED"),
     )
 
 

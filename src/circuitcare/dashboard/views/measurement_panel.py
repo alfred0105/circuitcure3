@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
+from circuitcare.frontend.board_component_registry import resolve_measurement_board_component
 from circuitcare.frontend.measurement_adapter import adapt_measurement_input
 from circuitcare.frontend.measurement_models import (
     BASE_UNITS, MEASUREMENT_TYPE_LABELS, MEASUREMENT_UNITS, SOURCE_LABELS,
@@ -30,6 +31,8 @@ def _measurement_verification_gaps(record: MeasurementRecord) -> list[str]:
     gaps = []
     if not record.measurement_target:
         gaps.append("측정 대상 미지정")
+    if not record.board_component_id or not str(record.identity_resolution_status).startswith(("USER_SELECTED_", "VERIFIED_")):
+        gaps.append("보드 소자 연결 미확인")
     if record.mapping_status != "MAPPED" or not record.probe_id or not record.node_id:
         gaps.append("전기적 측정 지점 연결 미확인")
     if record.uncertainty is None or record.uncertainty <= 0:
@@ -61,6 +64,7 @@ def _sigma_for_input_unit(value: Any, measurement_type: str, unit: str) -> str |
 def render_measurement_panel(
     st: Any, project: ProjectContext, *, selected_component: ComponentOverlayViewModel | None,
     preview: bool = False, component_map_version: str | None = None,
+    board_registry: dict[str, Any] | None = None,
 ) -> None:
     if selected_component is None:
         st.info("PCB Viewer에서 소자를 선택하면 해당 소자의 측정값을 기록할 수 있습니다.")
@@ -68,16 +72,56 @@ def render_measurement_panel(
     if not project.board_id:
         st.warning("보드 ID가 없어 측정 기록을 연결할 수 없습니다.")
         return
-    owner = f"{project.project_id}-{project.board_id}-{selected_component.component_id}"
-    records = get_measurements(st.session_state, project_id=project.project_id,
-                               board_id=project.board_id, component_id=selected_component.component_id)
-    current_records = [row for row in records if (
-        component_map_version is not None
-        and row.component_map_version == component_map_version
-        and row.component_identity_status not in {"IDENTITY_AMBIGUOUS", "IDENTITY_CONFLICT"}
-    )]
-    stale_records = [row for row in records if row not in current_records]
-    st.caption(f"측정 대상 · {selected_component.component_id} · {selected_component.component_type}")
+    board_component_id = selected_component.board_component_id
+    owner = f"{project.project_id}-{project.board_id}-{board_component_id or selected_component.component_id}"
+    all_records = get_measurements(st.session_state, project_id=project.project_id,
+                                   board_id=project.board_id)
+    current_records: list[MeasurementRecord] = []
+    stale_records: list[MeasurementRecord] = []
+    for row in all_records:
+        resolved_id = row.board_component_id
+        resolution = row.identity_resolution_status
+        if isinstance(board_registry, dict):
+            if resolved_id:
+                source_photo = row.source_photo_id
+                source_local = row.source_component_id or row.component_id
+                if source_photo:
+                    actual, resolution = resolve_measurement_board_component(
+                        board_registry, photo_id=source_photo, component_id=source_local,
+                        photo_fingerprint=row.source_photo_fingerprint,
+                        component_map_version=(row.component_map_version
+                                               if not row.source_photo_fingerprint else None))
+                    if actual is None:
+                        resolved_id, resolution = None, "UNRESOLVED"
+                    else:
+                        resolved_id = actual
+                elif (not source_photo or not source_local or not any(item.get("board_component_id") == resolved_id
+                             for item in board_registry.get("components", []))):
+                    resolved_id, resolution = None, "UNRESOLVED"
+            else:
+                resolved_id, resolution = resolve_measurement_board_component(
+                    board_registry, photo_id=row.source_photo_id,
+                    component_id=row.source_component_id or row.component_id,
+                    photo_fingerprint=row.source_photo_fingerprint,
+                    component_map_version=row.component_map_version)
+        if (board_component_id and resolved_id == board_component_id
+                and str(resolution).startswith("VERIFIED_")):
+            projected = replace(
+                row, board_component_id=str(resolved_id),
+                identity_resolution_status=resolution,
+            )
+            current_records.append(projected)
+        elif row.component_id == selected_component.component_id and board_registry is None:
+            if (component_map_version is not None and row.component_map_version == component_map_version
+                    and row.component_identity_status not in {"IDENTITY_AMBIGUOUS", "IDENTITY_CONFLICT"}):
+                current_records.append(row)
+            else:
+                stale_records.append(row)
+        elif (not str(resolution).startswith("VERIFIED_")
+              and (row.component_id == selected_component.component_id
+                   or row.source_component_id == selected_component.component_id)):
+            stale_records.append(row)
+    st.caption(f"측정 대상 · {board_component_id or selected_component.component_id} · {selected_component.component_type}")
     st.caption("측정값을 먼저 기록하세요. 검증 조건이 부족한 기록은 보존되지만 검증 결과로 판정하지 않습니다.")
     if stale_records:
         st.warning(f"이전 Component Map의 측정 기록 {len(stale_records)}개는 현재 부품에 자동 연결하지 않았습니다. 부품 연결을 확인해 주세요.")
@@ -149,6 +193,15 @@ def render_measurement_panel(
                 uncertainty=_sigma_for_input_unit(uncertainty, measurement_type, unit),
                 source=SOURCE_CODES[source_label],
                 component_map_version=component_map_version,
+                component_type=selected_component.component_type,
+                board_component_id=board_component_id,
+                source_photo_id=selected_component.canonical_frame_id,
+                source_photo_fingerprint=next((item.get("image_fingerprint")
+                                                for item in (board_registry or {}).get("photos", [])
+                                                if item.get("photo_id") == selected_component.canonical_frame_id), None),
+                source_component_id=selected_component.component_id,
+                measurement_location=target,
+                identity_resolution_status=("USER_SELECTED_VERIFIED" if board_component_id else "UNRESOLVED"),
                 measurement_target=target, fault_hypothesis=fault_hypothesis or None,
                 test_id=test_id or None,
                 reference_min=reference_min, reference_max=reference_max,
@@ -331,6 +384,7 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
                     uncertainty=_sigma_for_input_unit(uncertainty, edit_type, unit),
                     source=SOURCE_CODES[source_label],
                     component_map_version=record.component_map_version,
+                    component_type=record.component_type,
                     measurement_id=record.measurement_id, timestamp=record.timestamp,
                     measurement_target=target,
                     fault_hypothesis=fault_hypothesis or None,
@@ -344,6 +398,15 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
                     reference_conditions=reference_conditions,
                     location_verified=location_verified,
                     uncertainty_source=uncertainty_source,
+                )
+                updated = replace(
+                    updated, board_component_id=record.board_component_id,
+                    source_photo_id=record.source_photo_id,
+                    source_photo_fingerprint=record.source_photo_fingerprint,
+                    source_component_id=record.source_component_id,
+                    measurement_location=target or None,
+                    identity_resolution_status=record.identity_resolution_status,
+                    component_type=record.component_type,
                 )
                 updated = replace(updated, changed_at=datetime.now(timezone.utc).isoformat())
                 update_measurement(st.session_state, updated)

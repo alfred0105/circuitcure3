@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
+import uuid
 from typing import Any
 
 from circuitcare.frontend.measurement_models import (
@@ -12,6 +14,7 @@ from circuitcare.analysis.fingerprints import build_measurement_fingerprint
 from circuitcare.analysis.state_manager import invalidate_analysis
 
 MEASUREMENTS_KEY = "circuitcare_v5_measurements"
+MEASUREMENT_HISTORY_KEY = "circuitcare_v8_measurement_history"
 DIAGNOSIS_STATE_KEY = "circuitcare_v5_diagnosis_state"
 DIAGNOSIS_PROVIDER_KEY = "circuitcare_v5_diagnosis_provider"
 DIAGNOSIS_CONTEXT_KEY = "circuitcare_v5_diagnosis_context"
@@ -22,12 +25,29 @@ def owner_key(project_id: str, board_id: str) -> str:
 
 
 def get_measurements(state: dict[str, Any], *, project_id: str, board_id: str,
-                     component_id: str | None = None) -> list[MeasurementRecord]:
+                     component_id: str | None = None,
+                     board_component_id: str | None = None) -> list[MeasurementRecord]:
     scoped = state.get(MEASUREMENTS_KEY, {})
     records = list(scoped.get(owner_key(project_id, board_id), [])) if isinstance(scoped, dict) else []
     if component_id is not None:
         records = [record for record in records if record.component_id == component_id]
+    if board_component_id is not None:
+        records = [record for record in records if record.board_component_id == board_component_id]
     return records
+
+
+def _append_measurement_history(state: dict[str, Any], record: MeasurementRecord,
+                                event_type: str, *, previous: MeasurementRecord | None = None) -> None:
+    history = list(state.get(MEASUREMENT_HISTORY_KEY, []))
+    history.append({
+        "event_id": str(uuid.uuid4()), "event_type": event_type,
+        "project_id": record.project_id, "board_id": record.board_id,
+        "measurement_id": record.measurement_id,
+        "record": record.to_dict(),
+        "previous_record": previous.to_dict() if previous is not None else None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    state[MEASUREMENT_HISTORY_KEY] = history
 
 
 def current_measurement_set_sha256(state: dict[str, Any], *, project_id: str, board_id: str) -> str:
@@ -41,10 +61,13 @@ def save_measurement(state: dict[str, Any], record: MeasurementRecord) -> None:
     records = list(scoped.get(key, []))
     if any(item.measurement_id == record.measurement_id for item in records):
         raise ValueError("이미 저장된 Measurement ID입니다.")
+    if record.board_component_id and (not record.source_photo_id or not record.source_component_id):
+        raise ValueError("보드 소자 측정에는 원본 사진과 사진별 소자 ID가 필요합니다.")
     before = build_measurement_fingerprint(records)
     records.append(record)
     scoped[key] = assign_measurement_set(records, project_id=record.project_id, board_id=record.board_id)
     state[MEASUREMENTS_KEY] = scoped
+    _append_measurement_history(state, scoped[key][-1], "CREATED")
     if before != build_measurement_fingerprint(scoped[key]):
         invalidate_diagnosis(state, project_id=record.project_id, board_id=record.board_id)
 
@@ -62,6 +85,13 @@ def update_measurement(state: dict[str, Any], updated: MeasurementRecord) -> Non
     if (original.component_map_version != updated.component_map_version
             or original.component_identity_status != updated.component_identity_status):
         raise ValueError("측정 기록의 Component Map 또는 Identity를 수정할 수 없습니다.")
+    if (original.component_type, original.board_component_id, original.source_photo_id, original.source_photo_fingerprint,
+            original.source_component_id,
+            original.identity_resolution_status) != (
+            updated.component_type, updated.board_component_id, updated.source_photo_id, updated.source_photo_fingerprint,
+            updated.source_component_id,
+            updated.identity_resolution_status):
+        raise ValueError("측정 기록의 보드 소자 연결과 원본 식별 정보는 수정할 수 없습니다.")
     before = build_measurement_fingerprint(records)
     records[index] = replace(updated, probe_id=original.probe_id, node_id=original.node_id,
                              mapping_status=original.mapping_status,
@@ -69,6 +99,7 @@ def update_measurement(state: dict[str, Any], updated: MeasurementRecord) -> Non
                              measurement_set_id=None)
     scoped[key] = assign_measurement_set(records, project_id=updated.project_id, board_id=updated.board_id)
     state[MEASUREMENTS_KEY] = scoped
+    _append_measurement_history(state, records[index], "UPDATED", previous=original)
     if before != build_measurement_fingerprint(scoped[key]):
         invalidate_diagnosis(state, project_id=updated.project_id, board_id=updated.board_id)
 
@@ -81,9 +112,11 @@ def delete_measurement(state: dict[str, Any], *, project_id: str, board_id: str,
     remaining = [record for record in records if record.measurement_id != measurement_id]
     if len(remaining) == len(records):
         return False
+    removed = next(record for record in records if record.measurement_id == measurement_id)
     before = build_measurement_fingerprint(records)
     scoped[key] = assign_measurement_set(remaining, project_id=project_id, board_id=board_id)
     state[MEASUREMENTS_KEY] = scoped
+    _append_measurement_history(state, removed, "DELETED")
     invalidate_diagnosis(state, project_id=project_id, board_id=board_id)
     return True
 

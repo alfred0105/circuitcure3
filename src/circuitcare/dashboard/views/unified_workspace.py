@@ -676,6 +676,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         st, project, components=analysis_components, component_inventory=analysis_inventory,
         analysis_target_id=analysis_scope.target_id,
         component_id_aliases=aliases,
+        board_registry=board_registry if board_mode else None,
     )
     analysis_state = analysis_snapshot["record"]
     # Legacy photo analyses and Component Map verdicts do not paint the board.
@@ -898,6 +899,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
     live_analysis_snapshot = current_analysis_snapshot(
         st, project, components=snapshot_components, component_inventory=component_inventory,
         analysis_target_id=analysis_target_id, component_id_aliases=measurement_aliases,
+        board_registry=board_registry,
     )
 
     title, add_photo, edit, new = st.columns([5, 1, 1, 1])
@@ -977,6 +979,26 @@ def _focus_board_registry_component(
     return True
 
 
+def _handle_measurement_target_change(
+    state: Any, project: ProjectContext, registry: dict[str, Any] | None, widget_key: str,
+) -> None:
+    """Change the shared selection only for an explicit target-widget event."""
+    board_component_id = state.get(widget_key)
+    rows = registry.get("components", []) if isinstance(registry, dict) else []
+    row = next((item for item in rows
+                if item.get("board_component_id") == board_component_id), None)
+    sources = sorted(row.get("source_components", []),
+                     key=lambda item: item.get("review_status") == "EXCLUDED") if row else []
+    if not sources:
+        return
+    source = sources[0]
+    state[BOARD_COMPONENT_SELECTION_KEY] = board_component_id
+    state["circuitcare_v2_photo_choice"] = source.get("photo_id")
+    update_selection(state, project=project, active_photo_id=source.get("photo_id"),
+                     selected_component=source.get("component_id"))
+    state[f"cc_analysis_viewer_open_{project.project_id}"] = True
+
+
 def _set_workbench_view(state: Any, *, project_id: str, view: str) -> None:
     """Update the radio selection from a pre-render callback, before widget creation."""
     state[f"cc_workbench_view_{project_id}"] = view
@@ -1020,11 +1042,14 @@ def _render_component_inspector(st: Any, project: ProjectContext, preview: bool)
 
 def _render_board_identity_controls(st: Any, project: ProjectContext) -> None:
     registry = st.session_state.get("circuitcare_v7_active_board_registry")
-    if not isinstance(registry, dict) or len(registry.get("source_to_board_id", {})) < 2:
+    if not isinstance(registry, dict):
         return
+    inactive_links = registry.get("inactive_links", [])
     sources = [source for row in registry.get("components", [])
                for source in row.get("source_components", [])]
-    if len({source.get("photo_id") for source in sources}) < 2:
+    can_merge = (len(registry.get("source_to_board_id", {})) >= 2
+                 and len({source.get("photo_id") for source in sources}) >= 2)
+    if not can_merge and not inactive_links:
         return
     labels = {source["source_key"]: (
         f"{source['photo_id']} · {source['component_id']} · "
@@ -1035,31 +1060,46 @@ def _render_board_identity_controls(st: Any, project: ProjectContext) -> None:
     links = entry.get("confirmed_links", [])
     with st.expander("여러 사진에서 같은 소자 확인", expanded=False):
         st.caption("사진 간 자동 위치 병합은 하지 않습니다. 같은 소자임을 직접 확인한 관측만 연결됩니다.")
-        left = st.selectbox("사진 관측 A", list(labels), format_func=labels.get,
-                            key=f"cc_registry_left_{project.project_id}")
-        right = st.selectbox("사진 관측 B", list(labels), format_func=labels.get,
-                             key=f"cc_registry_right_{project.project_id}")
-        if st.button("같은 보드 소자로 연결", key=f"cc_registry_merge_{project.project_id}",
-                     disabled=left == right or labels[left].split(" · ")[0] == labels[right].split(" · ")[0]):
-            try:
-                confirm_component_match(st.session_state, project_id=project.project_id,
-                                        board_id=project.board_id, left_source_key=left,
-                                        right_source_key=right)
-                st.rerun()
-            except ValueError as exc:
-                st.warning(str(exc))
-        if links:
-            st.caption("사용자 확인으로 연결한 관계")
-            for index, link in enumerate(links):
-                if len(link) != 2:
-                    continue
-                a, b = link
-                st.caption(f"{labels.get(a, a)} ↔ {labels.get(b, b)}")
-                if st.button("연결 해제", key=f"cc_registry_unlink_{project.project_id}_{index}"):
-                    remove_component_match(st.session_state, project_id=project.project_id,
-                                           board_id=project.board_id, left_source_key=a,
-                                           right_source_key=b)
+        if can_merge:
+            left = st.selectbox("사진 관측 A", list(labels), format_func=labels.get,
+                                key=f"cc_registry_left_{project.project_id}")
+            right = st.selectbox("사진 관측 B", list(labels), format_func=labels.get,
+                                 key=f"cc_registry_right_{project.project_id}")
+            if st.button("같은 보드 소자로 연결", key=f"cc_registry_merge_{project.project_id}",
+                         disabled=left == right or labels[left].split(" · ")[0] == labels[right].split(" · ")[0]):
+                try:
+                    confirm_component_match(st.session_state, project_id=project.project_id,
+                                            board_id=project.board_id, left_source_key=left,
+                                            right_source_key=right)
                     st.rerun()
+                except ValueError as exc:
+                    st.warning(str(exc))
+            if links:
+                st.caption("사용자 확인으로 연결한 관계")
+                for index, link in enumerate(links):
+                    if len(link) != 2:
+                        continue
+                    a, b = link
+                    st.caption(f"{labels.get(a, a)} ↔ {labels.get(b, b)}")
+                    if st.button("연결 해제", key=f"cc_registry_unlink_{project.project_id}_{index}"):
+                        remove_component_match(st.session_state, project_id=project.project_id,
+                                               board_id=project.board_id, left_source_key=a,
+                                               right_source_key=b)
+                        st.rerun()
+        for item in inactive_links:
+            left_key, right_key = item.get("source_keys", ["", ""])
+            reason = str(item.get("reason", "RECONFIRMATION_REQUIRED"))
+            reason_labels = {
+                "PHOTO_OR_COMPONENT_MISSING": "사진 또는 소자 없음",
+                "RECONFIRMATION_REQUIRED": "확인 이력 없음",
+                "PHOTO_REPLACED_RECONFIRMATION_REQUIRED": "사진 교체됨",
+                "PHOTO_REDETECTED_RECONFIRMATION_REQUIRED": "소자 재탐지·검수 변경됨",
+                "PHOTO_COMPONENT_MAP_CHANGED_RECONFIRMATION_REQUIRED": "사진별 소자 목록 변경됨",
+                "SAME_PHOTO_COMPONENT_COLLISION_RECONFIRMATION_REQUIRED": "같은 사진의 서로 다른 소자 포함",
+            }
+            st.caption(f"비활성 연결 · {labels.get(left_key, left_key)} ↔ "
+                       f"{labels.get(right_key, right_key)} · "
+                       f"{reason_labels.get(reason, reason)} · 다시 선택해 확인하세요.")
 
 
 def _render_selected_component_summary(st: Any, project: ProjectContext) -> None:
@@ -1113,6 +1153,7 @@ def _render_fault_analysis_workspace(
             st, project, components=components,
             component_inventory=inventory,
             analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
+            board_registry=board_registry,
         )
     selection = st.session_state.get(SELECTION_KEY)
     selected = _selected_component(st)
@@ -1142,32 +1183,40 @@ def _render_fault_analysis_workspace(
         if components:
             component_ids = [item.component_id for item in components]
             option_labels = {item.component_id: f"{item.component_id} · {item.component_type}" for item in components}
-            selected_id = getattr(selection, "selected_component", None)
-            default_id = (component_id_aliases or {}).get(selected_id) if selected_id else None
-            if default_id not in component_ids:
-                default_id = component_ids[0]
-            picked_id = st.selectbox(
-                "측정 대상 소자", component_ids, index=component_ids.index(default_id),
+            selected_id = st.session_state.get(BOARD_COMPONENT_SELECTION_KEY)
+            if selected_id not in component_ids:
+                selected_local_id = getattr(selection, "selected_component", None)
+                selected_id = (component_id_aliases or {}).get(selected_local_id) if selected_local_id else None
+            if selected_id not in component_ids:
+                selected_id = component_ids[0]
+            target_key = f"cc_measurement_target_{project.project_id}"
+            sync_key = f"cc_measurement_target_synced_{project.project_id}"
+            if (target_key not in st.session_state
+                    or st.session_state.get(sync_key) != st.session_state.get(BOARD_COMPONENT_SELECTION_KEY)):
+                st.session_state[target_key] = selected_id
+                st.session_state[sync_key] = st.session_state.get(BOARD_COMPONENT_SELECTION_KEY)
+            st.selectbox(
+                "측정 대상 소자", component_ids, index=component_ids.index(selected_id),
                 format_func=option_labels.get,
-                key=f"cc_measurement_target_{project.project_id}_{selected_id or 'none'}",
+                key=target_key, on_change=_handle_measurement_target_change,
+                kwargs={"state": st.session_state, "project": project,
+                        "registry": board_registry, "widget_key": target_key},
             )
-            if picked_id != default_id:
-                _focus_board_registry_component(st, project, board_registry, picked_id)
-                st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
-                st.rerun()
         render_measurement_panel(
             st, project, selected_component=selected, preview=preview,
-            component_map_version=st.session_state.get(MAP_VERSION_KEY),
+            component_map_version=(board_registry.get("version") if isinstance(board_registry, dict)
+                                   else st.session_state.get(MAP_VERSION_KEY)),
+            board_registry=board_registry,
         )
         measurements = get_measurements(
             st.session_state, project_id=project.project_id, board_id=project.board_id or "",
         )
-        st.markdown("#### 측정 기반 진단")
-        render_diagnosis_panel(
-            st, project, measurements=measurements,
-            analysis_context_id=getattr(selection, "analysis_context_id", None),
-            component_map_version=st.session_state.get(MAP_VERSION_KEY),
-        )
+        with st.expander("회로 모델 기반 진단 · 고급", expanded=False):
+            render_diagnosis_panel(
+                st, project, measurements=measurements,
+                analysis_context_id=getattr(selection, "analysis_context_id", None),
+                component_map_version=st.session_state.get(MAP_VERSION_KEY),
+            )
 
     viewer_key = f"cc_analysis_viewer_open_{project.project_id}"
     with st.expander("PCB Viewer · 선택 후보 위치 확인", expanded=bool(st.session_state.get(viewer_key, False))):

@@ -27,6 +27,7 @@
 .cc-pcb-component.cc-fault-supported { fill:#ff4d5848; stroke:#ff5964; stroke-width:3; }
 .cc-pcb-component.cc-fault-refuted { fill:#24c78338; stroke:#38d695; stroke-width:3; }
 .cc-pcb-component.cc-fault-inconclusive { fill:#9aa5ae22; stroke:#a8b2bb; stroke-width:2.5; stroke-dasharray:5 3; }
+.cc-pcb-component.cc-fault-conflicted { fill:#f3bd3b30; stroke:#f3bd3b; stroke-width:3; stroke-dasharray:5 3; }
 .cc-pcb-component:focus { stroke:#fff; stroke-width:3; outline:none; }
 .cc-pcb-label { fill:#f7fafc; font-size:12px; font-weight:700; text-anchor:middle; paint-order:stroke; stroke:#17212b; stroke-width:3px; stroke-linejoin:round; pointer-events:none; }
 .cc-pcb-tooltip { position:absolute; z-index:3; max-width:240px; pointer-events:none; white-space:pre-line; border:1px solid #657788; border-radius:.4rem; padding:.45rem .6rem; color:#f5f8fa; background:#17212bf2; box-shadow:0 4px 14px #0006; font-size:.78rem; }

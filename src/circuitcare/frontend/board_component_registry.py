@@ -83,6 +83,44 @@ def measurement_component_aliases(registry: dict[str, Any]) -> dict[str, str | N
             for local_id, board_ids in candidates.items()}
 
 
+def resolve_measurement_board_component(
+    registry: dict[str, Any], *, photo_id: str | None, component_id: str,
+    photo_fingerprint: str | None = None, component_map_version: str | None = None,
+) -> tuple[str | None, str]:
+    """Resolve a measurement source only by exact photo/local identity or a unique legacy alias."""
+    if photo_id:
+        manifest = next((row for row in registry.get("photos", [])
+                         if row.get("photo_id") == photo_id), None)
+        if photo_fingerprint and (
+            manifest is None or manifest.get("image_fingerprint") != photo_fingerprint
+        ):
+            return None, "PHOTO_REPLACED_RECONFIRMATION_REQUIRED"
+        key = source_component_key(photo_id, component_id)
+        board_id = registry.get("source_to_board_id", {}).get(key)
+        source = next((source for row in registry.get("components", [])
+                       for source in row.get("source_components", [])
+                       if source.get("source_key") == key), None)
+        if (board_id and component_map_version and source
+                and source.get("component_map_version") != component_map_version):
+            return None, "PHOTO_COMPONENT_MAP_CHANGED_RECONFIRMATION_REQUIRED"
+        if board_id:
+            return str(board_id), "VERIFIED_SOURCE_IDENTITY"
+        return None, "UNRESOLVED"
+    alias = measurement_component_aliases(registry).get(component_id)
+    if alias:
+        if component_map_version:
+            candidates = [source for row in registry.get("components", [])
+                          if row.get("board_component_id") == alias
+                          for source in row.get("source_components", [])
+                          if source.get("component_id") == component_id]
+            matches = [source for source in candidates
+                       if source.get("component_map_version") == component_map_version]
+            if len(matches) != 1:
+                return None, "PHOTO_COMPONENT_MAP_CHANGED_RECONFIRMATION_REQUIRED"
+        return alias, "VERIFIED_UNIQUE_LEGACY_ALIAS"
+    return None, "UNRESOLVED"
+
+
 def _owner(project_id: str, board_id: str | None) -> str:
     return json.dumps([str(project_id), str(board_id or "")], separators=(",", ":"))
 
@@ -111,6 +149,8 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
             sources[key] = {
                 "source_key": key, "photo_id": str(photo_id), "component_id": local_id,
                 "image_fingerprint": snapshot.get("image_fingerprint"),
+                "review_version": snapshot.get("review_version"),
+                "component_map_version": snapshot.get("version"),
                 "board_side": str(snapshot.get("side", "unknown")),
                 "capture_type": str(snapshot.get("capture_type", "unknown")),
                 "detection_id": local_id, "component_type": str(get("component_type", "unknown")),
@@ -127,6 +167,14 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
                 "source": get("overlay_source"),
             }
     return sources
+
+
+def _link_source_version(source: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "image_fingerprint": source.get("image_fingerprint"),
+        "review_version": source.get("review_version"),
+        "component_map_version": source.get("component_map_version"),
+    }
 
 
 def build_board_component_registry(
@@ -157,14 +205,27 @@ def build_board_component_registry(
     if not isinstance(link_versions, dict):
         link_versions = {}
     active_links = []
+    inactive_links: list[dict[str, str]] = []
     for link in all_links:
         if link[0] not in sources or link[1] not in sources:
+            inactive_links.append({"source_keys": list(link), "reason": "PHOTO_OR_COMPONENT_MISSING"})
             continue
         expected_versions = link_versions.get(json.dumps(list(link), separators=(",", ":")))
-        if expected_versions and expected_versions == [
-            sources[link[0]].get("image_fingerprint"), sources[link[1]].get("image_fingerprint")
-        ]:
+        if not expected_versions:
+            inactive_links.append({"source_keys": list(link), "reason": "RECONFIRMATION_REQUIRED"})
+            continue
+        current_versions = [_link_source_version(sources[key]) for key in link]
+        if expected_versions == current_versions:
             active_links.append(link)
+        else:
+            image_changed = any(
+                expected.get("image_fingerprint") != current.get("image_fingerprint")
+                for expected, current in zip(expected_versions or [], current_versions)
+                if isinstance(expected, dict)
+            )
+            reason = ("PHOTO_REPLACED_RECONFIRMATION_REQUIRED" if image_changed
+                      else "PHOTO_REDETECTED_RECONFIRMATION_REQUIRED")
+            inactive_links.append({"source_keys": list(link), "reason": reason})
     links = active_links
 
     parent = {key: key for key in sources}
@@ -173,10 +234,22 @@ def build_board_component_registry(
             parent[key] = parent[parent[key]]
             key = parent[key]
         return key
+    group_photos = {key: {sources[key]["photo_id"]} for key in sources}
+    accepted_links: list[tuple[str, str]] = []
     for left, right in links:
         a, b = find(left), find(right)
         if a != b:
+            if group_photos[a] & group_photos[b]:
+                inactive_links.append({"source_keys": [left, right],
+                                       "reason": "SAME_PHOTO_COMPONENT_COLLISION_RECONFIRMATION_REQUIRED"})
+                continue
+            group_photos[min(a, b)] = group_photos[a] | group_photos[b]
+            group_photos.pop(max(a, b), None)
             parent[max(a, b)] = min(a, b)
+            accepted_links.append((left, right))
+        else:
+            accepted_links.append((left, right))
+    links = accepted_links
     groups: dict[str, list[str]] = {}
     for key in sorted(sources):
         groups.setdefault(find(key), []).append(key)
@@ -231,7 +304,8 @@ def build_board_component_registry(
     } for photo_id, snapshot in sorted(photo_snapshots.items())]
     payload = {"project_id": str(project_id), "board_id": str(board_id or ""),
                "photos": photo_manifest, "components": components, "source_to_board_id": source_to_board,
-               "confirmed_links": [list(link) for link in sorted(set(all_links))]}
+               "confirmed_links": [list(link) for link in sorted(set(all_links))],
+               "inactive_links": sorted(inactive_links, key=lambda item: (item["source_keys"], item["reason"]))}
     version_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True,
                                  separators=(",", ":"), default=str).encode()
     version = "board-registry:" + hashlib.sha256(version_payload).hexdigest()
@@ -275,8 +349,18 @@ def confirm_component_match(
     right_photo = source_rows[right_source_key].get("photo_id")
     if left_photo == right_photo:
         raise ValueError("서로 다른 사진의 관측만 보드 소자로 연결할 수 있습니다.")
+    left_board_id = registry["source_to_board_id"].get(left_source_key)
+    right_board_id = registry["source_to_board_id"].get(right_source_key)
+    left_group = next((row for row in registry.get("components", [])
+                       if row.get("board_component_id") == left_board_id), {})
+    right_group = next((row for row in registry.get("components", [])
+                        if row.get("board_component_id") == right_board_id), {})
+    left_photos = set(left_group.get("source_photo_ids", ()))
+    right_photos = set(right_group.get("source_photo_ids", ()))
+    if left_photos & right_photos:
+        raise ValueError("두 소자 그룹에 같은 사진의 서로 다른 소자가 있어 병합할 수 없습니다.")
     versions = dict(entry.get("link_versions", {}))
-    versions[link_key] = [source_rows[key].get("image_fingerprint") for key in link]
+    versions[link_key] = [_link_source_version(source_rows[key]) for key in link]
     entry["link_versions"] = versions
     root[owner] = entry
     state[REGISTRY_KEY] = root
