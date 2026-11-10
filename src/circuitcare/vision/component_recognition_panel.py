@@ -164,11 +164,16 @@ def restore_review_row(row: dict) -> None:
     row["user_edited"] = True
 
 
-def record_box_exclusion(state: Any, *, scope: str, row: dict) -> None:
+def record_box_exclusion(
+    state: Any, *, scope: str, row: dict, reason: str = "user_box_exclusion",
+    review: dict | None = None, duplicate_of: str | None = None,
+) -> None:
     """Snapshot a review row before hiding it so the immediately preceding action can be undone."""
     before = deepcopy(row)
     row["status_before_exclusion"] = row.get("상태", "검수 필요")
-    exclude_review_row(row, reason="user_box_exclusion")
+    exclude_review_row(row, reason=reason, review=review)
+    if duplicate_of:
+        row["duplicate_of"] = str(duplicate_of)
     state[f"{LAST_EXCLUDED_KEY}_{scope}"] = {"component_id": row.get("component_id"), "before": before}
 
 
@@ -525,7 +530,8 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 st_api.caption(proposal.get("evidence") or "시각 근거 없음")
                 if proposal.get("decision") == "suggest" and proposal["proposed_class"] == "not_component":
                     if st_api.button("오탐으로 제외 확인", key=f"cc_qwen_false_positive_{scope}_{index}"):
-                        exclude_review_row(target, reason="qwen_not_component", review=proposal)
+                        record_box_exclusion(st_api.session_state, scope=scope, row=target,
+                                             reason="qwen_not_component", review=proposal)
                         st_api.session_state[records_key] = rows
                         invalidate_review_state()
                         st_api.rerun()
@@ -564,9 +570,9 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 if st_api.button("선택 결과 저장", key=f"cc_qwen_duplicate_apply_{scope}_{index}"):
                     if keep_id in ids:
                         exclude_id = ids[1] if keep_id == ids[0] else ids[0]
-                        by_id[exclude_id]["상태"] = "제외"
-                        by_id[exclude_id]["duplicate_of"] = keep_id
-                        by_id[exclude_id]["ai_review"] = proposal
+                        record_box_exclusion(st_api.session_state, scope=scope,
+                                             row=by_id[exclude_id], reason="qwen_duplicate_review",
+                                             review=proposal, duplicate_of=keep_id)
                     else:
                         for target_id in ids:
                             by_id[target_id]["ai_review"] = proposal
@@ -590,7 +596,8 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 if proposal.get("decision") == "multiple_components" and len(children) >= 2:
                     if st_api.button("묶음 박스만 제외 · 개별 박스 유지", key=f"cc_qwen_group_exclude_{scope}_{index}"):
                         review = {**proposal, "child_ids": [child["component_id"] for child in children]}
-                        exclude_review_row(parent, reason="qwen_group_container", review=review)
+                        record_box_exclusion(st_api.session_state, scope=scope, row=parent,
+                                             reason="qwen_group_container", review=review)
                         parent["group_split_member_ids"] = review["child_ids"]
                         for child in children:
                             child["group_parent_id"] = parent_id

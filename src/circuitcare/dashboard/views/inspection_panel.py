@@ -55,8 +55,14 @@ def render_inspection_panel(
             }
             selected_option = next((label for label, item in labels.items() if item == selected_id), next(iter(labels)))
             overlap_signature = hashlib.sha1("|".join(overlap_ids).encode()).hexdigest()[:8]
+            # Streamlit keeps widget values across reruns. Include the server-side
+            # click selection in the key so a prior overlap choice cannot replace
+            # the most recent box clicked in the SVG.
+            viewer_key = overlap_key.removeprefix("circuitcare_v4_overlapping_box_ids_")
+            event_seq = st.session_state.get(f"{viewer_key}_last_seq", 0)
             choice = st.selectbox("겹친 박스", list(labels), index=list(labels).index(selected_option),
-                                  key=f"cc_box_overlap_select_{st.session_state.get('cc_active_component_review_scope', 'none')}_{overlap_signature}")
+                                  key=(f"cc_box_overlap_select_{st.session_state.get('cc_active_component_review_scope', 'none')}"
+                                       f"_{overlap_signature}_{selected_id or 'none'}_{event_seq}"))
             if labels[choice] != selected_id:
                 update_selection(st.session_state, project=project, selected_component=labels[choice])
                 st.rerun()

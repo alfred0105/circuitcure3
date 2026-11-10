@@ -44,9 +44,8 @@ export default function(component) {
       const [x1, y1, x2, y2] = item.bbox_xyxy;
       return x >= x1 && x <= x2 && y >= y1 && y <= y2;
     }).sort((a, b) => {
-      const aSelected = a.component_id === state.data.selected_component_id;
-      const bSelected = b.component_id === state.data.selected_component_id;
-      if (aSelected !== bSelected) return aSelected ? -1 : 1;
+      // Never let the previous selection bias a new physical click. Nested boxes
+      // resolve to the smallest hit; the overlap picker can still choose a parent.
       const aArea = (a.bbox_xyxy[2] - a.bbox_xyxy[0]) * (a.bbox_xyxy[3] - a.bbox_xyxy[1]);
       const bArea = (b.bbox_xyxy[2] - b.bbox_xyxy[0]) * (b.bbox_xyxy[3] - b.bbox_xyxy[1]);
       return aArea - bArea || a.component_id.localeCompare(b.component_id);
@@ -76,6 +75,7 @@ export default function(component) {
       project_id:state.data.project_id, board_id:state.data.board_id, board_side:state.data.board_side,
       component_id:componentId, canonical_frame_id:state.data.frame_id,
       selection_action:action || (componentId ? "select" : "clear"), bbox_xyxy:bbox, event_seq:state.sequence,
+      event_epoch:state.data.event_epoch,
       overlapping_component_ids:overlapIds || (componentId ? [componentId] : []),
       event_id:`${Date.now()}-${state.sequence}`,
     });

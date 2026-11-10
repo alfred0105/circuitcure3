@@ -84,33 +84,65 @@ def _bind_review_models_to_map(
     review_models: tuple[ComponentOverlayViewModel, ...],
     review_rows: list[dict[str, Any]],
 ) -> tuple[tuple[ComponentOverlayViewModel, ...], list[dict[str, Any]]]:
-    """Use review rows as canonical IDs/boxes while carrying matching map evidence."""
+    """Use review rows as canonical boxes; only attach map evidence on certain IDs."""
     review_by_id = {str(row.get("component_id")): row for row in review_rows if row.get("component_id")}
     auto_by_id = {item.component_id: item for item in review_models}
     consumed_map_ids: set[str] = set()
+    ambiguous_map_ids: set[str] = set()
     handled_review_ids: set[str] = set()
     rendered: list[ComponentOverlayViewModel] = []
+
+    # Stable aliases are authoritative. Geometry is only a fallback and must be
+    # unique in both directions; choosing the highest-confidence nearby map box
+    # silently attached evidence to the wrong physical component.
+    map_by_id = {item.component_id: item for item in map_models}
+    matches_by_row: dict[str, list[str]] = {}
+    rows_by_map: dict[str, list[str]] = {}
+    for row_id, row in review_by_id.items():
+        box = [row.get(key) for key in ("x1", "y1", "x2", "y2")]
+        if not all(isinstance(value, (int, float)) for value in box):
+            continue
+        aliases = row.get("associated_component_ids", [])
+        if not isinstance(aliases, (list, tuple, set)):
+            aliases = [aliases]
+        aliases = [str(item) for item in aliases if item]
+        exact = [item for item in aliases if item in map_by_id]
+        if exact:
+            matches_by_row[row_id] = exact[:1]
+            rows_by_map.setdefault(exact[0], []).append(row_id)
+            continue
+        matches = [item.component_id for item in map_models
+                   if same_component_box_pair(box, item.bbox_xyxy)]
+        matches_by_row[row_id] = matches
+        for map_id in matches:
+            rows_by_map.setdefault(map_id, []).append(row_id)
+
+    certain_map_by_row: dict[str, str] = {}
+    for row_id, map_ids in matches_by_row.items():
+        # Require one candidate and a reciprocal one-row match, even for stored
+        # aliases, so duplicated or conflicting review rows remain unbound.
+        if len(map_ids) == 1 and len(rows_by_map.get(map_ids[0], [])) == 1:
+            certain_map_by_row[row_id] = map_ids[0]
+        elif map_ids:
+            ambiguous_map_ids.update(map_ids)
+
     for row_id, row in review_by_id.items():
         box = [row.get(key) for key in ("x1", "y1", "x2", "y2")]
         if not all(isinstance(value, (int, float)) for value in box):
             continue
         handled_review_ids.add(row_id)
-        aliases = row.get("associated_component_ids", [])
-        if not isinstance(aliases, (list, tuple, set)):
-            aliases = [aliases]
-        aliases = [str(item) for item in aliases if item]
-        map_match = next((item for item in map_models
-                          if item.component_id in aliases and item.component_id not in consumed_map_ids), None)
-        if map_match is None:
-            matches = [item for item in map_models if item.component_id not in consumed_map_ids
-                       and same_component_box_pair(box, item.bbox_xyxy)]
-            if matches:
-                map_match = max(matches, key=lambda item: item.detection_confidence or 0.0)
+        map_id = certain_map_by_row.get(row_id)
+        map_match = map_by_id.get(map_id) if map_id else None
         if map_match is not None:
             consumed_map_ids.add(map_match.component_id)
+            aliases = row.get("associated_component_ids", [])
+            if not isinstance(aliases, (list, tuple, set)):
+                aliases = [aliases]
             if map_match.component_id not in aliases:
-                aliases.append(map_match.component_id)
-                row["associated_component_ids"] = aliases
+                row["associated_component_ids"] = [*aliases, map_match.component_id]
+            row.pop("map_match_status", None)
+        elif matches_by_row.get(row_id):
+            row["map_match_status"] = "AMBIGUOUS_GEOMETRY"
         if row.get("상태") == "제외":
             continue
         auto = auto_by_id.get(row_id)
@@ -134,7 +166,8 @@ def _bind_review_models_to_map(
                 evidence=tuple(dict.fromkeys((*auto.evidence, *map_match.evidence))))
         rendered.append(auto)
     rendered.extend(item for item in review_models if item.component_id not in handled_review_ids)
-    rendered.extend(item for item in map_models if item.component_id not in consumed_map_ids)
+    rendered.extend(item for item in map_models
+                    if item.component_id not in consumed_map_ids and item.component_id not in ambiguous_map_ids)
     return tuple(rendered), review_rows
 
 

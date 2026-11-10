@@ -8,6 +8,7 @@ import base64
 import hashlib
 import io
 import math
+import secrets
 from typing import Any
 
 from PIL import Image
@@ -37,6 +38,7 @@ def coordinate_status_for_viewer(*, api_available: bool, client_ready: bool,
 def validate_component_selection_event(
     event: Any, *, project_id: str, board_id: str | None, board_side: str,
     frame_id: str, allowed_ids: set[str], last_sequence: int,
+    event_epoch: str | None = None,
 ) -> tuple[bool, str | None]:
     if not isinstance(event, dict):
         return False, "선택 이벤트 형식 오류"
@@ -49,6 +51,8 @@ def validate_component_selection_event(
     overlap_ids = event.get("overlapping_component_ids", [component_id] if component_id else [])
     if observed != expected:
         return False, "오래된 프로젝트 또는 이미지 프레임 이벤트"
+    if event_epoch is not None and event.get("event_epoch") != event_epoch:
+        return False, "이전 Viewer 인스턴스의 선택 이벤트"
     if type(sequence) is not int or sequence <= last_sequence:
         return False, "중복 또는 오래된 선택 이벤트"
     if not isinstance(event_id, str) or not event_id.strip():
@@ -111,6 +115,20 @@ def render_component_viewer(
         return False, "", "INVALID_COORDINATE_FRAME"
     digest = hashlib.sha256(f"{project.project_id}|{project.board_id}|{map_cache_key}|{board_side}|{frame_id}|{image_mode}".encode()).hexdigest()[:16]
     viewer_key = f"cc_v4_pcb_viewer_{digest}"
+    epoch_key = f"{viewer_key}_event_epoch"
+    event_epoch = st.session_state.setdefault(epoch_key, secrets.token_urlsafe(18))
+    active_frame_key = "circuitcare_v4_active_viewer_frame"
+    frame_scope = f"{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}|{image_mode}"
+    prior_frame_scope = st.session_state.get(active_frame_key)
+    if prior_frame_scope != frame_scope:
+        previous_viewer_key = st.session_state.get("circuitcare_v4_active_viewer_key")
+        if previous_viewer_key:
+            st.session_state[f"{OVERLAPPING_SELECTION_KEY}_{previous_viewer_key}"] = []
+        st.session_state[f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"] = []
+        update_selection(st.session_state, project=project, selected_component=None)
+        st.session_state.pop(SELECTED_MAP_KEY, None)
+        st.session_state[active_frame_key] = frame_scope
+        st.session_state["circuitcare_v4_active_viewer_key"] = viewer_key
     selection = st.session_state.get(SELECTION_KEY)
     selected_id = getattr(selection, "selected_component", None)
     if selected_id and selected_id not in {item.component_id for item in components}:
@@ -144,6 +162,7 @@ def render_component_viewer(
                 and (event.get("project_id"), event.get("board_id"), event.get("board_side"),
                      event.get("canonical_frame_id"))
                 == (project.project_id, project.board_id or "", board_side, frame_id)
+                and event.get("event_epoch") == event_epoch
                 and type(seq) is int and seq > int(st.session_state.get(last_seq_key, 0))
                 and isinstance(event.get("event_id"), str) and event.get("event_id")
                 and on_box_draw is not None):
@@ -170,6 +189,7 @@ def render_component_viewer(
             event, project_id=project.project_id, board_id=project.board_id or "",
             board_side=board_side, frame_id=frame_id, allowed_ids=allowed_ids,
             last_sequence=int(st.session_state.get(last_seq_key, 0)),
+            event_epoch=event_epoch,
         )
         if not accepted:
             st.session_state[f"{viewer_key}_event_rejected"] = True
@@ -210,6 +230,7 @@ def render_component_viewer(
         project_id=project.project_id, board_id=project.board_id or "", board_side=board_side,
         frame_id=frame_id, selected_component_id=selected_id, asset_key=map_cache_key,
         event_sequence_seed=int(st.session_state.get(f"{viewer_key}_last_seq", 0)),
+        event_epoch=event_epoch,
         key=viewer_key, on_selection_change=handle_selection_change,
         on_viewer_status_change=handle_selection_change,
     )

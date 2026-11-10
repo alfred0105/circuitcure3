@@ -323,6 +323,7 @@ def preserve_review_rows(
     proposals = [row for row in detections if isinstance(row, dict) and row.get("bbox_xyxy")]
     previous = [deepcopy(row) for row in old_rows if isinstance(row, dict)]
     matches = []
+    excluded_candidates_by_new: dict[int, list[tuple[float, int]]] = {}
     for new_index, proposal in enumerate(proposals):
         for old_index, old in enumerate(previous):
             old_box = [old.get(key) for key in ("x1", "y1", "x2", "y2")]
@@ -333,15 +334,22 @@ def preserve_review_rows(
                 else:
                     matched = score >= match_threshold or same_component_box_pair(proposal["bbox_xyxy"], old_box)
                 if matched:
-                    # Prefer an active record over an excluded duplicate when a new
-                    # detection geometrically matches both.
+                    # First assign live detections to live records. If a proposal
+                    # only matches an excluded record, suppress it instead of
+                    # creating a fresh visible ID that resurrects the exclusion.
                     active_priority = int(old.get("상태") != "제외")
+                    preserved_priority = int(
+                        old.get("user_edited") or old.get("상태") in {"확인", "제외"}
+                        or old.get("source") in {"manual", "qwen_suggestion"}
+                    )
                     geometry_score = max(score, duplicate_box_metrics(proposal["bbox_xyxy"], old_box)["smaller_coverage"])
-                    matches.append((geometry_score, active_priority, new_index, old_index))
+                    matches.append((active_priority, preserved_priority, geometry_score, new_index, old_index))
+                    if old.get("상태") == "제외":
+                        excluded_candidates_by_new.setdefault(new_index, []).append((geometry_score, old_index))
     matched_new: set[int] = set()
     matched_old: set[int] = set()
     assignments: dict[int, dict[str, Any]] = {}
-    for _score, _active_priority, new_index, old_index in sorted(matches, reverse=True):
+    for _active_priority, _preserved_priority, _score, new_index, old_index in sorted(matches, reverse=True):
         if new_index in matched_new or old_index in matched_old:
             continue
         matched_new.add(new_index)
@@ -351,6 +359,10 @@ def preserve_review_rows(
     result = []
     for index, proposal in enumerate(proposals):
         old = assignments.get(index)
+        if old is None and excluded_candidates_by_new.get(index):
+            # The prior exclusion remains in history below; do not emit a new
+            # active proposal for the same geometry after detector reruns.
+            continue
         bbox = [float(value) for value in proposal["bbox_xyxy"]]
         row = {
             "component_id": (old or {}).get("component_id"),

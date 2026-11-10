@@ -48,6 +48,9 @@ def test_click_and_clear_selection_events_are_scoped_and_monotonic():
     overlapping = {**event, "overlapping_component_ids": ["c1", "c2"]}
     assert validate_component_selection_event(overlapping, **{**kwargs, "allowed_ids": {"c1", "c2"}}) == (True, None)
     assert validate_component_selection_event(overlapping, **kwargs)[0] is False
+    assert validate_component_selection_event(
+        {**event, "event_epoch": "old"}, **{**kwargs, "event_epoch": "current"}
+    ) == (False, "이전 Viewer 인스턴스의 선택 이벤트")
     assert validate_component_selection_event({**event, "project_id": "other"}, **kwargs)[0] is False
     assert validate_component_selection_event({**event, "board_id": "other"}, **kwargs)[0] is False
     assert validate_component_selection_event({**event, "board_side": "BOTTOM"}, **kwargs)[0] is False
@@ -77,6 +80,7 @@ def test_viewer_click_event_updates_real_streamlit_selection_and_overlap_stack(m
             "project_id": "p1", "board_id": "b1", "board_side": "TOP",
             "canonical_frame_id": "photo1", "component_id": "c1", "selection_action": "select",
             "overlapping_component_ids": ["c1", "c2"], "event_seq": 1, "event_id": "click-1",
+            "event_epoch": kwargs["event_epoch"],
         }}
         kwargs["on_selection_change"]()
         return object()
@@ -146,6 +150,50 @@ def test_map_and_detector_boxes_bind_to_one_review_identity():
     rows[0]["상태"] = "제외"
     hidden, _rows = _bind_review_models_to_map((map_box,), (review_box,), rows)
     assert hidden == ()
+
+
+def test_ambiguous_map_geometry_is_not_arbitrarily_bound_or_drawn_twice():
+    map_box = ComponentOverlayViewModel(**{**_model().__dict__, "component_id": "map-id"})
+    left = ComponentOverlayViewModel(**{**_model().__dict__, "component_id": "review-a",
+                                        "overlay_source": "yolo"})
+    right = ComponentOverlayViewModel(**{**_model().__dict__, "component_id": "review-b",
+                                         "overlay_source": "yolo"})
+    rows = [
+        {"component_id": item, "소자 종류": "resistor", "상태": "검수 필요",
+         "x1": 10, "y1": 20, "x2": 30, "y2": 50}
+        for item in ("review-a", "review-b")
+    ]
+    merged, rows = _bind_review_models_to_map((map_box,), (left, right), rows)
+    assert {item.component_id for item in merged} == {"review-a", "review-b"}
+    assert all("associated_component_ids" not in row for row in rows)
+    assert all(row["map_match_status"] == "AMBIGUOUS_GEOMETRY" for row in rows)
+
+
+def test_redetection_keeps_exclusion_and_does_not_create_a_resurrection_duplicate():
+    old_rows = [{"component_id": "excluded-1", "소자 종류": "resistor", "상태": "제외",
+                 "x1": 10, "y1": 20, "x2": 30, "y2": 50, "user_edited": True,
+                 "source": "yolo", "exclusion_reason": "qwen_not_component"}]
+    detections = [
+        {"class_name": "resistor", "confidence": .91, "bbox_xyxy": [10, 20, 30, 50]},
+        {"class_name": "resistor", "confidence": .89, "bbox_xyxy": [10, 20, 30, 50]},
+    ]
+    from circuitcare.vision.box_reconciliation import preserve_review_rows
+    rows = preserve_review_rows(old_rows, detections)
+    assert len(rows) == 1
+    assert rows[0]["component_id"] == "excluded-1"
+    assert rows[0]["상태"] == "제외"
+    assert board_visible_review_rows(rows) == []
+
+
+def test_all_exclusion_sources_share_undo_snapshot_and_preserve_reason():
+    row = {"component_id": "c1", "소자 종류": "resistor", "상태": "확인",
+           "x1": 1, "y1": 2, "x2": 10, "y2": 12}
+    state = {}
+    record_box_exclusion(state, scope="scope", row=row, reason="qwen_duplicate_review",
+                         review={"decision": "same_component"}, duplicate_of="c0")
+    assert row["상태"] == "제외" and row["duplicate_of"] == "c0"
+    assert undo_last_box_exclusion(state, scope="scope", rows=[row]) == "c1"
+    assert row["상태"] == "확인" and "duplicate_of" not in row
 
 
 def test_hover_identity_status_is_user_facing_korean_and_unknown_is_preserved():
