@@ -10,7 +10,18 @@ def test_rerun_reuses_component_id_and_review_status_by_iou():
         "location_confidence": .9, "bbox_xyxy": [11, 10, 41, 40]}]})
     assert state["rows"][0]["component_id"] == "auto-existing"
     assert state["rows"][0]["상태"] == "확인"
-    assert state["rows"][0]["소자 종류"] == "unknown"
+    assert state["rows"][0]["소자 종류"] == "resistor"
+
+
+def test_rerun_keeps_manual_and_qwen_boxes_when_detector_misses_them():
+    state = {"rows": [
+        {"component_id": "manual-1", "소자 종류": "unknown", "상태": "검수 필요",
+         "source": "manual", "x1": 70, "y1": 70, "x2": 90, "y2": 90},
+        {"component_id": "qwen-1", "소자 종류": "capacitor", "상태": "검수 필요",
+         "source": "qwen_suggestion", "x1": 110, "y1": 70, "x2": 130, "y2": 90},
+    ]}
+    _store_predictions(state, "rows", {"detections": []})
+    assert [row["component_id"] for row in state["rows"]] == ["manual-1", "qwen-1"]
 
 
 def test_conflicted_measurement_verdict_is_not_overwritten_by_later_measurement():

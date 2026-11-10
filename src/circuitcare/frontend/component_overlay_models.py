@@ -46,6 +46,8 @@ class ComponentOverlayViewModel:
     match_score: float | None = None
     component_type_status: str = "UNCONFIRMED"
     part_identity_status: str = "UNCONFIRMED"
+    overlay_source: str | None = None
+    ocr_class_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

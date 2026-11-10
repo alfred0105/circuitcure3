@@ -79,11 +79,22 @@ def render_inspection_panel(
                 "presence_status": "UNCONFIRMED", "component_type_status": "UNCONFIRMED",
                 "part_identity_status": "UNCONFIRMED", "confirmed_functional_roles": [],
             })
+            review_row = None
+            if review_image_bytes is not None and review_scope:
+                from circuitcare.vision.component_recognition_panel import review_keys
+
+                _result_key, records_key, _error_key = review_keys(review_scope)
+                review_row = next((row for row in st.session_state.get(records_key, [])
+                                   if row.get("component_id") == selected_component.component_id), None)
+                if review_row and review_row.get("상태") == "제외":
+                    inventory_item["presence_status"] = "EXCLUDED"
             presence_options = ("UNCONFIRMED", "CONFIRMED", "EXCLUDED")
             presence_labels = {"UNCONFIRMED": "미확인", "CONFIRMED": "실제 부품 확인", "EXCLUDED": "오검출 · 제외"}
             presence_key = f"cc_component_presence_{hash(owner)}_{selected_component.component_id}"
             current_presence = inventory_item.get("presence_status", "UNCONFIRMED")
-            if st.session_state.get(presence_key) not in presence_options:
+            if review_row and review_row.get("상태") == "제외":
+                st.session_state[presence_key] = "EXCLUDED"
+            elif st.session_state.get(presence_key) not in presence_options:
                 st.session_state[presence_key] = current_presence
             presence_status = st.radio(
                 "PCB에서 선택 부품 상태", presence_options,
@@ -132,6 +143,46 @@ def render_inspection_panel(
                 presence_status=presence_status,
                 confirmed_functional_roles=tuple(confirmed_roles),
             )
+            if review_image_bytes is not None and review_scope:
+                if review_row is not None:
+                    marking_result_key = f"cc_component_marking_ocr_{review_scope}_{selected_component.component_id}"
+                    with st.expander("선택 부품 각인 OCR", expanded=False):
+                        st.caption("각인 인식값은 미확인 후보입니다. OCR만으로 부품 모델이나 종류를 확정하지 않습니다.")
+                        if st.button("선택 부품에서 각인 읽기", key=f"cc_component_marking_run_{review_scope}_{selected_component.component_id}"):
+                            try:
+                                from PIL import Image
+                                from circuitcare.vision.ocr_backend import run_component_marking_ocr
+
+                                with Image.open(io.BytesIO(review_image_bytes)) as source_image:
+                                    result = run_component_marking_ocr(
+                                        source_image.convert("RGB"),
+                                        [review_row["x1"], review_row["y1"], review_row["x2"], review_row["y2"]],
+                                        current_type,
+                                    )
+                                st.session_state[marking_result_key] = result
+                            except Exception as exc:
+                                st.warning(f"각인 OCR을 실행하지 못했습니다 · {exc}")
+                        marking_result = st.session_state.get(marking_result_key)
+                        if isinstance(marking_result, dict):
+                            _render_selected_marking(st, {
+                                "image_bytes": review_image_bytes,
+                                "bbox_xyxy": [review_row["x1"], review_row["y1"], review_row["x2"], review_row["y2"]],
+                                "result": marking_result,
+                            })
+                            choices = [item.get("text", "") for item in marking_result.get("candidates", []) if item.get("text")]
+                            if choices:
+                                choice_key = f"cc_component_marking_choice_{review_scope}_{selected_component.component_id}"
+                                choice = st.selectbox("OCR 원문 후보 선택", choices, key=choice_key)
+                                if st.button("선택한 원문을 편집 후보로 사용", key=f"cc_component_marking_use_{review_scope}_{selected_component.component_id}"):
+                                    edits = st.session_state.setdefault(COMPONENT_EDIT_KEY, {})
+                                    edits[selected_component.component_id] = {
+                                        **edits.get(selected_component.component_id, {}),
+                                        "component_type": current_type,
+                                        "ocr_marking": choice,
+                                        "component_info": marking_result.get("inferred_value") or current_value,
+                                    }
+                                    st.session_state[COMPONENT_EDIT_KEY] = edits
+                                    st.rerun()
             if selected_component.fault_hypothesis:
                 st.caption(f"진단 후보 · {selected_component.diagnosis_display_status or '미확정'} · "
                            f"가설 {selected_component.fault_hypothesis}")
@@ -188,8 +239,7 @@ def render_inspection_panel(
             if selected_component.evidence:
                 with st.expander("검출 근거"):
                     st.write(" · ".join(selected_component.evidence))
-            if (selected_component.component_id.startswith(("auto-", "manual-"))
-                    and review_image_bytes is not None and review_scope):
+            if review_row is not None and review_image_bytes is not None and review_scope:
                 render_selected_component_editor(
                     st, image_bytes=review_image_bytes, scope=review_scope,
                     component_id=selected_component.component_id,
@@ -264,11 +314,3 @@ def _render_selected_marking(st: Any, context: dict[str, Any]) -> None:
         if len(candidates) > 1:
             st.caption("다른 방향에서 읽힌 후보 · " + " · ".join(item["text"] for item in candidates[1:4]))
         st.caption("OCR 인식값과 계산값은 검수 전 후보이며, 원본 부품 라벨은 바뀌지 않습니다.")
-
-    if st.button("선택 부품 각인 다시 읽기", key=f"cc_component_ocr_retry_{context.get('retry_key')}_{context.get('row_index')}"):
-        key = context.get("retry_key")
-        if key:
-            results = dict(st.session_state.get(key, {}))
-            results.pop(context.get("row_index"), None)
-            st.session_state[key] = results
-            st.rerun()

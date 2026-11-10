@@ -17,6 +17,9 @@
 .cc-pcb-component:hover, .cc-pcb-component.cc-hover { fill:#55bbdf30; stroke:#8ee7ff; stroke-width:2.5; }
 .cc-pcb-component.cc-selected { fill:#ffcf4d30; stroke:#ffd25a; stroke-width:3; }
 .cc-pcb-component.cc-excluded { fill:#ef58671a; stroke:#ef5867; stroke-dasharray:5 3; }
+.cc-pcb-component.cc-ai-suggested { fill:#ff9d2e1c; stroke:#ff9d2e; stroke-dasharray:3 3; stroke-width:2.2; }
+.cc-pcb-component.cc-second-pass { fill:#55bbdf14; stroke:#75d9ff; stroke-dasharray:6 3; stroke-width:2; }
+.cc-pcb-component.cc-manual-box { fill:#60dfa022; stroke:#60dfa0; stroke-dasharray:6 3; stroke-width:2; }
 .cc-pcb-component.cc-draw-preview { fill:#60dfa033; stroke:#60dfa0; stroke-width:2; stroke-dasharray:6 4; pointer-events:none; }
 .cc-pcb-component.cc-fault-suspected { fill:#ff9f4330; stroke:#ffb55e; stroke-width:3; }
 .cc-pcb-component.cc-fault-related { fill:#71b7ff24; stroke:#80c3ff; stroke-width:2.5; stroke-dasharray:5 3; }

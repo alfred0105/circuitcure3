@@ -28,7 +28,7 @@ Windows 또는 별도 환경에서는 필요한 UI·이미지·탐지 의존성�
 ## 개발 및 검증
 
 ```bash
-python -m pip install -e ".[dev,ui,vision,pcb-recognition,datasheet]"
+python -m pip install -e ".[dev,ui,vision,pcb-recognition,vision-ocr,datasheet]"
 python -m pytest -q
 ```
 

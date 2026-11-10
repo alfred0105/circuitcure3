@@ -368,7 +368,10 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             board_side=side_enum or active_side,
             component_id=str(row.get("component_id") or f"auto-{review_hash}-{index + 1}"),
             component_type=str(row.get("소자 종류", "unknown")),
-            display_label=f"{index + 1} · {row.get('소자 종류', 'unknown')}",
+            display_label=(f"AI 제안 · {row.get('소자 종류', 'unknown')}" if row.get("source") == "qwen_suggestion"
+                           else f"YOLO 2차 · {row.get('소자 종류', 'unknown')}" if row.get("source") == "yolo_second_pass"
+                           else f"수동 · {row.get('소자 종류', 'unknown')}" if row.get("source") == "manual"
+                           else f"{index + 1} · {row.get('소자 종류', 'unknown')}"),
             canonical_frame_id=selected,
             coordinate_frame="SOURCE_PHOTO_PIXEL",
             bbox_xyxy=(float(row["x1"]), float(row["y1"]),
@@ -379,14 +382,21 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             detection_confidence=float(row.get("신뢰도", 0.0)),
             identification_status="USER_CONFIRMED" if row.get("상태") == "확인" else "SUGGESTED_CLASS_ONLY",
             identity_match_status=None,
-            ocr_marking=None,
+            ocr_marking=(row.get("ocr_candidates") or [None])[0],
             possible_part_number=None,
-            evidence=("YOLO component proposal; awaiting user review",),
+            evidence=("Qwen 미확인 박스 제안" if row.get("source") == "qwen_suggestion"
+                      else "YOLO 저신뢰 2차 탐색 후보" if row.get("source") == "yolo_second_pass"
+                      else "사용자 추가 박스" if row.get("source") == "manual"
+                      else "YOLO component proposal; awaiting user review",),
             overlay_status="EXCLUDED" if row.get("상태") == "제외" else "CANDIDATE",
             diagnosis_display_status="DIAGNOSIS_NOT_RUN",
             location_confidence=float(row.get("location_confidence", row.get("신뢰도", 0.0))),
             type_confidence=row.get("type_confidence"), match_score=row.get("match_score"),
             component_type_status="USER_CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED",
+            ocr_status=row.get("ocr_association_status"),
+            ocr_candidates=tuple(row.get("ocr_candidates", [])),
+            ocr_class_hints=tuple(row.get("ocr_class_hints", [])),
+            overlay_source=row.get("source", "yolo"),
         ) for index, row in enumerate(review_rows))
         component_models = tuple(component_models) + auto_models
         st.session_state["circuitcare_v4_selected_marking_context"] = None
@@ -510,7 +520,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         rows = list(st.session_state.get(records_key, []))
         manual_id = f"manual-{review_hash}-{hashlib.sha256(repr(tuple(bbox)).encode()).hexdigest()[:12]}"
         rows.append({"component_id": manual_id, "소자 종류": "unknown", "상태": "검수 필요", "신뢰도": 0.0,
-                     "x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]})
+                     "x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3], "source": "manual"})
         st.session_state[records_key] = rows
         update_selection(st.session_state, project=project,
                          selected_component=manual_id)

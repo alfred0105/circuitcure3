@@ -1,5 +1,6 @@
 """Small standard-library client for a loopback-only Ollama server."""
 
+import base64
 import json
 import re
 from urllib.error import HTTPError, URLError
@@ -36,12 +37,38 @@ class OllamaClient:
             raise LocalLLMError(f"Model {model_name!r} is not installed locally (available: {available})")
         return match
 
-    def chat_json(self, model_name: str, messages: list[dict[str, str]], *,
-                  output_schema: dict | None = None) -> dict:
+    def chat_json(self, model_name: str, messages: list[dict], *,
+                  output_schema: dict | None = None,
+                  images: list[bytes | str] | None = None) -> dict:
         model_info = self.model_info(model_name)
+        request_messages = [dict(message) for message in messages]
+        if images:
+            encoded_images = []
+            for image in images:
+                if isinstance(image, bytes):
+                    encoded = base64.b64encode(image).decode("ascii")
+                elif isinstance(image, str):
+                    encoded = image
+                    try:
+                        base64.b64decode(encoded, validate=True)
+                    except ValueError as exc:
+                        raise ValueError("Ollama image input must be bytes or valid base64.") from exc
+                else:
+                    raise TypeError("Ollama image input must be bytes or base64 text.")
+                if not encoded:
+                    raise ValueError("Ollama image input cannot be empty.")
+                encoded_images.append(encoded)
+            image_message = next(
+                (message for message in reversed(request_messages) if message.get("role") == "user"),
+                None,
+            )
+            if image_message is None:
+                image_message = {"role": "user", "content": "Inspect the attached image."}
+                request_messages.append(image_message)
+            image_message["images"] = encoded_images
         body = {
             "model": model_name,
-            "messages": messages,
+            "messages": request_messages,
             "stream": False,
             "think": False,
             "format": output_schema or "json",

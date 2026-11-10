@@ -177,6 +177,7 @@ def render_component_viewer(
     payload = [{
         "component_id": item.component_id,
         "component_type": item.component_type,
+        "overlay_source": item.overlay_source,
         "display_label": item.display_label,
         "bbox_xyxy": list(item.bbox_xyxy),
         "polygon_xy": [list(point) for point in item.polygon_xy],

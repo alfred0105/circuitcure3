@@ -1,0 +1,143 @@
+"""Conservative reconciliation helpers for detector, OCR, and review records."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any
+
+
+REFERENCE_CLASS_HINTS = {
+    "R": "resistor", "C": "capacitor", "U": "IC", "D": "diode",
+    "Q": "transistor", "L": "inductor", "F": "fuse", "J": "connector",
+    "P": "connector", "CN": "connector", "T": "transformer", "Y": "oscillator",
+}
+
+
+def box_iou(left: list[float] | tuple[float, ...], right: list[float] | tuple[float, ...]) -> float:
+    if len(left) != 4 or len(right) != 4:
+        return 0.0
+    ix = max(0.0, min(float(left[2]), float(right[2])) - max(float(left[0]), float(right[0])))
+    iy = max(0.0, min(float(left[3]), float(right[3])) - max(float(left[1]), float(right[1])))
+    intersection = ix * iy
+    area_left = max(0.0, float(left[2]) - float(left[0])) * max(0.0, float(left[3]) - float(left[1]))
+    area_right = max(0.0, float(right[2]) - float(right[0])) * max(0.0, float(right[3]) - float(right[1]))
+    union = area_left + area_right - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _edge_distance(left: list[float], right: list[float]) -> float:
+    dx = max(float(left[0]) - float(right[2]), float(right[0]) - float(left[2]), 0.0)
+    dy = max(float(left[1]) - float(right[3]), float(right[1]) - float(left[3]), 0.0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _class_hint(reference: str) -> str | None:
+    import re
+
+    match = re.match(r"\s*([A-Z]+)", reference.upper())
+    return REFERENCE_CLASS_HINTS.get(match.group(1)) if match else None
+
+
+def associate_ocr_with_components(
+    detections: list[dict[str, Any]], ocr_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach nearby OCR as evidence, leaving class and review status unchanged."""
+    rows = [deepcopy(row) for row in detections]
+    for row in rows:
+        row["ocr_records"] = []
+        row["ocr_candidates"] = []
+        row["ocr_class_hints"] = []
+        row["ocr_association_status"] = "NO_TEXT"
+    for record in ocr_records:
+        text_box = record.get("bbox_xyxy")
+        text = str(record.get("raw_text", record.get("text", ""))).strip()
+        if not text or not isinstance(text_box, (list, tuple)) or len(text_box) != 4:
+            continue
+        ranked = []
+        for index, row in enumerate(rows):
+            box = row.get("bbox_xyxy")
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+            width = max(1.0, float(box[2]) - float(box[0]))
+            height = max(1.0, float(box[3]) - float(box[1]))
+            distance = _edge_distance([float(value) for value in text_box], [float(value) for value in box])
+            threshold = max(24.0, ((width * width + height * height) ** 0.5) * 1.5)
+            if distance <= threshold:
+                ranked.append((distance / threshold, index))
+        if not ranked:
+            continue
+        ranked.sort()
+        ambiguous = len(ranked) > 1 and ranked[1][0] - ranked[0][0] < 0.2
+        target_indices = [ranked[0][1]] if not ambiguous else [ranked[0][1], ranked[1][1]]
+        ref_candidates = record.get("reference_candidates") or []
+        for index in target_indices:
+            row = rows[index]
+            row["ocr_records"].append({**record, "association_status": "AMBIGUOUS" if ambiguous else "NEAR_COMPONENT"})
+            row["ocr_candidates"] = list(dict.fromkeys([*row["ocr_candidates"], text]))
+            row["ocr_class_hints"] = list(dict.fromkeys([
+                *row["ocr_class_hints"], *[hint for ref in ref_candidates if (hint := _class_hint(str(ref)))],
+            ]))
+            row["ocr_association_status"] = "AMBIGUOUS" if ambiguous else "ASSOCIATED"
+    return rows
+
+
+def preserve_review_rows(
+    old_rows: list[dict[str, Any]], detections: list[dict[str, Any]], *, match_threshold: float = 0.30,
+) -> list[dict[str, Any]]:
+    """Reuse detector IDs and keep user-authored/reviewed rows across re-inference."""
+    proposals = [row for row in detections if isinstance(row, dict) and row.get("bbox_xyxy")]
+    previous = [deepcopy(row) for row in old_rows if isinstance(row, dict)]
+    matches = []
+    for new_index, proposal in enumerate(proposals):
+        for old_index, old in enumerate(previous):
+            old_box = [old.get(key) for key in ("x1", "y1", "x2", "y2")]
+            if all(isinstance(value, (int, float)) for value in old_box):
+                score = box_iou(proposal["bbox_xyxy"], old_box)
+                if score >= match_threshold:
+                    matches.append((score, new_index, old_index))
+    matched_new: set[int] = set()
+    matched_old: set[int] = set()
+    assignments: dict[int, dict[str, Any]] = {}
+    for _score, new_index, old_index in sorted(matches, reverse=True):
+        if new_index in matched_new or old_index in matched_old:
+            continue
+        matched_new.add(new_index)
+        matched_old.add(old_index)
+        assignments[new_index] = previous[old_index]
+
+    result = []
+    for index, proposal in enumerate(proposals):
+        old = assignments.get(index)
+        bbox = [float(value) for value in proposal["bbox_xyxy"]]
+        row = {
+            "component_id": (old or {}).get("component_id"),
+            "소자 종류": proposal.get("class_name") or "unknown",
+            "상태": "검수 필요",
+            "신뢰도": float(proposal.get("confidence") or 0.0),
+            "location_confidence": proposal.get("location_confidence", proposal.get("body_confidence", proposal.get("confidence"))),
+            "type_confidence": proposal.get("type_confidence", proposal.get("confidence")),
+            "match_score": proposal.get("match_score"),
+            "x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3],
+            "source": (old or {}).get("source") if (old or {}).get("source") in {"manual", "qwen_suggestion", "yolo_second_pass"} else "yolo",
+        }
+        if old:
+            row["component_id"] = old.get("component_id")
+            # A reviewed or explicitly edited record owns its class and geometry.
+            if (old.get("source") in {"manual", "qwen_suggestion"}
+                    or old.get("상태") in {"확인", "제외"} or old.get("user_edited")):
+                for key in ("소자 종류", "상태", "x1", "y1", "x2", "y2", "user_edited"):
+                    if key in old:
+                        row[key] = old[key]
+            for key in ("ocr_records", "ocr_candidates", "ocr_class_hints", "ocr_association_status",
+                        "ai_review", "ai_proposed_class", "duplicate_of"):
+                if key in old:
+                    row[key] = old[key]
+        result.append(row)
+
+    # Keep manual additions, Qwen additions, and explicitly reviewed boxes even
+    # when a later detector pass does not return the same geometry.
+    for old_index, old in enumerate(previous):
+        keep = old.get("source") in {"manual", "qwen_suggestion", "yolo_second_pass"} or old.get("상태") in {"확인", "제외"} or old.get("user_edited")
+        if keep and old_index not in matched_old:
+            result.append(old)
+    return result
