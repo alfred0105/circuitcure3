@@ -296,7 +296,7 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                        "reference_designators": row.get("reference_designators", []),
                        "body_marking": row.get("body_marking")} for row in live_rows]
         with st_api.spinner("Qwen3.5 9B로 소자 종류·중복·미탐지 후보 검수 중…"):
-            review = review_components_with_qwen(OllamaClient(timeout_seconds=300), DEFAULT_REVIEW_MODEL,
+            review = review_components_with_qwen(OllamaClient(timeout_seconds=300, num_predict=4096), DEFAULT_REVIEW_MODEL,
                 image_bytes, detections, (ocr_result or {}).get("records", []))
         review["source_fingerprint"] = _review_fingerprint(rows, ocr_result)
         st_api.session_state[qwen_key] = review
@@ -448,7 +448,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                                    for row in live_rows]
                 with st_api.spinner("Qwen3.5 9B가 사진과 불확실한 후보를 검토하고 있습니다…"):
                     review = review_components_with_qwen(
-                        OllamaClient(timeout_seconds=300), DEFAULT_REVIEW_MODEL, image_bytes,
+                        OllamaClient(timeout_seconds=300, num_predict=4096), DEFAULT_REVIEW_MODEL, image_bytes,
                         qwen_detections, (ocr_result or {}).get("records", []),
                     )
                 review["source_fingerprint"] = _review_fingerprint(rows, ocr_result)

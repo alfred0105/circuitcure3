@@ -13,12 +13,16 @@ class LocalLLMError(RuntimeError):
 
 
 class OllamaClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:11434", timeout_seconds: int = 180):
+    def __init__(self, base_url: str = "http://127.0.0.1:11434", timeout_seconds: int = 180,
+                 num_predict: int = 1300):
         parsed = urlparse(base_url)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Ollama must use a local loopback HTTP URL")
+        if type(num_predict) is not int or num_predict < 1:
+            raise ValueError("num_predict must be a positive integer")
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.num_predict = num_predict
 
     def list_models(self) -> list[dict]:
         response = self._request("GET", "/api/tags")
@@ -72,7 +76,7 @@ class OllamaClient:
             "stream": False,
             "think": False,
             "format": output_schema or "json",
-            "options": {"temperature": 0.1, "num_predict": 1300},
+            "options": {"temperature": 0.1, "num_predict": self.num_predict},
         }
         json_mode = True
         fallback_reason = None
@@ -101,7 +105,11 @@ class OllamaClient:
             except json.JSONDecodeError:
                 parsed = None
             if parsed is None:
-                raise LocalLLMError(f"Ollama returned invalid JSON content: {exc}; response starts {content[:240]!r}") from exc
+                reason = response.get("done_reason")
+                detail = "; response may have been truncated at the output token limit" if reason == "length" else ""
+                raise LocalLLMError(
+                    f"Ollama returned invalid JSON content: {exc}{detail}; response starts {content[:240]!r}"
+                ) from exc
         if not isinstance(parsed, dict):
             raise LocalLLMError("Ollama JSON content must be an object")
         return {
@@ -148,6 +156,11 @@ class OllamaClient:
 def _strip_json_fence(content: str) -> str:
     stripped = content.strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", stripped, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    # Models may hit the output limit before emitting the closing fence. Drop the
+    # opening marker anyway so a complete JSON object can still be recovered.
+    match = re.match(r"^```(?:json)?\s*([\s\S]*)$", stripped, flags=re.IGNORECASE)
     if match:
         return match.group(1).strip()
     return stripped

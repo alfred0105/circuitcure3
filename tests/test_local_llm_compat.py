@@ -59,6 +59,33 @@ def test_chat_json_rejects_invalid_fallback_json(monkeypatch):
         client.chat_json("test:latest", [{"role": "user", "content": "JSON"}])
 
 
+@pytest.mark.parametrize("content", [
+    '```json\n{"ok":true}\n```',
+    '```json\n{"ok":true}',
+    'Result:\n```json\n{"ok":true}\n```',
+])
+def test_chat_json_recovers_complete_json_from_fenced_model_output(monkeypatch, content):
+    client = OllamaClient()
+    monkeypatch.setattr(client, "model_info", lambda _name: {"name": "test:latest"})
+    monkeypatch.setattr(client, "_request", lambda *_args: _response(content))
+    assert client.chat_json("test:latest", [{"role": "user", "content": "JSON"}])["content"] == {"ok": True}
+
+
+def test_chat_json_uses_configured_output_token_budget_and_reports_truncation(monkeypatch):
+    client = OllamaClient(num_predict=4096)
+    monkeypatch.setattr(client, "model_info", lambda _name: {"name": "test:latest"})
+    calls = []
+
+    def request(_method, _path, payload):
+        calls.append(payload)
+        return {**_response('```json\n{"incomplete":'), "done_reason": "length"}
+
+    monkeypatch.setattr(client, "_request", request)
+    with pytest.raises(LocalLLMError, match="truncated at the output token limit"):
+        client.chat_json("test:latest", [{"role": "user", "content": "JSON"}])
+    assert calls[0]["options"]["num_predict"] == 4096
+
+
 def _raise(value):
     if isinstance(value, Exception):
         raise value
