@@ -9,7 +9,10 @@ from PIL import Image
 from circuitcare.local_llm import OllamaClient
 from circuitcare.vision.ai_review_service import review_components_with_qwen
 from circuitcare.vision.box_reconciliation import associate_ocr_with_components
-from circuitcare.vision.box_reconciliation import boxes_overlap_candidate, preserve_review_rows
+from circuitcare.vision.box_reconciliation import (
+    board_visible_review_rows, boxes_overlap_candidate, deduplicate_component_boxes, preserve_review_rows,
+    same_component_box_pair,
+)
 from circuitcare.vision.component_recognition_panel import (
     INFERENCE_CONFIG, _review_fingerprint, duplicate_exclusion_enabled, invalidate_qwen_review,
     review_aux_keys,
@@ -80,7 +83,7 @@ def test_qwen_review_validates_detection_ids_and_unverified_boxes():
              "reference_candidates": ["C12"]}],
     )
 
-    assert len(client.images) == 3  # annotated photo and one crop for each uncertain proposal
+    assert len(client.images) == 4  # annotated photo, two detection crops, and a focused duplicate-pair crop
     assert client.schema is not None
     assert len(result["class_reviews"]) == 1
     assert len(result["duplicate_reviews"]) == 1
@@ -108,8 +111,28 @@ def test_secondary_tile_size_is_supported_by_locator():
     assert INFERENCE_CONFIG["secondary_tile"] == 640
 
 
-def test_contained_small_qwen_candidate_is_filtered_as_duplicate():
+def test_containment_is_a_review_signal_but_small_true_component_is_not_suppressed():
     assert boxes_overlap_candidate([45, 45, 55, 55], [0, 0, 100, 100])
+    assert not same_component_box_pair([45, 45, 55, 55], [0, 0, 100, 100])
+
+
+def test_location_ensemble_suppresses_same_body_with_different_box_sizes():
+    kept, suppressed = deduplicate_component_boxes([
+        {"source": "parsa", "score": .78, "box": [10, 10, 110, 110]},
+        {"source": "pcb_ai_doctor_v12n", "score": .72, "box": [20, 20, 100, 100]},
+    ])
+    assert len(kept) == 1
+    assert len(suppressed) == 1
+    assert kept[0]["source"] == "parsa"
+
+
+def test_location_ensemble_keeps_partially_overlapping_distinct_boxes():
+    kept, suppressed = deduplicate_component_boxes([
+        {"source": "parsa", "score": .81, "box": [0, 0, 60, 60]},
+        {"source": "pcb_ai_doctor_v12n", "score": .75, "box": [40, 0, 100, 60]},
+    ])
+    assert len(kept) == 2
+    assert suppressed == []
 
 
 def test_user_edited_yolo_box_and_class_survive_rerun():
@@ -178,6 +201,43 @@ def test_cached_qwen_review_is_invalidated_when_source_box_changes():
 
 
 def test_qwen_duplicate_exclusion_is_only_enabled_for_confident_same_component():
-    assert duplicate_exclusion_enabled({"decision": "same_component", "confidence": .7})
-    assert not duplicate_exclusion_enabled({"decision": "different_components", "confidence": .99})
-    assert not duplicate_exclusion_enabled({"decision": "same_component", "confidence": .5})
+    pair = ([10, 10, 110, 110], [20, 20, 100, 100])
+    far_pair = ([0, 0, 20, 20], [500, 500, 520, 520])
+    assert duplicate_exclusion_enabled({"decision": "same_component", "confidence": .7}, *pair)
+    assert not duplicate_exclusion_enabled({"decision": "same_component", "confidence": .99}, *far_pair)
+    assert not duplicate_exclusion_enabled({"decision": "different_components", "confidence": .99}, *pair)
+    assert not duplicate_exclusion_enabled({"decision": "same_component", "confidence": .5}, *pair)
+
+
+def test_qwen_duplicate_claim_for_far_apart_objects_is_rejected():
+    class FarPairClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [],
+                "duplicate_reviews": [{"detection_ids": ["r1", "r20"], "decision": "same_component",
+                                       "confidence": .99, "evidence": "False visual claim."}],
+                "missed_component_candidates": [], "notes": [],
+            }}
+
+    detections = [
+        {"component_id": "r1", "class_name": "resistor", "confidence": .8, "bbox_xyxy": [10, 10, 40, 30]},
+        {"component_id": "r20", "class_name": "resistor", "confidence": .8, "bbox_xyxy": [700, 500, 730, 520]},
+    ]
+    photo = io.BytesIO()
+    Image.new("RGB", (800, 600), "white").save(photo, format="PNG")
+    result = review_components_with_qwen(FarPairClient(), "qwen3.5:9b", photo.getvalue(), detections, [])
+    assert result["duplicate_reviews"] == []
+
+
+def test_user_excluded_duplicate_stays_hidden_after_new_detection_matches():
+    old_rows = [
+        {"component_id": "active", "소자 종류": "IC", "상태": "검수 필요",
+         "x1": 10, "y1": 10, "x2": 110, "y2": 110},
+        {"component_id": "duplicate", "소자 종류": "IC", "상태": "제외",
+         "x1": 20, "y1": 20, "x2": 100, "y2": 100, "duplicate_of": "active"},
+    ]
+    rows = preserve_review_rows(old_rows, [{"class_name": "unknown", "confidence": .9,
+                                           "bbox_xyxy": [12, 12, 108, 108]}])
+    assert {row["component_id"] for row in rows} == {"active", "duplicate"}
+    assert next(row for row in rows if row["component_id"] == "duplicate")["상태"] == "제외"
+    assert [row["component_id"] for row in board_visible_review_rows(rows)] == ["active"]

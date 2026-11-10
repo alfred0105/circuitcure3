@@ -48,4 +48,6 @@ markers = [
     "integration: requires external native or optional runtime dependencies",
     "stress: bounded synthetic stress and soak coverage",
     "crash_injection: intentionally terminates an isolated child process",
+  "optional_circuit: regression tests for optional KiCad, SPICE, or legacy circuit UI paths",
+  "model_performance: requires local PCB model weights, reference checkout, and labeled images",
 ]

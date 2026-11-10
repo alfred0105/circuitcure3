@@ -2,6 +2,8 @@ import subprocess
 
 import pytest
 
+pytestmark = pytest.mark.optional_circuit
+
 from circuitcare.dashboard.context import (
     _advisor_matches,
     _analysis_context_key,

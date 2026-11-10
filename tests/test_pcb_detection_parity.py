@@ -36,6 +36,7 @@ def _iou(a, b):
 
 
 @pytest.mark.integration
+@pytest.mark.model_performance
 def test_windows_and_mac_pipeline_outputs_match_on_same_local_assets(tmp_path):
     windows_repo = os.environ.get("CIRCUITCARE_WINDOWS_REPO")
     weights_root = os.environ.get("CIRCUITCARE_PCB_WEIGHTS")

@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+from circuitcare.vision.box_reconciliation import deduplicate_component_boxes
 from hr.infer.predict import agnostic_nms, combine, detect as _detect, draw, draw_elements
 
 ROOT = Path(__file__).resolve().parent
@@ -279,59 +280,19 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
                 EXTERNAL_MODELS[member] = YOLO(str(weight_path))
             model = EXTERNAL_MODELS[member]
         boxes, scores, classes = detect(model, image, conf, 640, tile, overlap, 0.5, DEVICE)
-        for i, cid in enumerate(classes.tolist()):
-            raw = model.names.get(int(cid), str(cid)) if isinstance(model.names, dict) else model.names[int(cid)]
-            if member == "pcbinspect_yolov12m":
-                key = {"componentbody": "component_body"}.get(
-                    str(raw).replace("_", "").replace(" ", "").lower())
-                if key is None:
-                    continue
-            else:
-                key = "component_body"
+        for i, _class_id in enumerate(classes.tolist()):
+            key = "component_body"
             routed[key].append({"box": [float(v) for v in boxes[i]], "score": float(scores[i]),
                                 "source": member})
 
-    def nms(items: list[dict], iou_threshold: float = 0.50) -> list[dict]:
-        items = sorted(items, key=lambda item: -item["score"])
-        kept: list[dict] = []
-        for item in items:
-            a = item["box"]
-            duplicate = False
-            for other in kept:
-                b = other["box"]
-                x1, y1 = max(a[0], b[0]), max(a[1], b[1])
-                x2, y2 = min(a[2], b[2]), min(a[3], b[3])
-                inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-                aa = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
-                bb = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
-                if inter / (aa + bb - inter + 1e-9) >= iou_threshold:
-                    duplicate = True
-                    break
-            if not duplicate:
-                kept.append(item)
-        return kept
-
-    pcb_body = nms([item for item in routed["component_body"]
-                     if item.get("source") == "pcbinspect_yolov12m"])
-    locator_body = nms([item for item in routed["component_body"]
-                         if item.get("source") != "pcbinspect_yolov12m"])
-
-    def same_body(a: dict, b: dict) -> bool:
-        ax0, ay0, ax1, ay1 = a["box"]
-        bx0, by0, bx1, by1 = b["box"]
-        ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
-        iy = max(0.0, min(ay1, by1) - max(ay0, by0))
-        inter = ix * iy
-        area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
-        area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
-        smaller_coverage = inter / (min(area_a, area_b) + 1e-9)
-        union = area_a + area_b - inter
-        iou = inter / (union + 1e-9)
-        return smaller_coverage >= 0.70 or iou >= 0.35
-
-    # PCBInspect provides the tighter semantic body box; locator boxes only fill gaps.
-    body = pcb_body + [item for item in locator_body
-                       if not any(same_body(item, primary) for primary in pcb_body)]
+    # Apply one conservative geometry pass to the complete two-model candidate
+    # set, including locator-vs-locator and locator-vs-Doctor pairs.
+    body, suppressed_duplicates = deduplicate_component_boxes(routed["component_body"])
+    suppressed_details = [{"kept_source": row["kept"].get("source"),
+        "suppressed_source": row["suppressed"].get("source"),
+        "kept_box": row["kept"].get("box"), "suppressed_box": row["suppressed"].get("box"),
+        "kept_confidence": row["kept"].get("score"), "suppressed_confidence": row["suppressed"].get("score"),
+        "geometry": row["metrics"]} for row in suppressed_duplicates]
     items = [("component_body", item) for item in body]
     items.sort(key=lambda pair: -pair[1]["score"])
     boxes = torch.tensor([item["box"] for _, item in items], dtype=torch.float32).reshape(-1, 4)
@@ -353,6 +314,8 @@ def run_body_only_prediction(image_bytes: bytes, options: dict) -> dict:
             "model_name": "YOLO26s Locator + AI Doctor (component body only; pins excluded)",
             "tile": tile, "overlap": overlap, "confidence": conf, "device": DEVICE,
             "total": len(items), "counts": counts, "detections": detections,
+            "duplicate_suppressed_count": len(suppressed_details),
+            "duplicate_suppressed": suppressed_details,
             "seconds": round(time.perf_counter() - started, 2),
             "elements_image": jpeg_data_url(overlay), "types_image": jpeg_data_url(overlay),
             "csv": table.getvalue()}

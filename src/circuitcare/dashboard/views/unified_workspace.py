@@ -45,6 +45,7 @@ from circuitcare.vision.component_recognition_panel import (
     ensure_component_detection, render_component_recognition_panel,
     review_keys, review_scope as component_review_scope,
 )
+from circuitcare.vision.box_reconciliation import board_visible_review_rows
 from circuitcare.frontend.state import (
     INTAKE_IMAGES_KEY, INTAKE_PROJECT_KEY, clear_intake_draft,
     reset_intake_for_new_project,
@@ -362,6 +363,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         st.session_state["cc_active_component_review_scope"] = review_scope
         st.session_state["cc_active_component_review_image"] = detector_image_bytes
         review_rows = st.session_state.get(records_key, [])
+        visible_review_rows = [(index, row) for index, row in enumerate(board_visible_review_rows(review_rows))]
         auto_models = tuple(ComponentOverlayViewModel(
             project_id=project.project_id,
             board_id=project.board_id or "",
@@ -399,7 +401,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             ocr_class_hints=tuple(row.get("ocr_class_hints", [])),
             reference_designators=tuple(row.get("reference_designators", [])),
             overlay_source=row.get("source", "yolo"),
-        ) for index, row in enumerate(review_rows))
+        ) for index, row in visible_review_rows)
         component_models = tuple(component_models) + auto_models
         st.session_state["circuitcare_v4_selected_marking_context"] = None
     else:

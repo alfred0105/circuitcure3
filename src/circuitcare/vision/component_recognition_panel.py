@@ -15,6 +15,7 @@ import streamlit as st
 
 from circuitcare.vision.box_reconciliation import (
     associate_ocr_with_components, boxes_overlap_candidate, preserve_review_rows,
+    same_component_box_pair,
 )
 
 APP_DIR = Path(__file__).resolve().parents[3] / "apps" / "pcb-component-recognition"
@@ -83,13 +84,15 @@ def _review_fingerprint(rows: list[dict], ocr_result: dict | None) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def duplicate_exclusion_enabled(proposal: dict) -> bool:
-    """Only expose a delete choice for a confident same-component suggestion."""
+def duplicate_exclusion_enabled(proposal: dict, left_box: list | tuple,
+                                right_box: list | tuple) -> bool:
+    """Require Qwen agreement and strong geometric evidence before exclusion."""
     try:
         confidence = float(proposal.get("confidence", 0))
     except (TypeError, ValueError):
         return False
-    return proposal.get("decision") == "same_component" and confidence >= 0.65
+    return (proposal.get("decision") == "same_component" and confidence >= 0.65
+            and same_component_box_pair(left_box, right_box))
 
 
 @st.cache_resource(show_spinner=False)
@@ -232,7 +235,7 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
             box = proposal.get("bbox_xyxy")
             if not isinstance(box, (list, tuple)) or len(box) != 4:
                 continue
-            if any(boxes_overlap_candidate(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) for row in rows):
+            if any(same_component_box_pair(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) for row in rows):
                 continue
             digest = hashlib.sha256(repr(tuple(round(float(value), 1) for value in box)).encode()).hexdigest()[:16]
             component_id = f"yolo2-{digest}"
@@ -243,6 +246,8 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                 location_confidence=proposal.get("location_confidence", proposal.get("body_confidence")),
                 type_confidence=proposal.get("type_confidence"), match_score=proposal.get("match_score"))
             candidate.update({"source": "yolo_second_pass", "상태": "검수 필요"})
+            candidate["possible_duplicate_ids"] = [row["component_id"] for row in rows
+                if boxes_overlap_candidate(box, [row["x1"], row["y1"], row["x2"], row["y2"]])]
             rows.append(candidate)
             additions += 1
         st_api.session_state[result_key]["secondary_detection_count"] = len(second_pass.get("detections", []))
@@ -338,7 +343,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     box = proposal.get("bbox_xyxy")
                     if not isinstance(box, (list, tuple)) or len(box) != 4:
                         continue
-                    if any(boxes_overlap_candidate(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) for row in rows):
+                    if any(same_component_box_pair(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) for row in rows):
                         continue
                     digest = hashlib.sha256(repr(tuple(round(float(value), 1) for value in box)).encode()).hexdigest()[:16]
                     component_id = f"yolo2-{digest}"
@@ -351,6 +356,8 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         type_confidence=proposal.get("type_confidence"), match_score=proposal.get("match_score"),
                     )
                     candidate.update({"source": "yolo_second_pass", "상태": "검수 필요"})
+                    candidate["possible_duplicate_ids"] = [row["component_id"] for row in rows
+                        if boxes_overlap_candidate(box, [row["x1"], row["y1"], row["x2"], row["y2"]])]
                     rows.append(candidate)
                     additions += 1
                 st_api.session_state[records_key] = rows
@@ -456,9 +463,17 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 ids = proposal.get("detection_ids", [])
                 if len(ids) != 2:
                     continue
+                pair_rows = [by_id.get(str(item_id)) for item_id in ids]
+                if any(row is None for row in pair_rows):
+                    continue
+                left_box = [pair_rows[0][key] for key in ("x1", "y1", "x2", "y2")]
+                right_box = [pair_rows[1][key] for key in ("x1", "y1", "x2", "y2")]
+                geometric_duplicate = same_component_box_pair(left_box, right_box)
                 st_api.markdown(f"**중복 검토 · {ids[0]} / {ids[1]} · {proposal['decision']} · 아직 미확인**")
                 st_api.caption(proposal.get("evidence") or "시각 근거 없음")
-                can_exclude = duplicate_exclusion_enabled(proposal)
+                if not geometric_duplicate:
+                    st_api.warning("박스 위치·크기 관계가 중복 근거와 맞지 않습니다. Qwen 제안만으로는 제외할 수 없습니다.")
+                can_exclude = duplicate_exclusion_enabled(proposal, left_box, right_box)
                 choices = [*ids, "둘 다 유지"] if can_exclude else ["둘 다 유지"]
                 choice_key = f"cc_qwen_duplicate_choice_{scope}_{index}_{hashlib.sha256('|'.join(ids).encode()).hexdigest()[:8]}"
                 if st_api.session_state.get(choice_key) not in choices:
@@ -485,9 +500,12 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     continue
                 st_api.markdown(f"**미탐지 후보 · {proposal['proposed_class']} · 점수 {proposal['confidence']:.2f} · 검수 필요**")
                 st_api.caption(proposal.get("evidence") or "Qwen 위치 후보 · YOLO 확인 필요")
+                if proposal.get("possible_duplicate_ids"):
+                    st_api.warning("박스 겹침 후보 · " + ", ".join(proposal["possible_duplicate_ids"])
+                                   + " · 포함 관계만으로 삭제하지 않고 별도 검수합니다.")
                 if st_api.button("미확인 후보 박스로 추가", key=f"cc_qwen_missing_apply_{scope}_{index}"):
-                    if any(boxes_overlap_candidate(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) for row in rows):
-                        st_api.warning("기존 박스와 겹칩니다. 중복 여부를 먼저 확인하세요.")
+                    if any(same_component_box_pair(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) for row in rows):
+                        st_api.warning("기존 박스와 같은 소자로 보이는 후보는 추가하지 않았습니다.")
                     else:
                         candidate = _record(
                             proposal["proposed_class"], box, confidence=proposal["confidence"],
@@ -497,12 +515,28 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                                           "source": "qwen_suggestion", "상태": "검수 필요",
                                           "ai_evidence": proposal.get("evidence", ""),
                                           "qwen_review_id": f"{scope}:{index}"})
+                        candidate["possible_duplicate_ids"] = [row["component_id"] for row in rows
+                            if boxes_overlap_candidate(box, [row["x1"], row["y1"], row["x2"], row["y2"]])]
+                        candidate["geometry_review_required"] = bool(candidate["possible_duplicate_ids"])
                         rows.append(candidate)
                         st_api.session_state[records_key] = rows
                         invalidate_qwen_review(st_api.session_state, scope)
                         st_api.rerun()
             for note in qwen_review.get("notes", []):
                 st_api.caption(f"Qwen 관찰 · {note}")
+
+    excluded_rows = [row for row in rows if row.get("상태") == "제외"]
+    if excluded_rows:
+        with st_api.expander(f"제외된 박스 검수 · {len(excluded_rows)}개", expanded=False):
+            st_api.caption("제외된 박스는 PCB 기본 오버레이에서 숨깁니다. 아래에서 이력 확인 후 되살릴 수 있습니다.")
+            for index, row in enumerate(excluded_rows):
+                st_api.write(f"{row.get('component_id')} · {row.get('소자 종류', 'unknown')} · 대표 박스 {row.get('duplicate_of', '미지정')}")
+                if st_api.button("박스 복원", key=f"cc_component_restore_excluded_{scope}_{row.get('component_id')}_{index}"):
+                    row["상태"] = "검수 필요"
+                    row.pop("duplicate_of", None)
+                    st_api.session_state[records_key] = rows
+                    invalidate_qwen_review(st_api.session_state, scope)
+                    st_api.rerun()
 
     export_rows = [{"project_id": project_id, "photo_id": photo_id,
                     "active": row.get("상태") != "제외", "class_name": row["소자 종류"],

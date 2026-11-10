@@ -49,6 +49,71 @@ def boxes_overlap_candidate(
             or box_intersection_over_smaller(candidate, existing) >= containment_threshold)
 
 
+def duplicate_box_metrics(
+    left: list[float] | tuple[float, ...], right: list[float] | tuple[float, ...],
+) -> dict[str, float]:
+    """Measure overlap, relative size, and normalized center distance for a box pair."""
+    if len(left) != 4 or len(right) != 4:
+        return {"iou": 0.0, "smaller_coverage": 0.0, "area_ratio": 0.0,
+                "center_distance_norm": float("inf")}
+    boxes = [[float(value) for value in left], [float(value) for value in right]]
+    areas = [max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1]) for box in boxes]
+    intersection = max(0.0, min(boxes[0][2], boxes[1][2]) - max(boxes[0][0], boxes[1][0])) * max(
+        0.0, min(boxes[0][3], boxes[1][3]) - max(boxes[0][1], boxes[1][1])
+    )
+    union = areas[0] + areas[1] - intersection
+    centers = [((box[0] + box[2]) / 2, (box[1] + box[3]) / 2) for box in boxes]
+    distance = ((centers[0][0] - centers[1][0]) ** 2 + (centers[0][1] - centers[1][1]) ** 2) ** .5
+    largest_scale = max(1.0, areas[0], areas[1]) ** .5
+    return {"iou": intersection / union if union else 0.0,
+            "smaller_coverage": intersection / min(areas) if min(areas) else 0.0,
+            "area_ratio": min(areas) / max(areas) if max(areas) else 0.0,
+            "center_distance_norm": distance / largest_scale}
+
+
+def same_component_box_pair(
+    left: list[float] | tuple[float, ...], right: list[float] | tuple[float, ...],
+) -> bool:
+    """Conservatively identify two detections of the same physical component.
+
+    A small box fully inside a much larger box is deliberately retained: PCB body
+    proposals can enclose a neighboring real part, so containment alone is not
+    enough to suppress it.
+    """
+    metrics = duplicate_box_metrics(left, right)
+    if metrics["area_ratio"] < 0.45:
+        return False
+    if metrics["center_distance_norm"] > 0.22:
+        return False
+    return (metrics["iou"] >= 0.50
+            or (metrics["smaller_coverage"] >= 0.90 and metrics["area_ratio"] >= 0.55))
+
+
+def board_visible_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hide excluded records from the default PCB overlay while retaining their history."""
+    return [row for row in rows if isinstance(row, dict) and row.get("상태") != "제외"]
+
+
+def deduplicate_component_boxes(candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Deduplicate the complete cross-model location set using score and geometry."""
+    kept: list[dict[str, Any]] = []
+    suppressed: list[dict[str, Any]] = []
+    ordered = sorted(candidates, key=lambda item: float(item.get("score", item.get("confidence", 0.0)) or 0.0),
+                     reverse=True)
+    for candidate in ordered:
+        box = candidate.get("box", candidate.get("bbox_xyxy"))
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        matching = next((row for row in kept
+                         if same_component_box_pair(box, row.get("box", row.get("bbox_xyxy", [])))), None)
+        if matching is None:
+            kept.append(candidate)
+        else:
+            suppressed.append({"kept": matching, "suppressed": candidate,
+                               "metrics": duplicate_box_metrics(box, matching.get("box", matching.get("bbox_xyxy", [])))})
+    return kept, suppressed
+
+
 def _edge_distance(left: list[float], right: list[float]) -> float:
     dx = max(float(left[0]) - float(right[2]), float(right[0]) - float(left[2]), 0.0)
     dy = max(float(left[1]) - float(right[3]), float(right[1]) - float(left[3]), 0.0)
@@ -121,12 +186,20 @@ def preserve_review_rows(
             old_box = [old.get(key) for key in ("x1", "y1", "x2", "y2")]
             if all(isinstance(value, (int, float)) for value in old_box):
                 score = box_iou(proposal["bbox_xyxy"], old_box)
-                if score >= match_threshold:
-                    matches.append((score, new_index, old_index))
+                if old.get("상태") == "제외":
+                    matched = score >= 0.75 or same_component_box_pair(proposal["bbox_xyxy"], old_box)
+                else:
+                    matched = score >= match_threshold or same_component_box_pair(proposal["bbox_xyxy"], old_box)
+                if matched:
+                    # Prefer an active record over an excluded duplicate when a new
+                    # detection geometrically matches both.
+                    active_priority = int(old.get("상태") != "제외")
+                    geometry_score = max(score, duplicate_box_metrics(proposal["bbox_xyxy"], old_box)["smaller_coverage"])
+                    matches.append((geometry_score, active_priority, new_index, old_index))
     matched_new: set[int] = set()
     matched_old: set[int] = set()
     assignments: dict[int, dict[str, Any]] = {}
-    for _score, new_index, old_index in sorted(matches, reverse=True):
+    for _score, _active_priority, new_index, old_index in sorted(matches, reverse=True):
         if new_index in matched_new or old_index in matched_old:
             continue
         matched_new.add(new_index)
