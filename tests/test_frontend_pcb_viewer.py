@@ -9,12 +9,14 @@ from circuitcare.dashboard.components.pcb_workspace import (
 )
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.frontend.component_overlay_models import display_identity_status
-from circuitcare.dashboard.views.unified_workspace import _bind_review_models_to_map
-from circuitcare.frontend.models import ProjectContext, SelectionState
+from circuitcare.dashboard.views.unified_workspace import (
+    _bind_review_models_to_map, _prepare_photo_component_snapshot,
+)
+from circuitcare.frontend.models import ImageRecord, ProjectContext, SelectionState
 from circuitcare.vision.box_reconciliation import board_visible_review_rows
 from circuitcare.vision.component_recognition_panel import (
     _store_predictions, ensure_review_row_for_component, invalidate_component_review_state,
-    record_box_exclusion, restore_review_row, undo_last_box_exclusion, update_review_row,
+    record_box_exclusion, review_keys, restore_review_row, undo_last_box_exclusion, update_review_row,
 )
 
 
@@ -215,7 +217,8 @@ def test_component_change_invalidates_diagnosis_but_preserves_measurement_histor
 
 def test_map_and_detector_boxes_bind_to_one_review_identity():
     map_box = ComponentOverlayViewModel(**{**_model().__dict__, "component_id": "map-id",
-                                           "fault_candidate_status": "SUSPECTED_FAULT"})
+                                           "fault_candidate_status": "SUSPECTED_FAULT",
+                                           "fault_history": ({"visual_status": "FAULT_REFUTED"},)})
     review_box = ComponentOverlayViewModel(**{**_model().__dict__, "component_id": "detector-id",
                                               "component_type": "capacitor", "bbox_xyxy": (11, 21, 31, 51),
                                               "overlay_source": "yolo"})
@@ -225,7 +228,8 @@ def test_map_and_detector_boxes_bind_to_one_review_identity():
     assert len(merged) == 1
     assert merged[0].component_id == "detector-id"
     assert merged[0].bbox_xyxy == (11, 21, 31, 51)
-    assert merged[0].fault_candidate_status == "SUSPECTED_FAULT"
+    assert merged[0].fault_candidate_status is None
+    assert merged[0].fault_history == ({"visual_status": "FAULT_REFUTED"},)
     assert rows[0]["associated_component_ids"] == ["map-id"]
     rows[0]["상태"] = "제외"
     hidden, _rows = _bind_review_models_to_map((map_box,), (review_box,), rows)
@@ -247,6 +251,49 @@ def test_ambiguous_map_geometry_is_not_arbitrarily_bound_or_drawn_twice():
     assert {item.component_id for item in merged} == {"review-a", "review-b"}
     assert all("associated_component_ids" not in row for row in rows)
     assert all(row["map_match_status"] == "AMBIGUOUS_GEOMETRY" for row in rows)
+
+
+def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(monkeypatch):
+    image_bytes = []
+    for color in ("red", "blue"):
+        output = io.BytesIO()
+        Image.new("RGB", (40, 30), color).save(output, format="PNG")
+        image_bytes.append(output.getvalue())
+    project = ProjectContext(
+        "p1", "b1", image_records=(
+            ImageRecord("photo-1", side="front"), ImageRecord("photo-2", side="back"),
+        ),
+    )
+    state = {"circuitcare_v2_active_photo_id": "photo-1",
+             "circuitcare_v2_photo_choice": "photo-1"}
+    st = SimpleNamespace(session_state=state)
+
+    def fake_detection(st_api, *, image_bytes, project_id, photo_id,
+                       review_image_bytes=None, review_image_size=None):
+        scope = unified_workspace.component_review_scope(review_image_bytes, project_id, photo_id)
+        _result_key, rows_key, _error_key = review_keys(scope)
+        component_id = "R1" if photo_id == "photo-1" else "C1"
+        st_api.session_state[rows_key] = [{
+            "component_id": component_id, "소자 종류": "resistor" if component_id == "R1" else "capacitor",
+            "상태": "검수 필요", "x1": 1, "y1": 1, "x2": 10, "y2": 10,
+        }]
+        return {"detections": []}, None
+
+    from circuitcare.dashboard.views import unified_workspace
+    monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
+    photos = [{"image_id": "photo-1", "data": image_bytes[0]},
+              {"image_id": "photo-2", "data": image_bytes[1]}]
+    first = _prepare_photo_component_snapshot(st, project, photos)
+    assert [item.component_id for item in first["components"]] == ["R1"]
+
+    state["circuitcare_v2_photo_choice"] = "photo-2"
+    state["circuitcare_v2_active_photo_id"] = "photo-2"
+    second = _prepare_photo_component_snapshot(st, project, photos)
+    assert [item.component_id for item in second["components"]] == ["C1"]
+    snapshots = state["circuitcare_v6_photo_component_snapshots"]
+    assert first["analysis_scope_key"] != second["analysis_scope_key"]
+    assert snapshots[first["analysis_scope_key"]]["photo_id"] == "photo-1"
+    assert snapshots[second["analysis_scope_key"]]["photo_id"] == "photo-2"
 
 
 def test_redetection_keeps_exclusion_and_does_not_create_a_resurrection_duplicate():

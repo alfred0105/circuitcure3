@@ -132,12 +132,16 @@ def commit_analysis_result(
     state: Any, *, scope: AnalysisScope, run_id: str,
     fingerprints: AnalysisFingerprints | dict[str, str], result: dict[str, Any],
     result_kind: str = "symptom", current_fingerprints: AnalysisFingerprints | dict[str, str] | None = None,
+    current_scope: AnalysisScope | None = None,
 ) -> bool:
     expected = fingerprints.to_dict() if isinstance(fingerprints, AnalysisFingerprints) else dict(fingerprints)
     live = (current_fingerprints.to_dict() if isinstance(current_fingerprints, AnalysisFingerprints)
             else dict(current_fingerprints) if current_fingerprints is not None else expected)
     record = _record(state, scope)
     if (record.get("status") != AnalysisStatus.RUNNING.value or record.get("run_id") != run_id
+            or record.get("scope") != scope.to_dict()
+            or record.get("run_result_kind") != result_kind
+            or (current_scope is not None and current_scope.key != scope.key)
             or record.get("fingerprints", {}).get("final_sha256") != expected.get("final_sha256")
             or live.get("final_sha256") != expected.get("final_sha256")):
         _archive_results(record, reason="analysis inputs changed while analysis was running")

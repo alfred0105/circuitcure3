@@ -343,10 +343,27 @@ def render_inspection_panel(
         # intentionally limited to PCB component review and editing.
 
 
-def _diagnosis_status_label(st: Any, project: ProjectContext) -> str:
-    state = st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {})
-    result = state.get("result") if isinstance(state, dict) else None
+def _diagnosis_status_label(st: Any, project: ProjectContext, *, analysis_snapshot: dict[str, Any] | None = None) -> str:
+    if analysis_snapshot is None:
+        from circuitcare.dashboard.views.symptom_diagnosis_panel import current_analysis_snapshot
+
+        components = tuple(st.session_state.get("circuitcare_v4_current_components", ()))
+        result_scope = st.session_state.get("circuitcare_v4_component_inventory_scope")
+        owner = f"{project.project_id}|{project.board_id or ''}|{result_scope or st.session_state.get(MAP_VERSION_KEY) or ''}"
+        inventories = st.session_state.get(COMPONENT_INVENTORY_KEY, {})
+        inventory = inventories.get(owner, {}) if isinstance(inventories, dict) else {}
+        analysis_snapshot = current_analysis_snapshot(
+            st, project, components=components, component_inventory=inventory,
+        )
+    result = analysis_snapshot.get("result")
     if not isinstance(result, dict):
+        status = analysis_snapshot.get("record", {}).get("status")
+        if status == "RUNNING":
+            return "진단 중"
+        if status == "STALE":
+            return "입력 변경 · 재분석 필요"
+        if status == "FAILED":
+            return "진단 실패 · 재시도 필요"
         return "진단 미실행"
     status = result.get("status")
     if status == "CANDIDATES_AVAILABLE":

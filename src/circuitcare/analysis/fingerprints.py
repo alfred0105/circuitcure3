@@ -31,7 +31,7 @@ def build_symptom_input_fingerprint(
     *, project: Any, components: Iterable[Any], symptoms: list[str], symptom_text: str,
     observations: dict[str, Any], answers: dict[str, Any], silkscreen_labels: list[dict[str, Any]],
     component_inventory: dict[str, dict[str, Any]] | None, confirmed_component_ids: list[str] | None,
-    inventory_complete: bool, target_id: str,
+    inventory_complete: bool, target_id: str, target_photo_sha256: str | None = None,
 ) -> str:
     """Build the content fingerprint for one selected PCB photo and its diagnosis inputs."""
     rows = [{
@@ -50,7 +50,7 @@ def build_symptom_input_fingerprint(
         "board_id": project.board_id,
         "analysis_target_id": str(target_id),
         "target_photo": ({
-            "content_sha256": getattr(photo, "content_sha256", None),
+            "content_sha256": target_photo_sha256 or getattr(photo, "content_sha256", None),
             "dimensions": getattr(photo, "image_dimensions", None),
             "side": getattr(photo, "side", None),
         } if photo else None),
@@ -93,6 +93,9 @@ def build_rules_fingerprint(*, extra_payload: dict[str, Any] | None = None) -> s
         root / "symptom_diagnosis" / "component_fault_ranker.py",
         root / "symptom_diagnosis" / "measurement_evaluator.py",
         root / "symptom_diagnosis" / "functional_blocks.py",
+        root / "symptom_diagnosis" / "symptom_parser.py",
+        root / "symptom_diagnosis" / "fault_hypothesis_validator.py",
+        root / "symptom_diagnosis" / "schemas.py",
         *sorted((root / "symptom_diagnosis" / "knowledge").glob("*.yaml")),
     ]
     files: dict[str, str] = {}

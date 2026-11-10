@@ -1,4 +1,5 @@
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
+from circuitcare.dashboard.views.unified_workspace import _attach_verified_history
 from circuitcare.symptom_diagnosis.diagnosis_state import (
     build_overlay_state,
     component_inventory_version,
@@ -106,6 +107,24 @@ def test_viewer_model_keeps_history_separate_from_active_fault_status():
     )
     assert item.fault_candidate_status == "SUSPECTED_FAULT"
     assert item.fault_history[0]["visual_status"] == "FAULT_REFUTED"
+
+
+def test_verified_history_never_becomes_a_current_pcb_verdict():
+    item = ComponentOverlayViewModel(
+        project_id="p", board_id="b", board_side="TOP", component_id="D1", component_type="diode",
+        display_label="D1", canonical_frame_id="photo", coordinate_frame="SOURCE_PHOTO_PIXEL",
+        bbox_xyxy=(1, 2, 3, 4), polygon_xy=(), source_backend_photo_ids=("photo",),
+        observation_ids=(), detection_confidence=0.9, identification_status="SUGGESTED_CLASS_ONLY",
+        identity_match_status=None, ocr_marking=None, possible_part_number=None, evidence=(),
+        overlay_status="CANDIDATE", fault_candidate_status=None,
+        diagnosis_display_status="DIAGNOSIS_NOT_RUN",
+    )
+    historical = {"component_id": "D1", "visual_status": "FAULT_REFUTED",
+                  "measurement_verdict": "refutes", "fault_hypothesis": "DIODE_LEAKAGE_FAILURE"}
+    updated = _attach_verified_history((item,), {"D1": [historical]})[0]
+    assert updated.fault_candidate_status is None
+    assert updated.diagnosis_display_status == "DIAGNOSIS_NOT_RUN"
+    assert updated.fault_history == (historical,)
 
 
 def test_viewer_assets_render_supported_refuted_and_unresolved_states():

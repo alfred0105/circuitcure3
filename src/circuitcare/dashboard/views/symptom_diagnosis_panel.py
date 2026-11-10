@@ -42,18 +42,116 @@ def _diagnosis_fingerprint(
     inventory_complete: bool = False,
     component_inventory: dict[str, dict[str, Any]] | None = None,
 ) -> str:
+    target_id = str(state.get(ACTIVE_PHOTO_KEY) or "target:default")
+    analysis_scope = AnalysisScope(project.project_id, project.board_id or "", target_id)
+    photo_snapshots = state.get("circuitcare_v6_photo_component_snapshots", {})
+    photo_snapshot = photo_snapshots.get(analysis_scope.key) if isinstance(photo_snapshots, dict) else None
     return build_symptom_input_fingerprint(
         project=project, components=components, symptoms=symptoms, symptom_text=symptom_text,
         observations=observations, answers=answers, silkscreen_labels=silkscreen_labels,
         component_inventory=component_inventory, confirmed_component_ids=confirmed_component_ids,
         inventory_complete=inventory_complete,
-        target_id=str(state.get(ACTIVE_PHOTO_KEY) or "target:default"),
+        target_id=target_id,
+        target_photo_sha256=(photo_snapshot.get("image_fingerprint")
+                             if isinstance(photo_snapshot, dict) else None),
     )
 
 
 def _analysis_scope(project: ProjectContext, state: Any) -> AnalysisScope:
     return AnalysisScope(project.project_id, project.board_id or "",
                          str(state.get(ACTIVE_PHOTO_KEY) or "target:default"))
+
+
+def current_analysis_snapshot(
+    st: Any, project: ProjectContext, *, components: tuple[Any, ...] = (),
+    component_inventory: dict[str, dict[str, Any]] | None = None,
+    symptom_text: str | None = None, selected_codes: list[str] | None = None,
+    observations: dict[str, Any] | None = None, inventory_complete: bool | None = None,
+) -> dict[str, Any]:
+    """Rebuild and validate the active photo's analysis version before rendering results."""
+    key = _project_key(project)
+    state = st.session_state.get(key, {})
+    if not isinstance(state, dict):
+        state = {}
+    kb = load_knowledge()
+    symptom_items = kb["symptom_ontology"]["symptoms"]
+    code_to_label = {code: item["label"] for code, item in symptom_items.items()}
+    if selected_codes is None:
+        labels = st.session_state.get(f"{key}_symptoms", [
+            code_to_label[code] for code in state.get("symptoms", []) if code in code_to_label
+        ])
+        selected_codes = [code for code, label in code_to_label.items() if label in labels]
+    if symptom_text is None:
+        symptom_text = st.session_state.get(f"{key}_description", project.symptom_description or "")
+    if inventory_complete is None:
+        inventory_complete = bool(st.session_state.get(
+            f"{key}_inventory_complete", state.get("inventory_complete", False)))
+    if observations is None:
+        observations = dict(state.get("manual_observations", state.get("observations", {})))
+        for fact in ("POWER_SOURCE_VERIFIED", "BUZZER_VERIFIED_FAILED", "BUZZER_VERIFIED_WORKING",
+                     "BUZZER_DRIVE_ABNORMAL", "BUZZER_DRIVE_VERIFIED_NORMAL", "VISIBLE_SOLDER_DAMAGE"):
+            widget_value = st.session_state.get(f"{key}_{fact}")
+            widget_value = {"예": True, "아니오": False, "모름": None}.get(widget_value, widget_value)
+            if widget_value in {True, False, None}:
+                observations[fact] = widget_value
+        if st.session_state.get(f"{key}_power_off", False):
+            observations["POWER_OFF_CONFIRMED"] = True
+        else:
+            observations.pop("POWER_OFF_CONFIRMED", None)
+    inventory = component_inventory or {}
+    rows = _component_rows(components, inventory)
+    confirmed_ids = sorted(row["component_id"] for row in rows if row.get("presence_status") == "CONFIRMED")
+    measurements = get_measurements(
+        st.session_state, project_id=project.project_id, board_id=project.board_id or "",
+    )
+    silkscreen = st.session_state.get("circuitcare_v4_silkscreen_labels", [])
+    if not isinstance(silkscreen, list):
+        silkscreen = []
+    input_fingerprint = _diagnosis_fingerprint(
+        project, components, selected_codes, symptom_text, observations, state.get("answers", {}),
+        measurements, silkscreen, st.session_state, confirmed_ids,
+        bool(inventory_complete), inventory,
+    )
+    llm_enabled = bool(st.session_state.get(f"{key}_llm_enabled", False))
+    selected_model = st.session_state.get(f"{key}_model")
+    fingerprints = build_analysis_fingerprints(
+        input_payload={"input_sha256": input_fingerprint}, measurements=measurements,
+        extra_rules_payload={"llm_enabled": llm_enabled,
+                             "llm_model": selected_model if llm_enabled else None},
+    )
+    scope = _analysis_scope(project, st.session_state)
+    record = get_current_state(st.session_state, scope)
+    legacy_matches = (
+        state.get("input_fingerprint") == input_fingerprint
+        and state.get("measurement_fingerprint") == _measurement_fingerprint(project, measurements)
+        and state.get("rules_sha256") == fingerprints.rules_sha256
+    )
+    if state.get("result") and not record.get("results") and not record.get("fingerprints") and legacy_matches:
+        migrate_legacy_result(
+            st.session_state, scope=scope, fingerprints=fingerprints,
+            result=state["result"], legacy_fingerprint=state.get("input_fingerprint"),
+        )
+    record = get_current_state(st.session_state, scope, fingerprints)
+    return {
+        "scope": scope, "fingerprints": fingerprints, "record": record,
+        "result": get_current_result(st.session_state, scope=scope, fingerprints=fingerprints),
+        "input_fingerprint": input_fingerprint,
+        "measurement_fingerprint": _measurement_fingerprint(project, measurements),
+        "measurements": measurements, "symptoms": selected_codes,
+        "symptom_text": symptom_text, "observations": observations,
+        "inventory_complete": bool(inventory_complete), "components": components,
+        "component_inventory": inventory, "llm_enabled": llm_enabled,
+        "selected_model": selected_model,
+    }
+
+
+def get_current_diagnosis_result(
+    st: Any, project: ProjectContext, *, components: tuple[Any, ...] = (),
+    component_inventory: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    return current_analysis_snapshot(
+        st, project, components=components, component_inventory=component_inventory,
+    )["result"]
 
 
 def _measurement_fingerprint(project: ProjectContext, measurements: list[Any]) -> str:
@@ -227,26 +325,24 @@ def render_symptom_diagnosis_panel(
             llm_enabled = st.checkbox("LLM 설명 보조 사용", key=llm_key)
         else:
             st.caption("Ollama를 사용할 수 없어 규칙 기반 분석으로 실행합니다.")
-    measurements = get_measurements(
-        st.session_state, project_id=project.project_id, board_id=project.board_id or "",
+    snapshot = current_analysis_snapshot(
+        st, project, components=components, component_inventory=component_inventory,
+        symptom_text=symptom_text, selected_codes=selected_codes,
+        observations=observations, inventory_complete=inventory_complete,
     )
+    measurements = snapshot["measurements"]
     silkscreen_labels = st.session_state.get("circuitcare_v4_silkscreen_labels", [])
     if not isinstance(silkscreen_labels, list):
         silkscreen_labels = []
-    fingerprint = _diagnosis_fingerprint(
-        project, components, selected_codes, symptom_text, observations,
-        state.get("answers", {}), measurements, silkscreen_labels, st.session_state,
-        confirmed_component_ids, inventory_complete,
-        component_inventory,
-    )
-    measurement_fingerprint = _measurement_fingerprint(project, measurements)
-    llm_enabled = bool(st.session_state.get(f"{key}_llm_enabled", False))
-    selected_model = st.session_state.get(f"{key}_model")
-    analysis_scope = _analysis_scope(project, st.session_state)
-    analysis_fingerprints = build_analysis_fingerprints(
-        input_payload={"input_sha256": fingerprint}, measurements=measurements,
-        extra_rules_payload={"llm_enabled": llm_enabled,
-                             "llm_model": selected_model if llm_enabled else None},
+    fingerprint = snapshot["input_fingerprint"]
+    measurement_fingerprint = snapshot["measurement_fingerprint"]
+    llm_enabled = snapshot["llm_enabled"]
+    selected_model = snapshot["selected_model"]
+    analysis_scope = snapshot["scope"]
+    analysis_fingerprints = snapshot["fingerprints"]
+    confirmed_component_ids = sorted(
+        row["component_id"] for row in _component_rows(components, component_inventory)
+        if row.get("presence_status") == "CONFIRMED"
     )
     central_state = get_current_state(st.session_state, analysis_scope)
     legacy_result_matches_inputs = (
@@ -285,7 +381,7 @@ def render_symptom_diagnosis_panel(
     else:
         state["result"] = None
         state["analysis_status"] = central_state.get("status", "NOT_RUN")
-    if st.button("원인 후보 분석" if not state.get("result") else "다시 분석", type="primary", disabled=preview,
+    if st.button("원인 후보 분석" if not current_result else "다시 분석", type="primary", disabled=preview,
                  key=f"{key}_run"):
         state["symptoms"] = selected_codes
         state["confirmed_component_ids"] = confirmed_component_ids
@@ -359,9 +455,15 @@ def render_symptom_diagnosis_panel(
                     )
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 result["llm_component_error"] = str(exc)
+        live_snapshot = current_analysis_snapshot(
+            st, project, components=components, component_inventory=component_inventory,
+            symptom_text=symptom_text, selected_codes=selected_codes,
+            observations=observations, inventory_complete=inventory_complete,
+        )
         committed = commit_analysis_result(
             st.session_state, scope=analysis_scope, run_id=run_id,
-            fingerprints=analysis_fingerprints, current_fingerprints=analysis_fingerprints,
+            fingerprints=analysis_fingerprints, current_fingerprints=live_snapshot["fingerprints"],
+            current_scope=live_snapshot["scope"],
             result=result, result_kind="symptom",
         )
         if not committed:
@@ -381,7 +483,7 @@ def render_symptom_diagnosis_panel(
         state["measurement_fingerprint"] = measurement_fingerprint
         st.session_state[key] = state
         st.rerun()
-    result = state.get("result")
+    result = current_result
     if not result:
         st.info("증상을 입력하고 **원인 후보 분석**을 실행하세요.")
         return
@@ -578,9 +680,15 @@ def render_symptom_diagnosis_panel(
                 except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                     state["result"]["llm_component_error"] = str(exc)
             answer_result = state["result"]
+            live_snapshot = current_analysis_snapshot(
+                st, project, components=components, component_inventory=component_inventory,
+                symptom_text=symptom_text, selected_codes=selected_codes,
+                observations=observations, inventory_complete=inventory_complete,
+            )
             committed = commit_analysis_result(
                 st.session_state, scope=analysis_scope, run_id=followup_run_id,
-                fingerprints=answer_fingerprints, current_fingerprints=answer_fingerprints,
+                fingerprints=answer_fingerprints, current_fingerprints=live_snapshot["fingerprints"],
+                current_scope=live_snapshot["scope"],
                 result=answer_result, result_kind="symptom",
             )
             if not committed:
