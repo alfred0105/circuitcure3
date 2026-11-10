@@ -10,17 +10,13 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 from circuitcare.local_llm import OllamaClient
+from circuitcare.component_taxonomy import COMPONENT_LABELS, UNKNOWN_CLASS, normalize_component_class
 from circuitcare.vision.box_reconciliation import (
     boxes_overlap_candidate, duplicate_box_metrics, same_component_box_pair,
 )
 
 DEFAULT_REVIEW_MODEL = "qwen3.5:9b"
-REVIEW_CLASSES = (
-    "unknown", "resistor", "inductor", "capacitor", "connector", "jumper", "IC",
-    "switch", "relay", "transistor", "potentiometer", "battery", "buzzer", "diode",
-    "display", "emi_filter", "ferrite_bead", "fuse", "LED", "clock", "oscillator",
-    "voltage_regulator", "MOV", "transformer", "heatsink",
-)
+REVIEW_CLASSES = COMPONENT_LABELS
 
 REVIEW_SCHEMA = {
     "type": "object",
@@ -50,7 +46,7 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 
-_SYSTEM = """You review a PCB photo and its YOLO component proposals. Be conservative: only suggest a class when the physical component appearance is clear. Small SMD parts are often visually ambiguous. Use OCR strings only as nearby text evidence; a reference such as C12 may not label the closest body. Do not claim certainty. Do not invent unseen parts. Existing boxes are identified by IDs; assess duplicate pairs only when their IDs are listed in duplicate_pair_crops, using the associated paired crop and surrounding board context. Search for at most a few clearly visible missed components, including when there are no detector proposals. Every proposed box is only a rough review candidate and must be manually checked. Each supplied image has an image_index from image_sources; missed boxes must be normalized relative to the image they cite. Return only the requested JSON object."""
+_SYSTEM = """You review a PCB photo and its YOLO component proposals. Use only the supplied shared component labels. Return unknown whenever appearance is ambiguous; return not_component only when the box clearly contains no physical component. Be conservative: only suggest a class when the physical component appearance is clear. Small SMD parts are often visually ambiguous. Use body markings and nearby OCR/silkscreen as cross-check evidence; a reference such as C12 may not label the closest body. Conflicting evidence means decision=uncertain and proposed_class=unknown. Do not claim certainty. Do not invent unseen parts. Existing boxes are identified by IDs; assess duplicate pairs only when their IDs are listed in duplicate_pair_crops, using the associated paired crop and surrounding board context. Search for at most a few clearly visible missed components, including when there are no detector proposals. Every proposed box is only a rough review candidate and must be manually checked. Each supplied image has an image_index from image_sources; missed boxes must be normalized relative to the image they cite. Return only the requested JSON object."""
 
 
 def _review_images(
@@ -186,10 +182,13 @@ def review_components_with_qwen(
     for index, row in enumerate(detections, start=1):
         box = row.get("bbox_xyxy", [row.get("x1"), row.get("y1"), row.get("x2"), row.get("y2")])
         identified.append({"detection_id": str(row.get("component_id") or f"det-{index}"),
-                           "class_name": row.get("class_name", row.get("소자 종류", "unknown")),
+                           "class_name": normalize_component_class(row.get("class_name", row.get("소자 종류", "unknown"))),
                            "confidence": row.get("confidence", row.get("신뢰도")),
                            "bbox_xyxy": box,
-                           "ocr_text": row.get("ocr_candidates", [])})
+                           "ocr_text": row.get("ocr_candidates", []),
+                           "ocr_class_hints": row.get("ocr_class_hints", []),
+                           "reference_designators": row.get("reference_designators", []),
+                           "body_marking": row.get("body_marking")})
     images, (width, height), image_manifest, pair_manifest = _review_images(image_bytes, identified)
     payload = {
         "image_coordinates_px": {"width": width, "height": height},
@@ -217,12 +216,27 @@ def review_components_with_qwen(
     class_reviews = []
     for row in content.get("class_reviews", []):
         confidence = row.get("confidence")
-        if (row.get("detection_id") not in known_ids or row.get("proposed_class") not in REVIEW_CLASSES
+        proposed = normalize_component_class(row.get("proposed_class"))
+        if (row.get("detection_id") not in known_ids
                 or row.get("decision") not in {"suggest", "uncertain"}
                 or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
                 or not 0 <= float(confidence) <= 1):
             continue
-        class_reviews.append({**row, "confidence": float(confidence), "evidence": str(row.get("evidence", ""))[:500]})
+        if row.get("decision") == "uncertain":
+            proposed = UNKNOWN_CLASS
+        target = next(item for item in identified if item["detection_id"] == row["detection_id"])
+        hints = {normalize_component_class(item, allow_not_component=False)
+                 for item in target.get("ocr_class_hints", [])}
+        hints.discard(UNKNOWN_CLASS)
+        if hints and proposed not in hints and proposed not in {UNKNOWN_CLASS, "not_component"}:
+            proposed = UNKNOWN_CLASS
+            decision = "uncertain"
+            evidence = (str(row.get("evidence", "")) + " OCR/silkscreen type hint conflicts with visual class.").strip()
+        else:
+            decision = row["decision"]
+            evidence = str(row.get("evidence", ""))
+        class_reviews.append({**row, "decision": decision, "proposed_class": proposed,
+                              "confidence": float(confidence), "evidence": evidence[:500]})
     duplicate_reviews = []
     seen_pairs = set()
     for row in content.get("duplicate_reviews", []):
@@ -243,11 +257,11 @@ def review_components_with_qwen(
     missed = []
     for row in content.get("missed_component_candidates", [])[:8]:
         box = row.get("bbox_norm_999", [])
+        proposed = normalize_component_class(row.get("proposed_class"))
         confidence = row.get("confidence")
         image_index = row.get("image_index", 0)
         if (type(image_index) is not int or not 0 <= image_index < len(image_manifest)
                 or len(box) != 4 or any(type(value) is not int or not 0 <= value <= 999 for value in box)
-                or row.get("proposed_class") not in REVIEW_CLASSES
                 or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
                 or not 0 <= float(confidence) <= 1):
             continue
@@ -267,7 +281,8 @@ def review_components_with_qwen(
             if isinstance(det.get("bbox_xyxy"), (list, tuple)) and len(det["bbox_xyxy"]) == 4
             and boxes_overlap_candidate(candidate, det["bbox_xyxy"])
             and not same_component_box_pair(candidate, det["bbox_xyxy"])]
-        missed.append({**row, "confidence": float(confidence), "bbox_xyxy": candidate, "evidence": str(row.get("evidence", ""))[:500],
+        missed.append({**row, "proposed_class": proposed,
+                       "confidence": float(confidence), "bbox_xyxy": candidate, "evidence": str(row.get("evidence", ""))[:500],
                        "possible_duplicate_ids": possible_duplicate_ids,
                        "geometry_review_required": bool(possible_duplicate_ids),
                        "review_status": "검수 필요", "source": "qwen_suggestion"})

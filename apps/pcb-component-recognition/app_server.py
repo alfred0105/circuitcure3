@@ -20,6 +20,7 @@ import torch
 from ultralytics import YOLO
 
 from circuitcare.vision.box_reconciliation import deduplicate_component_boxes
+from circuitcare.component_taxonomy import normalize_component_class
 from hr.infer.predict import agnostic_nms, combine, detect as _detect, draw, draw_elements
 
 ROOT = Path(__file__).resolve().parent
@@ -55,15 +56,11 @@ EVAL_ENSEMBLES = {
     "ensemble_all_three": ("Parsa + PCB AI Doctor v12n + PCBInspect v12m", ["parsa", "pcb_ai_doctor_v12n", "pcbinspect_yolov12m"]),
 }
 EVAL_WEIGHT_ROOT = WEIGHTS / "external"
-COMPONENT_CLASS_MAP = {
-    "battery": "battery", "button": "switch", "buzzer": "buzzer",
-    "capacitor": "capacitor", "clock": "clock", "connector": "connector",
-    "diode": "diode", "display": "display", "fuse": "fuse",
-    "heatsink": "heatsink", "ic": "IC", "inductor": "inductor",
-    "led": "LED", "potentiometer": "potentiometer", "relay": "relay",
-    "resistor": "resistor", "switch": "switch", "transformer": "transformer",
-    "transistor": "transistor",
-}
+COMPONENT_CLASS_MAP = {name: normalize_component_class(name) for name in (
+    "battery", "button", "buzzer", "capacitor", "clock", "connector", "diode",
+    "display", "fuse", "heatsink", "ic", "inductor", "led", "potentiometer",
+    "relay", "resistor", "switch", "transformer", "transistor",
+)}
 
 
 def detect(model, image, conf, imgsz, tile, overlap, iou, device, max_det=1000):
@@ -344,20 +341,11 @@ def run_pcb_component_types_prediction(image_bytes: bytes, options: dict) -> dic
     model = EXTERNAL_MODELS[model_key]
     boxes, scores, classes = detect(model, image, conf, 640, tile, overlap, 0.5, DEVICE)
 
-    class_map = {
-        "battery": "battery", "button": "switch", "buzzer": "buzzer",
-        "capacitor": "capacitor", "clock": "clock", "connector": "connector",
-        "diode": "diode", "display": "display", "fuse": "fuse",
-        "heatsink": "heatsink", "ic": "IC", "inductor": "inductor",
-        "led": "LED", "potentiometer": "potentiometer", "relay": "relay",
-        "resistor": "resistor", "switch": "switch", "transformer": "transformer",
-        "transistor": "transistor",
-    }
     # pads/pins are deliberately omitted from the component classifier output.
     assignments: dict[int, list[dict]] = {i: [] for i in range(len(bodies))}
     for i, class_id in enumerate(classes.tolist()):
         raw = model.names.get(int(class_id), str(class_id)) if isinstance(model.names, dict) else model.names[int(class_id)]
-        label = class_map.get(str(raw).strip().lower())
+        label = COMPONENT_CLASS_MAP.get(str(raw).strip().lower())
         if label is None or not bodies:
             continue
         pred = [float(v) for v in boxes[i]]

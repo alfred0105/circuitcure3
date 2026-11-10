@@ -11,6 +11,7 @@ from typing import Any
 import yaml
 
 from circuitcare.symptom_diagnosis.schemas import EvidenceStatus, Observation
+from circuitcare.component_taxonomy import normalize_component_class
 from circuitcare.symptom_diagnosis.functional_blocks import analyze_functional_blocks
 from circuitcare.symptom_diagnosis.component_fault_ranker import rank_component_candidates, rank_joint_candidates
 from circuitcare.symptom_diagnosis.fault_hypothesis_validator import (
@@ -186,9 +187,7 @@ def _condition_matches(condition: dict[str, Any], facts: dict[str, Any]) -> bool
 
 
 def _normalized_type(value: Any) -> str:
-    aliases = {"integrated_circuit": "ic", "IC": "ic", "LED": "led", "unknown_component": "unknown"}
-    text = str(value or "unknown").strip()
-    return aliases.get(text, text.casefold())
+    return normalize_component_class(value)
 
 
 def _normalize_observations(
@@ -346,7 +345,8 @@ def diagnose(
     known_component_ids = {str(part.get("component_id") or "") for part in normalized_parts}
     confirmed_ids = supplied_confirmed_ids & known_component_ids
     confirmed_parts = [part for part in normalized_parts
-                       if str(part.get("component_id") or "") in confirmed_ids]
+                       if str(part.get("component_id") or "") in confirmed_ids
+                       and part["component_type"] not in {"unknown", "not_component"}]
     unconfirmed_ids = [str(part.get("component_id")) for part in normalized_parts
                        if str(part.get("component_id") or "") not in confirmed_ids]
     normalized_parts = confirmed_parts

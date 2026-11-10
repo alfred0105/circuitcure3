@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any
 
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel, display_identity_status
+from circuitcare.component_taxonomy import COMPONENT_LABELS
 from circuitcare.frontend.measurement_state import get_measurements
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.dashboard.views.diagnosis_panel import render_diagnosis_panel
@@ -19,12 +20,7 @@ COMPONENT_EDIT_KEY = "circuitcare_v4_component_edits"
 COMPONENT_INVENTORY_KEY = "circuitcare_v4_component_inventory_by_map"
 ROLE_OPTIONS = ("power", "control", "control_input", "control_timing", "driver", "output",
                 "input", "input_output", "protection", "thermal", "buzzer", "relay")
-COMPONENT_TYPE_OPTIONS = (
-    "unknown", "resistor", "inductor", "capacitor", "connector", "jumper", "IC",
-    "switch", "relay", "transistor", "potentiometer", "battery", "buzzer", "diode",
-    "display", "emi_filter", "ferrite_bead", "fuse", "LED", "clock", "oscillator",
-    "voltage_regulator", "MOV", "transformer", "heatsink",
-)
+COMPONENT_TYPE_OPTIONS = COMPONENT_LABELS
 
 
 def _component_label(value: str) -> str:

@@ -8,14 +8,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-
-COMPONENT_LABELS = (
-    "battery", "switch", "buzzer", "capacitor", "clock", "connector", "diode",
-    "display", "emi_filter", "ferrite_bead", "fuse", "heatsink", "ic", "inductor",
-    "jumper", "led", "ldr", "mov", "oscillator", "potentiometer", "relay", "resistor",
-    "speaker", "thermistor", "transformer", "transistor", "voltage_regulator",
-)
-LABEL_ALIASES = {"integrated_circuit": "ic", "IC": "ic", "LED": "led", "MOV": "mov", "LDR": "ldr"}
+from circuitcare.component_taxonomy import COMPONENT_LABELS, normalize_component_class
 
 
 class EvidenceStatus(StrEnum):
@@ -82,8 +75,7 @@ class ComponentRecord:
 
     @property
     def normalized_label(self) -> str:
-        label = LABEL_ALIASES.get(self.label, self.label.casefold())
-        return label if label in COMPONENT_LABELS else "unknown"
+        return normalize_component_class(self.label)
 
     def to_dict(self) -> dict[str, Any]:
         return {**asdict(self), "normalized_label": self.normalized_label}

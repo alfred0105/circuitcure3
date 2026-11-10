@@ -14,9 +14,11 @@ from circuitcare.vision.box_reconciliation import (
     same_component_box_pair,
 )
 from circuitcare.vision.component_recognition_panel import (
-    INFERENCE_CONFIG, _review_fingerprint, duplicate_exclusion_enabled, invalidate_qwen_review,
-    review_aux_keys,
+    CLASS_OPTIONS, _legacy_secondary_scope, _migrate_legacy_review_state, _review_fingerprint,
+    _run_ai_review_workflow, duplicate_exclusion_enabled, invalidate_qwen_review, review_aux_keys,
+    review_keys, review_scope,
 )
+from circuitcare.component_taxonomy import COMPONENT_CLASSES, COMPONENT_LABELS, normalize_component_class
 
 
 def _png() -> bytes:
@@ -107,8 +109,80 @@ def test_silkscreen_reference_is_attached_as_class_hint_not_applied_as_fact():
     assert rows[0]["ocr_association_status"] == "ASSOCIATED"
 
 
-def test_secondary_tile_size_is_supported_by_locator():
-    assert INFERENCE_CONFIG["secondary_tile"] == 640
+def test_ai_review_runs_ocr_then_qwen_without_running_yolo(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import circuitcare.vision.component_recognition_panel as panel
+
+    calls = []
+    state = {}
+    rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
+             "신뢰도": .8, "x1": 2, "y1": 2, "x2": 20, "y2": 18}]
+    monkeypatch.setattr(panel, "_app_server", lambda: (_ for _ in ()).throw(AssertionError("YOLO called")))
+    def run_ocr(_image):
+        calls.append("ocr")
+        return {"records": []}
+
+    def run_qwen(*_args):
+        calls.append("qwen")
+        return {"class_reviews": [], "duplicate_reviews": [], "missed_component_candidates": [], "notes": []}
+
+    monkeypatch.setattr("circuitcare.vision.ocr_backend.run_local_ocr", run_ocr)
+    monkeypatch.setattr("circuitcare.vision.ai_review_service.review_components_with_qwen", run_qwen)
+    monkeypatch.setattr("circuitcare.local_llm.OllamaClient", lambda **_kwargs: object())
+    st_api = SimpleNamespace(session_state=state, spinner=lambda *_args, **_kwargs: nullcontext(), warning=lambda *_args: None)
+    _run_ai_review_workflow(st_api, image_bytes=_png(), scope="scope", rows=rows,
+                            records_key="records", ocr_key="ocr", qwen_key="qwen")
+    assert calls == ["ocr", "qwen"]
+    assert state["records"][0]["component_id"] == "r1"
+
+
+def test_shared_component_taxonomy_matches_detection_review_and_ui():
+    assert len(COMPONENT_CLASSES) == 18
+    assert set(CLASS_OPTIONS) == set(COMPONENT_LABELS)
+    assert normalize_component_class("IC") == "ic"
+    assert normalize_component_class("not-a-real-class") == "unknown"
+    assert normalize_component_class("not_component") == "not_component"
+
+
+def test_removing_second_pass_migrates_existing_reviewed_and_added_boxes():
+    image_bytes = _png()
+    old_scope = _legacy_secondary_scope(image_bytes, "project", "photo")
+    new_scope = review_scope(image_bytes, "project", "photo")
+    _old_result, old_records, _old_error = review_keys(old_scope)
+    _new_result, new_records, _new_error = review_keys(new_scope)
+    reviewed = {"component_id": "manual-old", "source": "manual", "user_edited": True,
+                "상태": "확인", "소자 종류": "capacitor", "x1": 1, "y1": 1, "x2": 8, "y2": 8}
+    added = {"component_id": "qwen-added", "source": "qwen_suggestion", "상태": "검수 필요",
+             "소자 종류": "unknown", "x1": 10, "y1": 10, "x2": 20, "y2": 20}
+    state = {old_records: [reviewed, added], new_records: [{**reviewed, "소자 종류": "resistor"}]}
+    _migrate_legacy_review_state(state, image_bytes, "project", "photo", new_scope)
+    assert {row["component_id"] for row in state[new_records]} == {"manual-old", "qwen-added"}
+    assert next(row for row in state[new_records] if row["component_id"] == "manual-old")["소자 종류"] == "capacitor"
+    assert old_records not in state
+
+
+def test_qwen_uncertain_class_is_preserved_as_unknown_and_ocr_conflict_downgrades(monkeypatch):
+    class TaxonomyClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            allowed = output_schema["properties"]["class_reviews"]["items"]["properties"]["proposed_class"]["enum"]
+            assert set(allowed) == set(COMPONENT_LABELS)
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [
+                    {"detection_id": "r1", "decision": "suggest", "proposed_class": "capacitor",
+                     "confidence": .8, "evidence": "Looks like a capacitor."},
+                    {"detection_id": "r2", "decision": "uncertain", "proposed_class": "resistor",
+                     "confidence": .4, "evidence": "Ambiguous body."},
+                ], "duplicate_reviews": [], "missed_component_candidates": [], "notes": [],
+            }}
+
+    result = review_components_with_qwen(TaxonomyClient(), "qwen3.5:9b", _png(), [
+        {"component_id": "r1", "class_name": "resistor", "bbox_xyxy": [2, 2, 24, 18],
+         "ocr_class_hints": ["resistor"], "reference_designators": ["R1"]},
+        {"component_id": "r2", "class_name": "unknown", "bbox_xyxy": [30, 2, 50, 18]},
+    ], [])
+    assert [(row["proposed_class"], row["decision"]) for row in result["class_reviews"]] == [
+        ("unknown", "uncertain"), ("unknown", "uncertain")]
 
 
 def test_containment_is_a_review_signal_but_small_true_component_is_not_suppressed():
