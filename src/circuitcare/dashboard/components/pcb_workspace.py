@@ -19,6 +19,7 @@ from circuitcare.frontend.workbench_state import SELECTION_KEY, update_selection
 from circuitcare.vision.image_loader import load_board_image
 
 SELECTED_MAP_KEY = "circuitcare_v4_selection_map_key"
+OVERLAPPING_SELECTION_KEY = "circuitcare_v4_overlapping_box_ids"
 
 
 def coordinate_status_for_viewer(*, api_available: bool, client_ready: bool,
@@ -45,13 +46,17 @@ def validate_component_selection_event(
     event_id = event.get("event_id")
     action = event.get("selection_action")
     component_id = event.get("component_id")
+    overlap_ids = event.get("overlapping_component_ids", [component_id] if component_id else [])
     if observed != expected:
         return False, "오래된 프로젝트 또는 이미지 프레임 이벤트"
     if type(sequence) is not int or sequence <= last_sequence:
         return False, "중복 또는 오래된 선택 이벤트"
     if not isinstance(event_id, str) or not event_id.strip():
         return False, "선택 이벤트 ID가 없습니다."
-    if action == "select" and component_id in allowed_ids:
+    if (action == "select" and component_id in allowed_ids
+            and isinstance(overlap_ids, list) and component_id in overlap_ids
+            and all(isinstance(item, str) for item in overlap_ids)
+            and set(overlap_ids) <= allowed_ids):
         return True, None
     if action == "clear" and component_id is None:
         return True, None
@@ -172,6 +177,12 @@ def render_component_viewer(
         st.session_state[last_id_key] = event.get("event_id")
         st.session_state[last_seq_key] = seq
         st.session_state[SELECTED_MAP_KEY] = map_cache_key
+        overlap_ids = event.get("overlapping_component_ids", [component_id])
+        overlap_key = f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"
+        if component_id is None:
+            st.session_state[overlap_key] = []
+        else:
+            st.session_state[overlap_key] = list(dict.fromkeys(overlap_ids))
         update_selection(st.session_state, project=project, selected_component=component_id)
 
     payload = [{

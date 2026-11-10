@@ -3,6 +3,9 @@ from circuitcare.dashboard.components.pcb_workspace import (
 )
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.frontend.component_overlay_models import display_identity_status
+from circuitcare.dashboard.views.unified_workspace import _exclude_selected_review_box
+from circuitcare.vision.box_reconciliation import board_visible_review_rows
+from circuitcare.vision.component_recognition_panel import _store_predictions
 
 
 def _model():
@@ -32,6 +35,9 @@ def test_click_and_clear_selection_events_are_scoped_and_monotonic():
     kwargs = dict(project_id="p1", board_id="b1", board_side="TOP", frame_id="frame1",
                   allowed_ids={"c1"}, last_sequence=0)
     assert validate_component_selection_event(event, **kwargs) == (True, None)
+    overlapping = {**event, "overlapping_component_ids": ["c1", "c2"]}
+    assert validate_component_selection_event(overlapping, **{**kwargs, "allowed_ids": {"c1", "c2"}}) == (True, None)
+    assert validate_component_selection_event(overlapping, **kwargs)[0] is False
     assert validate_component_selection_event({**event, "project_id": "other"}, **kwargs)[0] is False
     assert validate_component_selection_event({**event, "board_id": "other"}, **kwargs)[0] is False
     assert validate_component_selection_event({**event, "board_side": "BOTTOM"}, **kwargs)[0] is False
@@ -41,6 +47,26 @@ def test_click_and_clear_selection_events_are_scoped_and_monotonic():
     assert validate_component_selection_event({k: v for k, v in event.items() if k != "event_id"}, **kwargs)[0] is False
     clear = {**event, "component_id": None, "selection_action": "clear", "event_seq": 2}
     assert validate_component_selection_event(clear, **{**kwargs, "last_sequence": 1}) == (True, None)
+
+
+def test_selected_box_exclusion_hides_it_and_yolo_rerun_preserves_exclusion():
+    box = _model()
+    rows = []
+    excluded = _exclude_selected_review_box(rows, box)
+    assert excluded["상태"] == "제외"
+    assert excluded["user_edited"] is True
+    assert board_visible_review_rows(rows) == []
+
+    state = {"rows": rows}
+    _store_predictions(state, "rows", {"detections": [{
+        "class_name": "resistor", "confidence": .91, "bbox_xyxy": [11, 21, 31, 51],
+    }]})
+    assert state["rows"][0]["component_id"] == "c1"
+    assert state["rows"][0]["상태"] == "제외"
+    assert board_visible_review_rows(state["rows"]) == []
+
+    state["rows"][0]["상태"] = "검수 필요"
+    assert len(board_visible_review_rows(state["rows"])) == 1
 
 
 def test_hover_identity_status_is_user_facing_korean_and_unknown_is_preserved():

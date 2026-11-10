@@ -36,7 +36,7 @@ export default function(component) {
     const p = canvas.createSVGPoint(); p.x = clientX; p.y = clientY;
     return p.matrixTransform(canvas.getScreenCTM().inverse());
   };
-  const hitComponent = (event) => {
+  const hitComponents = (event) => {
     const p = point(event.clientX, event.clientY);
     const x = (p.x - state.x) / state.scale;
     const y = (p.y - state.y) / state.scale;
@@ -50,8 +50,9 @@ export default function(component) {
       const aArea = (a.bbox_xyxy[2] - a.bbox_xyxy[0]) * (a.bbox_xyxy[3] - a.bbox_xyxy[1]);
       const bArea = (b.bbox_xyxy[2] - b.bbox_xyxy[0]) * (b.bbox_xyxy[3] - b.bbox_xyxy[1]);
       return aArea - bArea || a.component_id.localeCompare(b.component_id);
-    })[0] || null;
+    });
   };
+  const hitComponent = (event) => hitComponents(event)[0] || null;
   const drawCamera = () => {
     camera.setAttribute("transform", `translate(${state.x} ${state.y}) scale(${state.scale})`);
     zoomLabel.textContent = `${Math.round(state.scale * 100)}%`;
@@ -69,12 +70,13 @@ export default function(component) {
     state.y = p.y - (p.y - state.y) * ratio;
     state.scale = scale; state.userAdjusted = true; drawCamera();
   };
-  const sendSelection = (componentId, action = null, bbox = null) => {
+  const sendSelection = (componentId, action = null, bbox = null, overlapIds = null) => {
     state.sequence += 1;
     state.setStateValue("selection", {
       project_id:state.data.project_id, board_id:state.data.board_id, board_side:state.data.board_side,
       component_id:componentId, canonical_frame_id:state.data.frame_id,
       selection_action:action || (componentId ? "select" : "clear"), bbox_xyxy:bbox, event_seq:state.sequence,
+      overlapping_component_ids:overlapIds || (componentId ? [componentId] : []),
       event_id:`${Date.now()}-${state.sequence}`,
     });
   };
@@ -224,8 +226,8 @@ export default function(component) {
       if (!drag || drag.id!==event.pointerId) return;
       state.drag=null;
       if (!drag.moved) {
-        const hit=hitComponent(event);
-        sendSelection(hit?.component_id || null);
+        const hits=hitComponents(event);
+        sendSelection(hits[0]?.component_id || null, null, null, hits.map((item)=>item.component_id));
       }
       viewport.dataset.dragging="false";
       try { if(viewport.hasPointerCapture(event.pointerId))viewport.releasePointerCapture(event.pointerId); } catch (_) { /* already released */ }

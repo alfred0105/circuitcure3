@@ -34,7 +34,7 @@ from circuitcare.frontend.component_map_adapter import (
 )
 from circuitcare.frontend.photo_adapter import adapt_component_map_input
 from circuitcare.dashboard.components.pcb_workspace import (
-    SELECTED_MAP_KEY, render_component_viewer, scale_overlay_to_display,
+    OVERLAPPING_SELECTION_KEY, SELECTED_MAP_KEY, render_component_viewer, scale_overlay_to_display,
 )
 from circuitcare.dashboard.views.inspection_panel import (
     COMPONENT_EDIT_KEY, MAP_VERSION_KEY, render_inspection_panel,
@@ -45,7 +45,7 @@ from circuitcare.vision.component_recognition_panel import (
     ensure_component_detection, render_component_recognition_panel,
     review_keys, review_scope as component_review_scope,
 )
-from circuitcare.vision.box_reconciliation import board_visible_review_rows
+from circuitcare.vision.box_reconciliation import board_visible_review_rows, exclude_review_row
 from circuitcare.frontend.state import (
     INTAKE_IMAGES_KEY, INTAKE_PROJECT_KEY, clear_intake_draft,
     reset_intake_for_new_project,
@@ -403,6 +403,10 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             overlay_source=row.get("source", "yolo"),
         ) for index, row in visible_review_rows)
         component_models = tuple(component_models) + auto_models
+        excluded_component_ids = {str(row.get("component_id")) for row in review_rows
+                                  if row.get("상태") == "제외" and row.get("component_id")}
+        component_models = tuple(item for item in component_models
+                                 if item.component_id not in excluded_component_ids)
         st.session_state["circuitcare_v4_selected_marking_context"] = None
     else:
         review_scope = None
@@ -541,6 +545,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         map_cache_key=cache_key, image_mode=mode,
         on_box_draw=add_manual_box if mode == "원본 사진" and detector_image_bytes is not None else None,
     )
+    st.session_state["cc_active_component_overlap_key"] = f"{OVERLAPPING_SELECTION_KEY}_{_viewer_key}"
     if candidate_state:
         st.caption("진단 색상 · 노랑: 검사 후보 · 빨강: 해당 가설 측정 이상 · 초록: 해당 검사 정상 · 회색: 판정 불가. "
                    "초록은 소자 전체의 정상 판정을 뜻하지 않습니다.")
@@ -587,6 +592,64 @@ def _photo_label(record: Any, number: int) -> str:
         "marking_detail": "부품 표기", "unknown": "미지정",
     }[record.capture_type]
     return f"사진 {number} · {role}"
+
+
+def _exclude_selected_review_box(rows: list[dict[str, Any]], target: ComponentOverlayViewModel) -> dict[str, Any]:
+    """Persist an excluded visible box through the existing component review record."""
+    row = next((item for item in rows if str(item.get("component_id")) == target.component_id), None)
+    if row is None:
+        x1, y1, x2, y2 = target.bbox_xyxy
+        row = {"component_id": target.component_id, "소자 종류": target.component_type,
+               "상태": "검수 필요", "신뢰도": float(target.detection_confidence or 0.0),
+               "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
+               "source": target.overlay_source or "component_map"}
+        rows.append(row)
+    exclude_review_row(row, reason="user_box_exclusion")
+    return row
+
+
+def _render_selected_box_actions(st: Any, project: ProjectContext,
+                                 components: tuple[ComponentOverlayViewModel, ...]) -> None:
+    """Expose direct box exclusion and overlap selection at the top of inspection."""
+    selection = st.session_state.get(SELECTION_KEY)
+    selected_id = getattr(selection, "selected_component", None)
+    overlap_key = st.session_state.get("cc_active_component_overlap_key")
+    overlap_ids = st.session_state.get(overlap_key, []) if overlap_key else []
+    by_id = {item.component_id: item for item in components}
+    hits = [component_id for component_id in overlap_ids if component_id in by_id]
+    if selected_id in by_id and selected_id not in hits:
+        hits.insert(0, selected_id)
+
+    if len(hits) > 1:
+        labels = {
+            f"{component_id} · {by_id[component_id].component_type} · "
+            f"{(by_id[component_id].bbox_xyxy[2] - by_id[component_id].bbox_xyxy[0]) * (by_id[component_id].bbox_xyxy[3] - by_id[component_id].bbox_xyxy[1]):.0f}px²": component_id
+            for component_id in hits
+        }
+        label_by_id = {component_id: label for label, component_id in labels.items()}
+        current = selected_id if selected_id in hits else hits[0]
+        choice = st.selectbox("겹친 박스 선택", list(labels),
+                              index=list(labels).index(label_by_id[current]),
+                              key=f"cc_box_overlap_select_{st.session_state.get('cc_active_component_review_scope', 'none')}")
+        chosen_id = labels[choice]
+        if chosen_id != selected_id:
+            update_selection(st.session_state, project=project, selected_component=chosen_id)
+            st.rerun()
+
+    target = by_id.get(selected_id)
+    review_scope = st.session_state.get("cc_active_component_review_scope")
+    if target is None or not review_scope:
+        return
+    if not st.button("박스 제외", key=f"cc_selected_box_exclude_{selected_id}", use_container_width=True):
+        return
+    _result_key, records_key, _error_key = review_keys(review_scope)
+    rows = list(st.session_state.get(records_key, []))
+    _exclude_selected_review_box(rows, target)
+    st.session_state[records_key] = rows
+    from circuitcare.vision.component_recognition_panel import invalidate_qwen_review
+    invalidate_qwen_review(st.session_state, review_scope)
+    update_selection(st.session_state, project=project, selected_component=None)
+    st.rerun()
 
 
 def render_workbench_shell(st: Any, project: ProjectContext) -> None:
@@ -640,6 +703,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
             selection = st.session_state.get(SELECTION_KEY)
             selected_id = getattr(selection, "selected_component", None)
             selected_component = next((item for item in current_components if item.component_id == selected_id), None)
+            _render_selected_box_actions(st, project, current_components)
             render_inspection_panel(
                 st, project, preview=preview, components=current_components,
                 selected_component=selected_component,
