@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 
 from PIL import Image
 
 from circuitcare.local_llm import OllamaClient
 from circuitcare.vision.ai_review_service import review_components_with_qwen
 from circuitcare.vision.box_reconciliation import associate_ocr_with_components
+from circuitcare.vision.box_reconciliation import boxes_overlap_candidate, preserve_review_rows
+from circuitcare.vision.component_recognition_panel import (
+    INFERENCE_CONFIG, _review_fingerprint, duplicate_exclusion_enabled, invalidate_qwen_review,
+    review_aux_keys,
+)
 
 
 def _png() -> bytes:
@@ -57,9 +63,9 @@ def test_qwen_review_validates_detection_ids_and_unverified_boxes():
                      "evidence": "Invalid id."},
                 ],
                 "missed_component_candidates": [
-                    {"bbox_norm_999": [600, 400, 800, 700], "proposed_class": "capacitor",
+                    {"image_index": 0, "bbox_norm_999": [600, 400, 800, 700], "proposed_class": "capacitor",
                      "confidence": .66, "evidence": "Visible unboxed body."},
-                    {"bbox_norm_999": [300, 300, 300, 400], "proposed_class": "resistor",
+                    {"image_index": 0, "bbox_norm_999": [300, 300, 300, 400], "proposed_class": "resistor",
                      "confidence": .9, "evidence": "Degenerate box."},
                 ],
                 "notes": ["Review each suggestion manually."],
@@ -93,5 +99,85 @@ def test_silkscreen_reference_is_attached_as_class_hint_not_applied_as_fact():
     )
     assert rows[0]["ocr_candidates"] == ["C12"]
     assert rows[0]["ocr_class_hints"] == ["capacitor"]
+    assert rows[0]["reference_designators"] == ["C12"]
     assert rows[0]["class_name"] == "resistor"
     assert rows[0]["ocr_association_status"] == "ASSOCIATED"
+
+
+def test_secondary_tile_size_is_supported_by_locator():
+    assert INFERENCE_CONFIG["secondary_tile"] == 640
+
+
+def test_contained_small_qwen_candidate_is_filtered_as_duplicate():
+    assert boxes_overlap_candidate([45, 45, 55, 55], [0, 0, 100, 100])
+
+
+def test_user_edited_yolo_box_and_class_survive_rerun():
+    rows = preserve_review_rows([
+        {"component_id": "yolo-1", "소자 종류": "capacitor", "상태": "검수 필요",
+         "x1": 12, "y1": 12, "x2": 48, "y2": 48, "user_edited": True},
+    ], [{"class_name": "resistor", "confidence": .9, "bbox_xyxy": [10, 10, 50, 50]}])
+    assert rows[0]["component_id"] == "yolo-1"
+    assert rows[0]["소자 종류"] == "capacitor"
+    assert rows[0]["x1"] == 12
+
+
+def test_qwen_still_checks_full_photo_when_yolo_has_no_boxes():
+    class EmptyClient:
+        def __init__(self):
+            self.called = False
+
+        def chat_json(self, _model, messages, *, output_schema, images):
+            self.called = True
+            payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
+            assert payload["detector_proposals"] == []
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [],
+                "missed_component_candidates": [{
+                    "image_index": 0, "bbox_norm_999": [200, 200, 600, 600],
+                    "proposed_class": "IC", "confidence": .7, "evidence": "Visible IC body.",
+                }], "notes": [],
+            }}
+
+    client = EmptyClient()
+    result = review_components_with_qwen(client, "qwen3.5:9b", _png(), [], [])
+    assert client.called
+    assert len(result["missed_component_candidates"]) == 1
+
+
+def test_qwen_receives_overlapping_native_resolution_tiles_and_maps_tile_box():
+    class TileClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            assert len(images) > 1
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [],
+                "missed_component_candidates": [{
+                    "image_index": 1, "bbox_norm_999": [100, 100, 300, 300],
+                    "proposed_class": "capacitor", "confidence": .7, "evidence": "Small part in tile.",
+                }], "notes": [],
+            }}
+
+    output = io.BytesIO()
+    Image.new("RGB", (1800, 700), "white").save(output, format="PNG")
+    result = review_components_with_qwen(TileClient(), "qwen3.5:9b", output.getvalue(), [], [])
+    assert result["review_tiles"] == 2
+    candidate = result["missed_component_candidates"][0]["bbox_xyxy"]
+    assert candidate[0] > 0 and candidate[2] > candidate[0]
+
+
+def test_cached_qwen_review_is_invalidated_when_source_box_changes():
+    rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
+             "x1": 1, "y1": 1, "x2": 10, "y2": 10}]
+    before = _review_fingerprint(rows, None)
+    rows[0]["x1"] = 3
+    assert _review_fingerprint(rows, None) != before
+    _ocr_key, qwen_key = review_aux_keys("scope")
+    session_state = {qwen_key: {"class_reviews": ["stale"]}}
+    invalidate_qwen_review(session_state, "scope")
+    assert qwen_key not in session_state
+
+
+def test_qwen_duplicate_exclusion_is_only_enabled_for_confident_same_component():
+    assert duplicate_exclusion_enabled({"decision": "same_component", "confidence": .7})
+    assert not duplicate_exclusion_enabled({"decision": "different_components", "confidence": .99})
+    assert not duplicate_exclusion_enabled({"decision": "same_component", "confidence": .5})

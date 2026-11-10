@@ -382,7 +382,8 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             detection_confidence=float(row.get("신뢰도", 0.0)),
             identification_status="USER_CONFIRMED" if row.get("상태") == "확인" else "SUGGESTED_CLASS_ONLY",
             identity_match_status=None,
-            ocr_marking=(row.get("ocr_candidates") or [None])[0],
+            # Nearby board silkscreen is reference text, not a marking on the body.
+            ocr_marking=row.get("body_marking"),
             possible_part_number=None,
             evidence=("Qwen 미확인 박스 제안" if row.get("source") == "qwen_suggestion"
                       else "YOLO 저신뢰 2차 탐색 후보" if row.get("source") == "yolo_second_pass"
@@ -396,6 +397,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             ocr_status=row.get("ocr_association_status"),
             ocr_candidates=tuple(row.get("ocr_candidates", [])),
             ocr_class_hints=tuple(row.get("ocr_class_hints", [])),
+            reference_designators=tuple(row.get("reference_designators", [])),
             overlay_source=row.get("source", "yolo"),
         ) for index, row in enumerate(review_rows))
         component_models = tuple(component_models) + auto_models
@@ -522,6 +524,8 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         rows.append({"component_id": manual_id, "소자 종류": "unknown", "상태": "검수 필요", "신뢰도": 0.0,
                      "x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3], "source": "manual"})
         st.session_state[records_key] = rows
+        from circuitcare.vision.component_recognition_panel import invalidate_qwen_review
+        invalidate_qwen_review(st.session_state, review_scope)
         update_selection(st.session_state, project=project,
                          selected_component=manual_id)
 

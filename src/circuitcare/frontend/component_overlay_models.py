@@ -48,6 +48,7 @@ class ComponentOverlayViewModel:
     part_identity_status: str = "UNCONFIRMED"
     overlay_source: str | None = None
     ocr_class_hints: tuple[str, ...] = ()
+    reference_designators: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

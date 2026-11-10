@@ -5,6 +5,7 @@ import hashlib
 import json
 import importlib.util
 import io
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,9 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from circuitcare.vision.box_reconciliation import associate_ocr_with_components, preserve_review_rows
+from circuitcare.vision.box_reconciliation import (
+    associate_ocr_with_components, boxes_overlap_candidate, preserve_review_rows,
+)
 
 APP_DIR = Path(__file__).resolve().parents[3] / "apps" / "pcb-component-recognition"
 MODULE_NAME = "circuitcare_pcb_component_app_server"
@@ -28,14 +31,16 @@ AUTO_CLASS_OPTIONS = ["unknown", "resistor", "capacitor", "IC", "diode", "LED", 
                       "fuse", "transformer", "clock", "heatsink", "potentiometer"]
 INFERENCE_CONFIG = {"model_pipeline": "yolo26s+doctor-v12n+arshia-yolov8s", "conf": 0.20,
                     "tile": 1024, "overlap": 0.25, "postprocess": "one-to-one-v2",
-                    "secondary_conf": 0.08, "secondary_tile": 768, "secondary_overlap": 0.25,
+                    "secondary_conf": 0.08, "secondary_tile": 640, "secondary_overlap": 0.25,
                     "ocr_engine": "rapidocr-v1", "review_model": "qwen3.5:9b"}
 
 
 def _model_cache_fingerprint() -> str:
-    specs = ((APP_DIR / "weights" / "any_best.pt"),
-             (APP_DIR / "weights" / "external" / "pcb-ai-doctor" / "best_v12n.pt"),
-             (APP_DIR / "weights" / "external" / "pcb-yolov8s-detection" / "best.pt"))
+    configured_root = os.environ.get("CIRCUITCARE_PCB_WEIGHTS")
+    root = Path(configured_root).expanduser() if configured_root else APP_DIR / "weights"
+    specs = ((root / "any_best.pt"),
+             (root / "external" / "pcb-ai-doctor" / "best_v12n.pt"),
+             (root / "external" / "pcb-yolov8s-detection" / "best.pt"))
     parts = []
     for path in specs:
         try:
@@ -60,6 +65,31 @@ def review_keys(scope: str) -> tuple[str, str, str]:
 
 def review_aux_keys(scope: str) -> tuple[str, str]:
     return f"cc_component_ocr_{scope}", f"cc_component_qwen_review_{scope}"
+
+
+def invalidate_qwen_review(state: Any, scope: str) -> None:
+    """Drop suggestions whenever their detection/OCR evidence changes."""
+    _ocr_key, qwen_key = review_aux_keys(scope)
+    state.pop(qwen_key, None)
+
+
+def _review_fingerprint(rows: list[dict], ocr_result: dict | None) -> str:
+    snapshot = [{key: row.get(key) for key in (
+        "component_id", "소자 종류", "상태", "x1", "y1", "x2", "y2", "신뢰도",
+        "ocr_candidates", "reference_designators", "ocr_class_hints",
+    )} for row in rows]
+    payload = json.dumps({"rows": snapshot, "ocr": (ocr_result or {}).get("records", [])},
+                         ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def duplicate_exclusion_enabled(proposal: dict) -> bool:
+    """Only expose a delete choice for a confident same-component suggestion."""
+    try:
+        confidence = float(proposal.get("confidence", 0))
+    except (TypeError, ValueError):
+        return False
+    return proposal.get("decision") == "same_component" and confidence >= 0.65
 
 
 @st.cache_resource(show_spinner=False)
@@ -175,9 +205,86 @@ def render_selected_component_editor(st_api: Any, *, image_bytes: bytes, scope: 
             st_api.error("박스는 가로·세로 각각 4px 이상이어야 합니다.")
             return
         rows[index].update({"소자 종류": label, "상태": status,
-                            "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+                            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                            "user_edited": True})
         st_api.session_state[records_key] = rows
+        invalidate_qwen_review(st_api.session_state, scope)
         st_api.rerun()
+
+
+def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows: list[dict],
+                            result_key: str, records_key: str, ocr_key: str, qwen_key: str) -> None:
+    """Run optional low-confidence YOLO, OCR, and Qwen review as one user action."""
+    from circuitcare.vision.box_reconciliation import boxes_overlap_candidate
+
+    invalidate_qwen_review(st_api.session_state, scope)
+    try:
+        with st_api.spinner("YOLO 저신뢰 2차 탐색 중…"):
+            engine = _app_server()
+            engine.load_component_locator()
+            second_pass = engine.run_prediction(image_bytes, {
+                "conf": INFERENCE_CONFIG["secondary_conf"],
+                "tile": INFERENCE_CONFIG["secondary_tile"],
+                "overlap": INFERENCE_CONFIG["secondary_overlap"],
+            })
+        additions = 0
+        for proposal in second_pass.get("detections", []):
+            box = proposal.get("bbox_xyxy")
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+            if any(boxes_overlap_candidate(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) for row in rows):
+                continue
+            digest = hashlib.sha256(repr(tuple(round(float(value), 1) for value in box)).encode()).hexdigest()[:16]
+            component_id = f"yolo2-{digest}"
+            if any(row.get("component_id") == component_id for row in rows):
+                continue
+            candidate = _record(proposal.get("class_name", "unknown"), box,
+                confidence=proposal.get("confidence", 0.0), component_id=component_id,
+                location_confidence=proposal.get("location_confidence", proposal.get("body_confidence")),
+                type_confidence=proposal.get("type_confidence"), match_score=proposal.get("match_score"))
+            candidate.update({"source": "yolo_second_pass", "상태": "검수 필요"})
+            rows.append(candidate)
+            additions += 1
+        st_api.session_state[result_key]["secondary_detection_count"] = len(second_pass.get("detections", []))
+        st_api.session_state[result_key]["secondary_candidate_added"] = additions
+    except Exception as exc:
+        st_api.warning(f"YOLO 2차 탐색 실패 · {exc}")
+
+    ocr_result = st_api.session_state.get(ocr_key)
+    try:
+        from PIL import Image
+        from circuitcare.vision.ocr_backend import run_local_ocr
+
+        with st_api.spinner("PCB 실크스크린 OCR 중…"):
+            with Image.open(io.BytesIO(image_bytes)) as source_image:
+                ocr_result = run_local_ocr(source_image.convert("RGB"))
+        st_api.session_state[ocr_key] = ocr_result
+        associated = associate_ocr_with_components([
+            {**row, "bbox_xyxy": [row["x1"], row["y1"], row["x2"], row["y2"]]}
+            for row in rows
+        ], ocr_result.get("records", []))
+        for row, evidence in zip(rows, associated):
+            for key in ("ocr_records", "ocr_candidates", "reference_designators", "ocr_class_hints", "ocr_association_status"):
+                row[key] = evidence.get(key)
+    except Exception as exc:
+        st_api.warning(f"OCR를 실행하지 못했습니다 · {exc} · 기존 검수 결과는 유지됩니다.")
+
+    st_api.session_state[records_key] = rows
+    try:
+        from circuitcare.local_llm import OllamaClient
+        from circuitcare.vision.ai_review_service import DEFAULT_REVIEW_MODEL, review_components_with_qwen
+
+        live_rows = [row for row in rows if row.get("상태") != "제외"]
+        detections = [{"component_id": row["component_id"], "class_name": row.get("소자 종류", "unknown"),
+                       "confidence": row.get("신뢰도"), "bbox_xyxy": [row["x1"], row["y1"], row["x2"], row["y2"]],
+                       "ocr_candidates": row.get("ocr_candidates", [])} for row in live_rows]
+        with st_api.spinner("Qwen3.5 9B로 소자 종류·중복·미탐지 후보 검수 중…"):
+            review = review_components_with_qwen(OllamaClient(timeout_seconds=300), DEFAULT_REVIEW_MODEL,
+                image_bytes, detections, (ocr_result or {}).get("records", []))
+        review["source_fingerprint"] = _review_fingerprint(rows, ocr_result)
+        st_api.session_state[qwen_key] = review
+    except Exception as exc:
+        st_api.warning(f"Qwen 검수 제안을 만들지 못했습니다 · {exc} · 탐지와 사용자 검수 기록은 보존됩니다.")
 
 
 def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, project_id: str,
@@ -201,6 +308,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
             return
     st_api.caption("이미지 위의 ‘박스 그리기’를 눌러 드래그하세요. 박스를 선택하면 오른쪽에서 종류·상태·위치를 수정할 수 있습니다.")
     if st_api.button("선택 사진 다시 탐지", key=f"cc_component_run_{scope}"):
+        invalidate_qwen_review(st_api.session_state, scope)
         st_api.session_state.pop(result_key, None)
         st_api.session_state.pop(error_key, None)
         st_api.rerun()
@@ -209,12 +317,14 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
     result = st_api.session_state[result_key]
 
     ocr_key, qwen_key = review_aux_keys(scope)
-    with st_api.expander("OCR · Qwen AI 재검토", expanded=False):
+    if st_api.button("AI 소자 검수", key=f"cc_component_ai_review_{scope}", type="primary"):
+        _run_ai_review_workflow(st_api, image_bytes=image_bytes, scope=scope, rows=rows,
+            result_key=result_key, records_key=records_key, ocr_key=ocr_key, qwen_key=qwen_key)
+        st_api.rerun()
+    with st_api.expander("개별 실행 · 고급", expanded=False):
         st_api.caption("OCR와 Qwen 결과는 제안으로만 저장합니다. 소자 종류 수정·박스 추가·중복 제외는 사용자가 선택해야 합니다.")
         if st_api.button("YOLO 저신뢰 보조 탐색", key=f"cc_component_second_pass_{scope}"):
             try:
-                from circuitcare.vision.box_reconciliation import box_iou
-
                 with st_api.spinner("낮은 confidence와 작은 타일로 추가 후보를 탐색하고 있습니다…"):
                     engine = _app_server()
                     engine.load_component_locator()
@@ -228,7 +338,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     box = proposal.get("bbox_xyxy")
                     if not isinstance(box, (list, tuple)) or len(box) != 4:
                         continue
-                    if any(box_iou(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) >= 0.30 for row in rows):
+                    if any(boxes_overlap_candidate(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) for row in rows):
                         continue
                     digest = hashlib.sha256(repr(tuple(round(float(value), 1) for value in box)).encode()).hexdigest()[:16]
                     component_id = f"yolo2-{digest}"
@@ -244,6 +354,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     rows.append(candidate)
                     additions += 1
                 st_api.session_state[records_key] = rows
+                invalidate_qwen_review(st_api.session_state, scope)
                 st_api.session_state[result_key]["secondary_detection_count"] = len(second_pass.get("detections", []))
                 st_api.session_state[result_key]["secondary_candidate_added"] = additions
                 st_api.rerun()
@@ -265,9 +376,10 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     for row in rows
                 ], ocr_result.get("records", []))
                 for old_row, evidence in zip(rows, associated):
-                    for key in ("ocr_records", "ocr_candidates", "ocr_class_hints", "ocr_association_status"):
+                    for key in ("ocr_records", "ocr_candidates", "reference_designators", "ocr_class_hints", "ocr_association_status"):
                         old_row[key] = evidence.get(key)
                 st_api.session_state[records_key] = rows
+                invalidate_qwen_review(st_api.session_state, scope)
                 st_api.rerun()
             except Exception as exc:
                 from circuitcare.vision.ocr_backend import OCRUnavailable
@@ -292,8 +404,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
             else:
                 st_api.info("OCR 문자 후보가 없습니다. 탐지 결과는 그대로 유지됩니다.")
 
-        if st_api.button("Qwen3.5 9B로 검수 제안 생성", key=f"cc_component_run_qwen_{scope}",
-                         disabled=not rows):
+        if st_api.button("Qwen3.5 9B로 검수 제안 생성", key=f"cc_component_run_qwen_{scope}"):
             try:
                 from circuitcare.local_llm import OllamaClient
                 from circuitcare.vision.ai_review_service import DEFAULT_REVIEW_MODEL, review_components_with_qwen
@@ -309,13 +420,17 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         OllamaClient(timeout_seconds=300), DEFAULT_REVIEW_MODEL, image_bytes,
                         qwen_detections, (ocr_result or {}).get("records", []),
                     )
+                review["source_fingerprint"] = _review_fingerprint(rows, ocr_result)
                 st_api.session_state[qwen_key] = review
             except Exception as exc:
                 st_api.warning(f"Qwen 검수 제안을 만들지 못했습니다 · {exc} · YOLO 박스와 사용자 검수 기록은 보존됩니다.")
 
         qwen_review = st_api.session_state.get(qwen_key)
+        if isinstance(qwen_review, dict) and qwen_review.get("source_fingerprint") != _review_fingerprint(rows, ocr_result):
+            invalidate_qwen_review(st_api.session_state, scope)
+            qwen_review = None
         if isinstance(qwen_review, dict):
-            st_api.caption(f"제안 모델 · {qwen_review.get('model', 'Qwen3.5 9B')} · 상태 {qwen_review.get('verification_status', 'AI_SUGGESTIONS_ONLY')} · 모든 제안은 미확인")
+            st_api.caption(f"제안 모델 · {qwen_review.get('model', 'Qwen3.5 9B')} · 상태 {qwen_review.get('verification_status', 'AI_SUGGESTIONS_ONLY')} · 1024px 고해상도 타일 {qwen_review.get('review_tiles', 0)}개 확인 · 모든 제안은 미확인")
             by_id = {str(row.get("component_id")): row for row in rows}
             for index, proposal in enumerate(qwen_review.get("class_reviews", [])):
                 target = by_id.get(proposal.get("detection_id"))
@@ -335,6 +450,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         target["user_edited"] = True
                         target["ai_review"] = proposal
                         st_api.session_state[records_key] = rows
+                        invalidate_qwen_review(st_api.session_state, scope)
                         st_api.rerun()
             for index, proposal in enumerate(qwen_review.get("duplicate_reviews", [])):
                 ids = proposal.get("detection_ids", [])
@@ -342,9 +458,14 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     continue
                 st_api.markdown(f"**중복 검토 · {ids[0]} / {ids[1]} · {proposal['decision']} · 아직 미확인**")
                 st_api.caption(proposal.get("evidence") or "시각 근거 없음")
+                can_exclude = duplicate_exclusion_enabled(proposal)
+                choices = [*ids, "둘 다 유지"] if can_exclude else ["둘 다 유지"]
+                choice_key = f"cc_qwen_duplicate_choice_{scope}_{index}_{hashlib.sha256('|'.join(ids).encode()).hexdigest()[:8]}"
+                if st_api.session_state.get(choice_key) not in choices:
+                    st_api.session_state[choice_key] = "둘 다 유지"
                 keep_id = st_api.radio(
-                    "중복 제안 선택", [*ids, "둘 다 유지"], horizontal=True,
-                    key=f"cc_qwen_duplicate_choice_{scope}_{index}",
+                    "중복 제안 선택", choices, index=len(choices) - 1, horizontal=True,
+                    key=choice_key,
                 )
                 if st_api.button("선택 결과 저장", key=f"cc_qwen_duplicate_apply_{scope}_{index}"):
                     if keep_id in ids:
@@ -356,6 +477,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         for target_id in ids:
                             by_id[target_id]["ai_review"] = proposal
                     st_api.session_state[records_key] = rows
+                    invalidate_qwen_review(st_api.session_state, scope)
                     st_api.rerun()
             for index, proposal in enumerate(qwen_review.get("missed_component_candidates", [])):
                 box = proposal.get("bbox_xyxy")
@@ -364,9 +486,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 st_api.markdown(f"**미탐지 후보 · {proposal['proposed_class']} · 점수 {proposal['confidence']:.2f} · 검수 필요**")
                 st_api.caption(proposal.get("evidence") or "Qwen 위치 후보 · YOLO 확인 필요")
                 if st_api.button("미확인 후보 박스로 추가", key=f"cc_qwen_missing_apply_{scope}_{index}"):
-                    from circuitcare.vision.box_reconciliation import box_iou
-
-                    if any(box_iou(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) >= 0.30 for row in rows):
+                    if any(boxes_overlap_candidate(box, [row["x1"], row["y1"], row["x2"], row["y2"]]) for row in rows):
                         st_api.warning("기존 박스와 겹칩니다. 중복 여부를 먼저 확인하세요.")
                     else:
                         candidate = _record(
@@ -379,6 +499,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                                           "qwen_review_id": f"{scope}:{index}"})
                         rows.append(candidate)
                         st_api.session_state[records_key] = rows
+                        invalidate_qwen_review(st_api.session_state, scope)
                         st_api.rerun()
             for note in qwen_review.get("notes", []):
                 st_api.caption(f"Qwen 관찰 · {note}")

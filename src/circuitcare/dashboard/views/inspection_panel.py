@@ -230,6 +230,10 @@ def render_inspection_panel(
                     st.rerun()
             if current_marking or current_value:
                 st.caption(f"자동 판독 상태 · {display_identity_status(selected_component.identification_status)}")
+            if selected_component.reference_designators:
+                st.caption("주변 실크스크린 Reference 후보 · " + " · ".join(selected_component.reference_designators))
+            if selected_component.ocr_marking:
+                st.caption("소자 본체 각인 후보 · " + selected_component.ocr_marking)
             if selected_marking_context and selected_component.component_id.startswith("auto-"):
                 _render_selected_marking(st, selected_marking_context)
             if selected_component.identity_match_status:

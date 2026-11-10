@@ -10,7 +10,7 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 from circuitcare.local_llm import OllamaClient
-from circuitcare.vision.box_reconciliation import box_iou
+from circuitcare.vision.box_reconciliation import boxes_overlap_candidate
 
 DEFAULT_REVIEW_MODEL = "qwen3.5:9b"
 REVIEW_CLASSES = (
@@ -36,23 +36,24 @@ REVIEW_SCHEMA = {
             "evidence": {"type": "string"},
         }, "required": ["detection_ids", "decision", "confidence", "evidence"], "additionalProperties": False}},
         "missed_component_candidates": {"type": "array", "items": {"type": "object", "properties": {
+            "image_index": {"type": "integer", "minimum": 0, "maximum": 32},
             "bbox_norm_999": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 999}, "minItems": 4, "maxItems": 4},
             "proposed_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
-        }, "required": ["bbox_norm_999", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
+        }, "required": ["image_index", "bbox_norm_999", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
         "notes": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["class_reviews", "duplicate_reviews", "missed_component_candidates", "notes"],
     "additionalProperties": False,
 }
 
-_SYSTEM = """You review a PCB photo and its YOLO component proposals. Be conservative: only suggest a class when the physical component appearance is clear. Small SMD parts are often visually ambiguous. Use OCR strings only as nearby text evidence; a reference such as C12 may not label the closest body. Do not claim certainty. Do not invent unseen parts. Existing boxes are identified by IDs; propose duplicates only when they cover the same physical body. Search for at most a few clearly visible missed components. Every proposed box is only a rough review candidate and must be manually checked. Return only the requested JSON object."""
+_SYSTEM = """You review a PCB photo and its YOLO component proposals. Be conservative: only suggest a class when the physical component appearance is clear. Small SMD parts are often visually ambiguous. Use OCR strings only as nearby text evidence; a reference such as C12 may not label the closest body. Do not claim certainty. Do not invent unseen parts. Existing boxes are identified by IDs; propose duplicates only when they cover the same physical body. Search for at most a few clearly visible missed components, including when there are no detector proposals. Every proposed box is only a rough review candidate and must be manually checked. Each supplied image has an image_index from image_sources; missed boxes must be normalized relative to the image they cite. Return only the requested JSON object."""
 
 
 def _review_images(
     image_bytes: bytes, detections: list[dict[str, Any]], *, max_crop_count: int = 10,
-) -> tuple[list[bytes], tuple[int, int]]:
+) -> tuple[list[bytes], tuple[int, int], list[dict[str, Any]]]:
     with Image.open(io.BytesIO(image_bytes)) as source_image:
         image = source_image.convert("RGB")
     width, height = image.size
@@ -72,6 +73,7 @@ def _review_images(
         painter.rectangle((x1, y1, x2, y2), outline=color, width=3)
         painter.text((x1 + 2, max(0, y1 - 14)), detection_id, fill="white", stroke_width=2, stroke_fill="black")
     images = [guide]
+    manifest = [{"image_index": 0, "kind": "annotated_full_image", "bbox_xyxy": [0, 0, width, height]}]
     for row in ordered:
         box = row.get("bbox_xyxy")
         if not isinstance(box, (list, tuple)) or len(box) != 4:
@@ -82,12 +84,42 @@ def _review_images(
                            min(width, int(x2 + pad_x)), min(height, int(y2 + pad_y))))
         crop.thumbnail((720, 720), Image.Resampling.LANCZOS)
         images.append(crop)
+        manifest.append({"image_index": len(images) - 1, "kind": "detection_crop",
+                         "detection_id": str(row["detection_id"]),
+                         "bbox_xyxy": [max(0.0, x1 - pad_x), max(0.0, y1 - pad_y),
+                                       min(float(width), x2 + pad_x), min(float(height), y2 + pad_y)]})
+
+    # Add overlapping native-resolution views so small parts remain visible to Qwen.
+    tile_size, overlap, max_tiles = 1024, 0.25, 16
+    if width > tile_size or height > tile_size:
+        step = int(tile_size * (1 - overlap))
+        def positions(length: int) -> list[int]:
+            if length <= tile_size:
+                return [0]
+            starts = list(range(0, length - tile_size + 1, step))
+            if starts[-1] != length - tile_size:
+                edge = length - tile_size
+                if edge - starts[-1] < step * 0.5:
+                    starts[-1] = edge
+                else:
+                    starts.append(edge)
+            return starts
+        tile_boxes = [(x, y, min(width, x + tile_size), min(height, y + tile_size))
+                      for y in positions(height) for x in positions(width)]
+        if len(tile_boxes) > max_tiles:
+            selected = sorted({round(index * (len(tile_boxes) - 1) / (max_tiles - 1))
+                               for index in range(max_tiles)})
+            tile_boxes = [tile_boxes[index] for index in selected]
+        for x1, y1, x2, y2 in tile_boxes:
+            images.append(image.crop((x1, y1, x2, y2)))
+            manifest.append({"image_index": len(images) - 1, "kind": "native_resolution_tile",
+                             "bbox_xyxy": [x1, y1, x2, y2]})
     encoded = []
     for candidate in images:
         buffer = io.BytesIO()
         candidate.save(buffer, format="JPEG", quality=88)
         encoded.append(buffer.getvalue())
-    return encoded, (width, height)
+    return encoded, (width, height), manifest
 
 
 def review_components_with_qwen(
@@ -98,8 +130,6 @@ def review_components_with_qwen(
     ocr_records: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Request suggestions and validate every ID and normalized box before display."""
-    if not detections:
-        return {"class_reviews": [], "duplicate_reviews": [], "missed_component_candidates": [], "notes": [], "model": model}
     identified = []
     for index, row in enumerate(detections, start=1):
         box = row.get("bbox_xyxy", [row.get("x1"), row.get("y1"), row.get("x2"), row.get("y2")])
@@ -108,15 +138,11 @@ def review_components_with_qwen(
                            "confidence": row.get("confidence", row.get("신뢰도")),
                            "bbox_xyxy": box,
                            "ocr_text": row.get("ocr_candidates", [])})
-    images, (width, height) = _review_images(image_bytes, identified)
-    image_legend = [identified[0]["detection_id"]] if len(images) <= 1 else [
-        identified[0]["detection_id"], *[row["detection_id"] for row in sorted(
-            identified, key=lambda item: float(item.get("confidence") or 0.0))[:len(images) - 1]]
-    ]
+    images, (width, height), image_manifest = _review_images(image_bytes, identified)
     payload = {
         "image_coordinates_px": {"width": width, "height": height},
         "annotated_image_box_ids": [row["detection_id"] for row in identified],
-        "crop_image_order_after_annotated_image": image_legend[1:],
+        "image_sources": image_manifest,
         "detector_proposals": [{key: value for key, value in row.items() if key != "bbox_xyxy"}
                                | {"bbox_xyxy": [round(float(value), 1) for value in row["bbox_xyxy"]]}
                                for row in identified],
@@ -125,7 +151,7 @@ def review_components_with_qwen(
                                         "confidence": row.get("confidence"),
                                         "reference_candidates": row.get("reference_candidates", [])}
                                        for row in ocr_records[:120]],
-        "coordinate_rule": "Return missed bbox_norm_999 as [x1,y1,x2,y2] in the full annotated image, each integer from 0 to 999.",
+        "coordinate_rule": "For each missed candidate, provide image_index and bbox_norm_999=[x1,y1,x2,y2] normalized 0..999 within that exact image.",
     }
     response = client.chat_json(
         model, [{"role": "system", "content": _SYSTEM},
@@ -163,7 +189,9 @@ def review_components_with_qwen(
     for row in content.get("missed_component_candidates", [])[:8]:
         box = row.get("bbox_norm_999", [])
         confidence = row.get("confidence")
-        if (len(box) != 4 or any(type(value) is not int or not 0 <= value <= 999 for value in box)
+        image_index = row.get("image_index", 0)
+        if (type(image_index) is not int or not 0 <= image_index < len(image_manifest)
+                or len(box) != 4 or any(type(value) is not int or not 0 <= value <= 999 for value in box)
                 or row.get("proposed_class") not in REVIEW_CLASSES
                 or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
                 or not 0 <= float(confidence) <= 1):
@@ -171,10 +199,13 @@ def review_components_with_qwen(
         x1, y1, x2, y2 = box
         if x2 <= x1 or y2 <= y1:
             continue
-        candidate = [x1 * width / 999, y1 * height / 999, x2 * width / 999, y2 * height / 999]
+        region = image_manifest[image_index]["bbox_xyxy"]
+        region_width, region_height = region[2] - region[0], region[3] - region[1]
+        candidate = [region[0] + x1 * region_width / 999, region[1] + y1 * region_height / 999,
+                     region[0] + x2 * region_width / 999, region[1] + y2 * region_height / 999]
         if candidate[2] - candidate[0] < 4 or candidate[3] - candidate[1] < 4:
             continue
-        if any(box_iou(candidate, row["bbox_xyxy"]) >= .30
+        if any(boxes_overlap_candidate(candidate, row["bbox_xyxy"])
                for row in identified if isinstance(row.get("bbox_xyxy"), (list, tuple)) and len(row["bbox_xyxy"]) == 4):
             continue
         missed.append({**row, "confidence": float(confidence), "bbox_xyxy": candidate, "evidence": str(row.get("evidence", ""))[:500],
@@ -183,4 +214,5 @@ def review_components_with_qwen(
             "missed_component_candidates": missed,
             "notes": [str(note)[:300] for note in content.get("notes", [])[:10]],
             "model": response.get("model", model), "image_size_px": [width, height],
+            "review_image_count": len(images), "review_tiles": sum(item["kind"] == "native_resolution_tile" for item in image_manifest),
             "verification_status": "AI_SUGGESTIONS_ONLY"}

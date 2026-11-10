@@ -25,6 +25,30 @@ def box_iou(left: list[float] | tuple[float, ...], right: list[float] | tuple[fl
     return intersection / union if union > 0 else 0.0
 
 
+def box_intersection_over_smaller(
+    left: list[float] | tuple[float, ...], right: list[float] | tuple[float, ...],
+) -> float:
+    """Return intersection divided by the smaller box area (containment-aware)."""
+    if len(left) != 4 or len(right) != 4:
+        return 0.0
+    intersection = max(0.0, min(float(left[2]), float(right[2])) - max(float(left[0]), float(right[0]))) * max(
+        0.0, min(float(left[3]), float(right[3])) - max(float(left[1]), float(right[1]))
+    )
+    areas = [max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+             for box in (left, right)]
+    smaller = min(areas)
+    return intersection / smaller if smaller > 0 else 0.0
+
+
+def boxes_overlap_candidate(
+    candidate: list[float] | tuple[float, ...], existing: list[float] | tuple[float, ...],
+    *, iou_threshold: float = 0.30, containment_threshold: float = 0.72,
+) -> bool:
+    """Treat substantial containment as overlap so nested duplicates are filtered."""
+    return (box_iou(candidate, existing) >= iou_threshold
+            or box_intersection_over_smaller(candidate, existing) >= containment_threshold)
+
+
 def _edge_distance(left: list[float], right: list[float]) -> float:
     dx = max(float(left[0]) - float(right[2]), float(right[0]) - float(left[2]), 0.0)
     dy = max(float(left[1]) - float(right[3]), float(right[1]) - float(left[3]), 0.0)
@@ -46,6 +70,7 @@ def associate_ocr_with_components(
     for row in rows:
         row["ocr_records"] = []
         row["ocr_candidates"] = []
+        row["reference_designators"] = []
         row["ocr_class_hints"] = []
         row["ocr_association_status"] = "NO_TEXT"
     for record in ocr_records:
@@ -74,6 +99,9 @@ def associate_ocr_with_components(
             row = rows[index]
             row["ocr_records"].append({**record, "association_status": "AMBIGUOUS" if ambiguous else "NEAR_COMPONENT"})
             row["ocr_candidates"] = list(dict.fromkeys([*row["ocr_candidates"], text]))
+            row["reference_designators"] = list(dict.fromkeys([
+                *row["reference_designators"], *[str(ref).upper() for ref in ref_candidates],
+            ]))
             row["ocr_class_hints"] = list(dict.fromkeys([
                 *row["ocr_class_hints"], *[hint for ref in ref_candidates if (hint := _class_hint(str(ref)))],
             ]))
@@ -128,7 +156,7 @@ def preserve_review_rows(
                 for key in ("소자 종류", "상태", "x1", "y1", "x2", "y2", "user_edited"):
                     if key in old:
                         row[key] = old[key]
-            for key in ("ocr_records", "ocr_candidates", "ocr_class_hints", "ocr_association_status",
+            for key in ("ocr_records", "ocr_candidates", "reference_designators", "ocr_class_hints", "ocr_association_status",
                         "ai_review", "ai_proposed_class", "duplicate_of"):
                 if key in old:
                     row[key] = old[key]
