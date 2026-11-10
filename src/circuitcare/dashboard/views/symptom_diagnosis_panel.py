@@ -89,17 +89,24 @@ def _sync_component_candidates(st: Any, project: ProjectContext, result: dict[st
 def _component_rows(components: tuple[Any, ...],
                     component_inventory: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     inventory = component_inventory or {}
-    return [{"component_id": item.component_id, "component_type": item.component_type,
+    result = []
+    for item in components:
+        review_owned = getattr(item, "overlay_source", None) in {"yolo", "manual", "qwen_suggestion"}
+        presence_status = ("CONFIRMED" if item.identification_status == "USER_CONFIRMED" else "UNCONFIRMED") \
+            if review_owned else inventory.get(item.component_id, {}).get("presence_status", "UNCONFIRMED")
+        type_status = ("USER_CONFIRMED" if item.identification_status == "USER_CONFIRMED" else "UNCONFIRMED") \
+            if review_owned else inventory.get(item.component_id, {}).get(
+                "component_type_status", getattr(item, "component_type_status", "UNCONFIRMED"))
+        result.append({"component_id": item.component_id, "component_type": item.component_type,
              "bbox_xyxy": list(item.bbox_xyxy), "ocr_marking": item.ocr_marking,
              "component_info": getattr(item, "component_info", None),
-             "presence_status": inventory.get(item.component_id, {}).get("presence_status", "UNCONFIRMED"),
-             "component_type_status": inventory.get(item.component_id, {}).get(
-                 "component_type_status", getattr(item, "component_type_status", "UNCONFIRMED")),
+             "presence_status": presence_status,
+             "component_type_status": type_status,
              "part_identity_status": inventory.get(item.component_id, {}).get("part_identity_status", "UNCONFIRMED"),
              "confirmed_functional_roles": inventory.get(item.component_id, {}).get("confirmed_functional_roles", []),
              "role_status": "CONFIRMED" if inventory.get(item.component_id, {}).get("confirmed_functional_roles") else "UNKNOWN",
-             "role_evidence": ("사용자가 선택한 기능 역할",) if inventory.get(item.component_id, {}).get("confirmed_functional_roles") else ()}
-            for item in components]
+             "role_evidence": ("사용자가 선택한 기능 역할",) if inventory.get(item.component_id, {}).get("confirmed_functional_roles") else ()})
+    return result
 
 
 def _current_analysis_context(project: ProjectContext, state: Any,

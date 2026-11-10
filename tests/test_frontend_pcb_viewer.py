@@ -1,11 +1,21 @@
+import io
+from types import SimpleNamespace
+
+from PIL import Image
+
 from circuitcare.dashboard.components.pcb_workspace import (
-    coordinate_status_for_viewer, scale_overlay_to_display, validate_component_selection_event,
+    OVERLAPPING_SELECTION_KEY, coordinate_status_for_viewer, render_component_viewer,
+    scale_overlay_to_display, validate_component_selection_event,
 )
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.frontend.component_overlay_models import display_identity_status
-from circuitcare.dashboard.views.unified_workspace import _exclude_selected_review_box
+from circuitcare.dashboard.views.unified_workspace import _bind_review_models_to_map
+from circuitcare.frontend.models import ProjectContext, SelectionState
 from circuitcare.vision.box_reconciliation import board_visible_review_rows
-from circuitcare.vision.component_recognition_panel import _store_predictions
+from circuitcare.vision.component_recognition_panel import (
+    _store_predictions, ensure_review_row_for_component, invalidate_component_review_state,
+    record_box_exclusion, restore_review_row, undo_last_box_exclusion, update_review_row,
+)
 
 
 def _model():
@@ -49,24 +59,93 @@ def test_click_and_clear_selection_events_are_scoped_and_monotonic():
     assert validate_component_selection_event(clear, **{**kwargs, "last_sequence": 1}) == (True, None)
 
 
-def test_selected_box_exclusion_hides_it_and_yolo_rerun_preserves_exclusion():
+def test_viewer_click_event_updates_real_streamlit_selection_and_overlap_stack(monkeypatch):
+    import circuitcare.dashboard.components.pcb_workspace as workspace
+
+    streamlit = SimpleNamespace(session_state={})
+    project = ProjectContext(project_id="p1", board_id="b1")
+    from circuitcare.frontend.workbench_state import SELECTION_KEY
+    streamlit.session_state[SELECTION_KEY] = SelectionState(project_id="p1", board_id="b1")
+    output = io.BytesIO()
+    Image.new("RGB", (32, 32), "white").save(output, format="PNG")
+    components = tuple(ComponentOverlayViewModel(**{**_model().__dict__, "component_id": item})
+                       for item in ("c1", "c2"))
+
+    def fake_render(_st, **kwargs):
+        key = kwargs["key"]
+        streamlit.session_state[key] = {"selection": {
+            "project_id": "p1", "board_id": "b1", "board_side": "TOP",
+            "canonical_frame_id": "photo1", "component_id": "c1", "selection_action": "select",
+            "overlapping_component_ids": ["c1", "c2"], "event_seq": 1, "event_id": "click-1",
+        }}
+        kwargs["on_selection_change"]()
+        return object()
+
+    monkeypatch.setattr(workspace, "render_pcb_viewer", fake_render)
+    available, viewer_key, _status = render_component_viewer(
+        streamlit, image=None, source_image_bytes=output.getvalue(), canonical_png_bytes=None,
+        image_size_px=(32, 32), components=components, project=project, board_side="TOP",
+        frame_id="photo1", selected_component_id=None, map_cache_key="map1", image_mode="원본 사진",
+    )
+    assert available is True
+    selection = streamlit.session_state[SELECTION_KEY]
+    assert selection.selected_component == "c1"
+    assert streamlit.session_state[f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"] == ["c1", "c2"]
+
+
+def test_review_row_is_single_source_for_selected_box_edit_exclusion_and_restore():
     box = _model()
     rows = []
-    excluded = _exclude_selected_review_box(rows, box)
-    assert excluded["상태"] == "제외"
-    assert excluded["user_edited"] is True
+    row = ensure_review_row_for_component(rows, box)
+    update_review_row(row, component_type="capacitor", status="확인", bbox_xyxy=[12, 22, 34, 56])
+    assert row["component_id"] == "c1"
+    assert row["소자 종류"] == "capacitor" and row["상태"] == "확인"
+    assert [row[key] for key in ("x1", "y1", "x2", "y2")] == [12, 22, 34, 56]
+    state = {}
+    record_box_exclusion(state, scope="scope", row=row)
+    assert row["상태"] == "제외" and row["user_edited"] is True
     assert board_visible_review_rows(rows) == []
+    assert undo_last_box_exclusion(state, scope="scope", rows=rows) == "c1"
+    assert row["상태"] == "확인" and board_visible_review_rows(rows) == [row]
 
-    state = {"rows": rows}
-    _store_predictions(state, "rows", {"detections": [{
+    rerun_state = {"rows": [row]}
+    record_box_exclusion(rerun_state, scope="scope", row=row)
+    restore_review_row(row)
+    assert row["상태"] == "확인"
+    record_box_exclusion(rerun_state, scope="scope", row=row)
+    _store_predictions(rerun_state, "rows", {"detections": [{
         "class_name": "resistor", "confidence": .91, "bbox_xyxy": [11, 21, 31, 51],
     }]})
-    assert state["rows"][0]["component_id"] == "c1"
-    assert state["rows"][0]["상태"] == "제외"
-    assert board_visible_review_rows(state["rows"]) == []
+    assert rerun_state["rows"][0]["component_id"] == "c1"
+    assert rerun_state["rows"][0]["상태"] == "제외"
+    assert board_visible_review_rows(rerun_state["rows"]) == []
 
-    state["rows"][0]["상태"] = "검수 필요"
-    assert len(board_visible_review_rows(state["rows"])) == 1
+
+def test_component_change_invalidates_diagnosis_but_preserves_measurement_history():
+    state = {"circuitcare_v5_measurements": {"owner": ["measurement"]},
+             "cc_symptom_diagnosis_p1": {"result": {"status": "old"}, "input_fingerprint": "old"}}
+    invalidate_component_review_state(state, scope="scope", project_id="p1", board_id="b1")
+    assert state["cc_symptom_diagnosis_p1"]["result"] is None
+    assert state["circuitcare_v5_measurements"]["owner"] == ["measurement"]
+
+
+def test_map_and_detector_boxes_bind_to_one_review_identity():
+    map_box = ComponentOverlayViewModel(**{**_model().__dict__, "component_id": "map-id",
+                                           "fault_candidate_status": "SUSPECTED_FAULT"})
+    review_box = ComponentOverlayViewModel(**{**_model().__dict__, "component_id": "detector-id",
+                                              "component_type": "capacitor", "bbox_xyxy": (11, 21, 31, 51),
+                                              "overlay_source": "yolo"})
+    rows = [{"component_id": "detector-id", "소자 종류": "capacitor", "상태": "확인",
+             "x1": 11, "y1": 21, "x2": 31, "y2": 51}]
+    merged, rows = _bind_review_models_to_map((map_box,), (review_box,), rows)
+    assert len(merged) == 1
+    assert merged[0].component_id == "detector-id"
+    assert merged[0].bbox_xyxy == (11, 21, 31, 51)
+    assert merged[0].fault_candidate_status == "SUSPECTED_FAULT"
+    assert rows[0]["associated_component_ids"] == ["map-id"]
+    rows[0]["상태"] = "제외"
+    hidden, _rows = _bind_review_models_to_map((map_box,), (review_box,), rows)
+    assert hidden == ()
 
 
 def test_hover_identity_status_is_user_facing_korean_and_unknown_is_preserved():

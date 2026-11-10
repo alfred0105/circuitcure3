@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 import importlib.util
 import io
 import os
@@ -19,11 +20,13 @@ from circuitcare.vision.box_reconciliation import (
 )
 from circuitcare.component_taxonomy import COMPONENT_LABELS, normalize_component_class
 from circuitcare.vision.ai_review_service import AIReviewStageError
+from circuitcare.frontend.measurement_state import invalidate_diagnosis
 
 APP_DIR = Path(__file__).resolve().parents[3] / "apps" / "pcb-component-recognition"
 MODULE_NAME = "circuitcare_pcb_component_app_server"
 CLASS_OPTIONS = list(COMPONENT_LABELS)
 STATUS_OPTIONS = ["검수 필요", "확인", "제외"]
+LAST_EXCLUDED_KEY = "circuitcare_v4_last_excluded_box"
 INFERENCE_CONFIG = {"model_pipeline": "yolo26s+doctor-v12n+arshia-yolov8s", "conf": 0.20,
                     "tile": 1024, "overlap": 0.25, "postprocess": "one-to-one-v2",
                     "ocr_engine": "rapidocr-v1", "review_model": "qwen3.5:9b"}
@@ -111,6 +114,77 @@ def invalidate_qwen_review(state: Any, scope: str) -> None:
     """Drop suggestions whenever their detection/OCR evidence changes."""
     _ocr_key, qwen_key = review_aux_keys(scope)
     state.pop(qwen_key, None)
+
+
+def invalidate_component_review_state(state: Any, *, scope: str, project_id: str, board_id: str | None) -> None:
+    """Invalidate derived AI/diagnosis results while leaving measurement records untouched."""
+    invalidate_qwen_review(state, scope)
+    invalidate_diagnosis(state, project_id=project_id, board_id=board_id or "")
+    diagnosis_key = f"cc_symptom_diagnosis_{project_id}"
+    diagnosis = state.get(diagnosis_key)
+    if isinstance(diagnosis, dict):
+        diagnosis["result"] = None
+        diagnosis.pop("input_fingerprint", None)
+        state[diagnosis_key] = diagnosis
+
+
+def ensure_review_row_for_component(rows: list[dict], component: Any) -> dict:
+    """Return the canonical review row for a displayed component, creating it if needed."""
+    component_id = str(component.component_id)
+    row = next((item for item in rows if str(item.get("component_id")) == component_id), None)
+    if row is None:
+        x1, y1, x2, y2 = component.bbox_xyxy
+        row = _record(component.component_type, [x1, y1, x2, y2],
+                      status="확인" if component.presence_status == "CONFIRMED" else "검수 필요",
+                      confidence=component.detection_confidence or 0.0,
+                      component_id=component_id,
+                      location_confidence=component.detection_confidence,
+                      type_confidence=component.type_confidence)
+        row["source"] = component.overlay_source or "component_map"
+        rows.append(row)
+    return row
+
+
+def update_review_row(row: dict, *, component_type: str, status: str,
+                      bbox_xyxy: list[int] | tuple[int, int, int, int]) -> None:
+    if component_type not in CLASS_OPTIONS or status not in STATUS_OPTIONS:
+        raise ValueError("소자 종류 또는 검수 상태가 유효하지 않습니다.")
+    x1, y1, x2, y2 = map(int, bbox_xyxy)
+    if min(x1, y1) < 0 or x2 - x1 < 4 or y2 - y1 < 4:
+        raise ValueError("박스 좌표가 유효하지 않습니다.")
+    row.update({"소자 종류": component_type, "상태": status,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "user_edited": True})
+
+
+def restore_review_row(row: dict) -> None:
+    row["상태"] = row.pop("status_before_exclusion", "검수 필요")
+    row.pop("exclusion_reason", None)
+    row.pop("duplicate_of", None)
+    row["user_edited"] = True
+
+
+def record_box_exclusion(state: Any, *, scope: str, row: dict) -> None:
+    """Snapshot a review row before hiding it so the immediately preceding action can be undone."""
+    before = deepcopy(row)
+    row["status_before_exclusion"] = row.get("상태", "검수 필요")
+    exclude_review_row(row, reason="user_box_exclusion")
+    state[f"{LAST_EXCLUDED_KEY}_{scope}"] = {"component_id": row.get("component_id"), "before": before}
+
+
+def undo_last_box_exclusion(state: Any, *, scope: str, rows: list[dict]) -> str | None:
+    """Restore the exact row snapshot from the latest user exclusion, if present."""
+    snapshot = state.get(f"{LAST_EXCLUDED_KEY}_{scope}")
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("before"), dict):
+        return None
+    component_id = snapshot.get("component_id")
+    row = next((item for item in rows if item.get("component_id") == component_id), None)
+    if row is None:
+        return None
+    row.clear()
+    row.update(deepcopy(snapshot["before"]))
+    state.pop(f"{LAST_EXCLUDED_KEY}_{scope}", None)
+    return str(component_id)
 
 
 def _review_fingerprint(rows: list[dict], ocr_result: dict | None) -> str:
@@ -217,49 +291,6 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
         return None, str(exc)
 
 
-def render_selected_component_editor(st_api: Any, *, image_bytes: bytes, scope: str,
-                                     component_id: str) -> None:
-    """Edit class, review status, and coordinates for the selected overlay box."""
-    _result_key, records_key, _error_key = review_keys(scope)
-    rows = st_api.session_state.get(records_key, [])
-    index = next((i for i, item in enumerate(rows) if item.get("component_id") == component_id), -1)
-    if not 0 <= index < len(rows):
-        return
-    row = rows[index]
-    form_key = f"cc_component_selected_edit_{scope}_{index}"
-    st_api.markdown("**부품 상태 수정**")
-    with st_api.form(form_key):
-        current_label = normalize_component_class(row.get("소자 종류"))
-        label = st_api.selectbox("소자 종류", CLASS_OPTIONS,
-                                 index=CLASS_OPTIONS.index(current_label), key=f"{form_key}_class")
-        status = st_api.selectbox("검수 상태", STATUS_OPTIONS,
-                                  index=STATUS_OPTIONS.index(row.get("상태", "검수 필요")),
-                                  key=f"{form_key}_status")
-        with st_api.expander("박스 좌표 조정"):
-            cols = st_api.columns(2)
-            x1 = cols[0].number_input("왼쪽 x", min_value=0, value=int(row["x1"]), step=1, key=f"{form_key}_x1")
-            y1 = cols[1].number_input("위쪽 y", min_value=0, value=int(row["y1"]), step=1, key=f"{form_key}_y1")
-            x2 = cols[0].number_input("오른쪽 x", min_value=0, value=int(row["x2"]), step=1, key=f"{form_key}_x2")
-            y2 = cols[1].number_input("아래쪽 y", min_value=0, value=int(row["y2"]), step=1, key=f"{form_key}_y2")
-        apply = st_api.form_submit_button("수정 적용", use_container_width=True)
-    if apply:
-        from PIL import Image
-        import io
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            width, height = image.size
-        x1, x2 = max(0, min(width, int(x1))), max(0, min(width, int(x2)))
-        y1, y2 = max(0, min(height, int(y1))), max(0, min(height, int(y2)))
-        if x2 - x1 < 4 or y2 - y1 < 4:
-            st_api.error("박스는 가로·세로 각각 4px 이상이어야 합니다.")
-            return
-        rows[index].update({"소자 종류": label, "상태": status,
-                            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                            "user_edited": True})
-        st_api.session_state[records_key] = rows
-        invalidate_qwen_review(st_api.session_state, scope)
-        st_api.rerun()
-
-
 def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows: list[dict],
                             records_key: str, ocr_key: str, qwen_key: str) -> None:
     """Run RapidOCR and Qwen review on the existing first-pass YOLO proposals."""
@@ -353,10 +384,15 @@ def _make_group_child_row(scope: str, parent_id: str, index: int, proposal: dict
 
 
 def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, project_id: str,
-                                       photo_id: str, auto_result: dict | None = None,
+                                       photo_id: str, board_id: str | None = None,
+                                       auto_result: dict | None = None,
                                        auto_error: str | None = None) -> None:
     """Compact controls and export; drawing/editing happens on the shared PCB viewer."""
     scope = review_scope(image_bytes, project_id, photo_id)
+    def invalidate_review_state() -> None:
+        invalidate_component_review_state(st_api.session_state, scope=scope,
+                                          project_id=project_id, board_id=board_id)
+
     _migrate_legacy_review_state(st_api.session_state, image_bytes, project_id, photo_id, scope)
     result_key, records_key, error_key = review_keys(scope)
     if result_key not in st_api.session_state:
@@ -378,7 +414,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
         st_api.session_state[records_key] = cleaned_rows
     st_api.caption("이미지 위의 ‘박스 그리기’를 눌러 드래그하세요. 박스를 선택하면 오른쪽에서 종류·상태·위치를 수정할 수 있습니다.")
     if st_api.button("선택 사진 다시 탐지", key=f"cc_component_run_{scope}"):
-        invalidate_qwen_review(st_api.session_state, scope)
+        invalidate_review_state()
         st_api.session_state.pop(result_key, None)
         st_api.session_state.pop(error_key, None)
         st_api.rerun()
@@ -407,7 +443,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     for key in ("ocr_records", "ocr_candidates", "reference_designators", "ocr_class_hints", "ocr_association_status"):
                         old_row[key] = evidence.get(key)
                 st_api.session_state[records_key] = rows
-                invalidate_qwen_review(st_api.session_state, scope)
+                invalidate_review_state()
                 st_api.rerun()
             except Exception as exc:
                 from circuitcare.vision.ocr_backend import OCRUnavailable
@@ -458,7 +494,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
 
         qwen_review = st_api.session_state.get(qwen_key)
         if isinstance(qwen_review, dict) and qwen_review.get("source_fingerprint") != _review_fingerprint(rows, ocr_result):
-            invalidate_qwen_review(st_api.session_state, scope)
+            invalidate_review_state()
             qwen_review = None
         if isinstance(qwen_review, dict):
             if qwen_review.get("verification_status") == "AI_REVIEW_FAILED":
@@ -491,7 +527,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     if st_api.button("오탐으로 제외 확인", key=f"cc_qwen_false_positive_{scope}_{index}"):
                         exclude_review_row(target, reason="qwen_not_component", review=proposal)
                         st_api.session_state[records_key] = rows
-                        invalidate_qwen_review(st_api.session_state, scope)
+                        invalidate_review_state()
                         st_api.rerun()
                 elif proposal.get("decision") == "suggest" and proposal["proposed_class"] in CLASS_OPTIONS:
                     if st_api.button("종류 제안 반영 · 검수 필요 상태 유지", key=f"cc_qwen_class_apply_{scope}_{index}"):
@@ -500,7 +536,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         target["user_edited"] = True
                         target["ai_review"] = proposal
                         st_api.session_state[records_key] = rows
-                        invalidate_qwen_review(st_api.session_state, scope)
+                        invalidate_review_state()
                         st_api.rerun()
             for index, proposal in enumerate(qwen_review.get("duplicate_reviews", [])):
                 ids = proposal.get("detection_ids", [])
@@ -535,7 +571,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         for target_id in ids:
                             by_id[target_id]["ai_review"] = proposal
                     st_api.session_state[records_key] = rows
-                    invalidate_qwen_review(st_api.session_state, scope)
+                    invalidate_review_state()
                     st_api.rerun()
             for index, proposal in enumerate(qwen_review.get("group_reviews", [])):
                 parent_id = str(proposal.get("parent_id", ""))
@@ -559,7 +595,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         for child in children:
                             child["group_parent_id"] = parent_id
                         st_api.session_state[records_key] = rows
-                        invalidate_qwen_review(st_api.session_state, scope)
+                        invalidate_review_state()
                         st_api.rerun()
                 elif proposal.get("decision") == "single_component":
                     if st_api.button("하나의 부품 패키지로 확인", key=f"cc_qwen_group_single_{scope}_{index}"):
@@ -567,7 +603,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         parent["group_review_decision"] = "single_component"
                         parent["ai_review"] = proposal
                         st_api.session_state[records_key] = rows
-                        invalidate_qwen_review(st_api.session_state, scope)
+                        invalidate_review_state()
                         st_api.rerun()
                 for child_index, candidate in enumerate(proposal.get("new_components", [])):
                     st_api.markdown(f"묶음 내부 신규 후보 · {candidate['proposed_class']} · 점수 {candidate['confidence']:.2f}")
@@ -590,7 +626,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                                     "stage": "ui_apply", "status": "added", "component_id": candidate_row["component_id"],
                                 })
                                 st_api.session_state[records_key] = rows
-                                invalidate_qwen_review(st_api.session_state, scope)
+                                invalidate_review_state()
                                 st_api.rerun()
                         except Exception as exc:
                             parent.setdefault("group_review_diagnostics", []).append({
@@ -625,23 +661,10 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         candidate["geometry_review_required"] = bool(candidate["possible_duplicate_ids"])
                         rows.append(candidate)
                         st_api.session_state[records_key] = rows
-                        invalidate_qwen_review(st_api.session_state, scope)
+                        invalidate_review_state()
                         st_api.rerun()
             for note in qwen_review.get("notes", []):
                 st_api.caption(f"Qwen 관찰 · {note}")
-
-    excluded_rows = [row for row in rows if row.get("상태") == "제외"]
-    if excluded_rows:
-        with st_api.expander(f"제외된 박스 검수 · {len(excluded_rows)}개", expanded=False):
-            st_api.caption("제외된 박스는 PCB 기본 오버레이에서 숨깁니다. 아래에서 이력 확인 후 되살릴 수 있습니다.")
-            for index, row in enumerate(excluded_rows):
-                st_api.write(f"{row.get('component_id')} · {row.get('소자 종류', 'unknown')} · 대표 박스 {row.get('duplicate_of', '미지정')}")
-                if st_api.button("박스 복원", key=f"cc_component_restore_excluded_{scope}_{row.get('component_id')}_{index}"):
-                    row["상태"] = "검수 필요"
-                    row.pop("duplicate_of", None)
-                    st_api.session_state[records_key] = rows
-                    invalidate_qwen_review(st_api.session_state, scope)
-                    st_api.rerun()
 
     export_rows = [{"project_id": project_id, "photo_id": photo_id,
                     "active": row.get("상태") != "제외", "class_name": row["소자 종류"],

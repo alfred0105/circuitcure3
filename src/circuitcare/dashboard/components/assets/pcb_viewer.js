@@ -130,6 +130,13 @@ export default function(component) {
       }
     }
     layer.appendChild(fragment);
+    const statusLabel = root.querySelector("[data-status-label]");
+    if (statusLabel) {
+      const selected = (data.components || []).find((item) => item.component_id === data.selected_component_id);
+      statusLabel.textContent = selected
+        ? `선택 ${selected.display_label || selected.component_type} · ${selected.component_id}`
+        : `박스 ${(data.components || []).length}개 · 클릭하여 선택`;
+    }
   };
   const setImage = () => {
     const [width,height] = data.image_size_px || [];

@@ -22,7 +22,7 @@ def render_pcb_viewer(
     global _VIEWER
     if _VIEWER is None:
         _VIEWER = st.components.v2.component(
-            name="circuitcare_interactive_pcb",
+            name="circuitcare_interactive_pcb_v3",
             html=(ASSET_DIR / "pcb_viewer.html").read_text(encoding="utf-8"),
             css=(ASSET_DIR / "pcb_viewer.css").read_text(encoding="utf-8"),
             js=(ASSET_DIR / "pcb_viewer.js").read_text(encoding="utf-8"),

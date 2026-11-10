@@ -3,35 +3,28 @@
 from __future__ import annotations
 
 import io
+import hashlib
 from dataclasses import replace
 from typing import Any
 
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel, display_identity_status
-from circuitcare.component_taxonomy import COMPONENT_LABELS
 from circuitcare.frontend.measurement_state import get_measurements
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.dashboard.views.diagnosis_panel import render_diagnosis_panel
 from circuitcare.dashboard.views.measurement_panel import render_measurement_panel
 from circuitcare.dashboard.views.symptom_diagnosis_panel import render_symptom_diagnosis_panel
-from circuitcare.vision.component_recognition_panel import render_selected_component_editor
+from circuitcare.vision.component_recognition_panel import (
+    CLASS_OPTIONS, LAST_EXCLUDED_KEY, STATUS_OPTIONS, ensure_review_row_for_component,
+    invalidate_component_review_state, record_box_exclusion, restore_review_row,
+    review_keys, undo_last_box_exclusion, update_review_row,
+)
+from circuitcare.frontend.workbench_state import SELECTION_KEY, update_selection
 
 MAP_VERSION_KEY = "circuitcare_v4_selection_map_key"
 COMPONENT_EDIT_KEY = "circuitcare_v4_component_edits"
 COMPONENT_INVENTORY_KEY = "circuitcare_v4_component_inventory_by_map"
 ROLE_OPTIONS = ("power", "control", "control_input", "control_timing", "driver", "output",
                 "input", "input_output", "protection", "thermal", "buzzer", "relay")
-COMPONENT_TYPE_OPTIONS = COMPONENT_LABELS
-
-
-def _component_label(value: str) -> str:
-    types = {
-        "capacitor": "커패시터", "resistor": "저항", "inductor": "인덕터",
-        "diode": "다이오드", "transistor": "트랜지스터", "integrated_circuit": "IC",
-        "ic": "IC", "connector": "커넥터", "unknown_component": "부품 후보",
-    }
-    return types.get(value.lower(), value)
-
-
 def render_inspection_panel(
     st: Any, project: ProjectContext, *, preview: bool = False,
     components: tuple[ComponentOverlayViewModel, ...] = (),
@@ -48,9 +41,25 @@ def render_inspection_panel(
     inventory = inventories.setdefault(owner, {})
     with st.container(border=True):
         st.markdown('<span class="cc-inspection-marker"></span>', unsafe_allow_html=True)
-        render_symptom_diagnosis_panel(st, project, components=components, preview=preview,
-                                       component_inventory=inventory)
-        st.divider()
+        overlap_key = st.session_state.get("cc_active_component_overlap_key")
+        overlap_ids = st.session_state.get(overlap_key, []) if overlap_key else []
+        by_id = {item.component_id: item for item in components}
+        overlap_ids = list(dict.fromkeys(item for item in overlap_ids if item in by_id))
+        selection = st.session_state.get(SELECTION_KEY)
+        selected_id = getattr(selection, "selected_component", None)
+        if len(overlap_ids) > 1:
+            labels = {
+                f"{item} · {by_id[item].component_type} · "
+                f"{(by_id[item].bbox_xyxy[2] - by_id[item].bbox_xyxy[0]) * (by_id[item].bbox_xyxy[3] - by_id[item].bbox_xyxy[1]):.0f}px²": item
+                for item in overlap_ids
+            }
+            selected_option = next((label for label, item in labels.items() if item == selected_id), next(iter(labels)))
+            overlap_signature = hashlib.sha1("|".join(overlap_ids).encode()).hexdigest()[:8]
+            choice = st.selectbox("겹친 박스", list(labels), index=list(labels).index(selected_option),
+                                  key=f"cc_box_overlap_select_{st.session_state.get('cc_active_component_review_scope', 'none')}_{overlap_signature}")
+            if labels[choice] != selected_id:
+                update_selection(st.session_state, project=project, selected_component=labels[choice])
+                st.rerun()
         if preview:
             st.markdown("**부품** · 인식 결과 없음")
         elif detection_status in {"DETECTOR_NOT_CONFIGURED", "BLOCKED_MODEL_UNAVAILABLE"}:
@@ -61,13 +70,45 @@ def render_inspection_panel(
             st.markdown("**인식된 부품** · 없음")
         else:
             st.markdown(f"**인식된 부품** · {len(components)}개")
+        active_scope = st.session_state.get("cc_active_component_review_scope") or review_scope
+        active_records_key = review_keys(active_scope)[1] if active_scope else None
+        active_rows = list(st.session_state.get(active_records_key, [])) if active_records_key else []
+        if active_scope:
+            undo_key = f"{LAST_EXCLUDED_KEY}_{active_scope}"
+            last_excluded = st.session_state.get(undo_key)
+            undo_col, restore_col = st.columns(2)
+            undo_id = last_excluded.get("component_id") if isinstance(last_excluded, dict) else None
+            if undo_col.button("직전 제외 취소", key=f"cc_component_undo_exclusion_{active_scope}",
+                               disabled=not bool(undo_id), use_container_width=True):
+                restored_id = undo_last_box_exclusion(st.session_state, scope=active_scope, rows=active_rows)
+                if restored_id:
+                    st.session_state[active_records_key] = active_rows
+                    invalidate_component_review_state(st.session_state, scope=active_scope,
+                        project_id=project.project_id, board_id=project.board_id)
+                    update_selection(st.session_state, project=project, selected_component=restored_id)
+                    st.rerun()
+            excluded_rows = [row for row in active_rows if row.get("상태") == "제외"]
+            if excluded_rows:
+                with restore_col.popover(f"제외 복원 · {len(excluded_rows)}"):
+                    for index, row in enumerate(excluded_rows):
+                        st.caption(f"{row.get('component_id')} · {row.get('소자 종류', 'unknown')}")
+                        if st.button("복원", key=f"cc_restore_box_{active_scope}_{row.get('component_id')}_{index}"):
+                            restore_review_row(row)
+                            st.session_state[active_records_key] = active_rows
+                            if isinstance(last_excluded, dict) and last_excluded.get("component_id") == row.get("component_id"):
+                                st.session_state.pop(undo_key, None)
+                            invalidate_component_review_state(st.session_state, scope=active_scope,
+                                project_id=project.project_id, board_id=project.board_id)
+                            update_selection(st.session_state, project=project,
+                                             selected_component=str(row.get("component_id")))
+                            st.rerun()
         st.markdown("### 선택 부품")
         if selected_component is None:
             st.caption("PCB에서 박스를 누르면 이곳에 인식 정보가 표시됩니다.")
         else:
             edits = st.session_state.setdefault(COMPONENT_EDIT_KEY, {})
             edit = edits.get(selected_component.component_id, {})
-            current_type = edit.get("component_type", selected_component.component_type)
+            current_type = selected_component.component_type
             current_marking = edit.get("ocr_marking", selected_component.ocr_marking or "")
             current_value = edit.get("component_info", selected_component.component_info or "")
             st.caption(f"부품 ID · {selected_component.component_id}")
@@ -76,40 +117,74 @@ def render_inspection_panel(
                 "part_identity_status": "UNCONFIRMED", "confirmed_functional_roles": [],
             })
             review_row = None
-            if review_image_bytes is not None and review_scope:
-                from circuitcare.vision.component_recognition_panel import review_keys
-
-                _result_key, records_key, _error_key = review_keys(review_scope)
+            records_key = review_keys(review_scope)[1] if review_scope else None
+            if review_image_bytes is not None and records_key:
                 review_row = next((row for row in st.session_state.get(records_key, [])
                                    if row.get("component_id") == selected_component.component_id), None)
-                if review_row and review_row.get("상태") == "제외":
-                    inventory_item["presence_status"] = "EXCLUDED"
-            presence_options = ("UNCONFIRMED", "CONFIRMED", "EXCLUDED")
-            presence_labels = {"UNCONFIRMED": "미확인", "CONFIRMED": "실제 부품 확인", "EXCLUDED": "오검출 · 제외"}
-            presence_key = f"cc_component_presence_{hash(owner)}_{selected_component.component_id}"
-            current_presence = inventory_item.get("presence_status", "UNCONFIRMED")
-            if review_row and review_row.get("상태") == "제외":
-                st.session_state[presence_key] = "EXCLUDED"
-            elif st.session_state.get(presence_key) not in presence_options:
-                st.session_state[presence_key] = current_presence
-            presence_status = st.radio(
-                "PCB에서 선택 부품 상태", presence_options,
-                format_func=presence_labels.get, horizontal=True, key=presence_key,
-                on_change=_sync_inventory_widget, args=(st, owner, selected_component.component_id,
-                                                        "presence_status", presence_key),
-            )
-            inventory_item["presence_status"] = presence_status
-            st.caption("확인한 소자만 진단 후보로 사용합니다. 오검출은 제외하고, 아직 판단이 안 되면 미확인으로 두세요.")
-            type_status_key = f"cc_component_type_status_{hash(owner)}_{selected_component.component_id}"
+            current_status = review_row.get("상태", "검수 필요") if review_row else (
+                "확인" if selected_component.presence_status == "CONFIRMED" else "검수 필요")
+            inventory_item["presence_status"] = (
+                "CONFIRMED" if current_status == "확인" else "EXCLUDED" if current_status == "제외" else "UNCONFIRMED")
+            inventory_item["component_type_status"] = "USER_CONFIRMED" if current_status == "확인" else "UNCONFIRMED"
+            st.caption(f"상태 · {current_status} · 검수 레코드와 동기화됨")
+            if review_row is not None and review_row.get("상태") == "제외":
+                st.warning("제외된 박스입니다. 복원 전까지 진단과 기본 Viewer에서 제외됩니다.")
+            elif review_scope and records_key:
+                if st.button("박스 제외", key=f"cc_selected_box_exclude_{selected_component.component_id}",
+                             type="primary", use_container_width=True):
+                    rows = list(st.session_state.get(records_key, []))
+                    review_row = ensure_review_row_for_component(rows, selected_component)
+                    record_box_exclusion(st.session_state, scope=review_scope, row=review_row)
+                    st.session_state[records_key] = rows
+                    invalidate_component_review_state(st.session_state, scope=review_scope,
+                        project_id=project.project_id, board_id=project.board_id)
+                    update_selection(st.session_state, project=project, selected_component=None)
+                    st.rerun()
+            if review_scope and records_key and review_image_bytes is not None:
+                box = review_row or {"x1": selected_component.bbox_xyxy[0], "y1": selected_component.bbox_xyxy[1],
+                                     "x2": selected_component.bbox_xyxy[2], "y2": selected_component.bbox_xyxy[3]}
+                row_signature = (current_type, current_status,
+                                 int(box["x1"]), int(box["y1"]), int(box["x2"]), int(box["y2"]))
+                form_version = hashlib.sha1(repr(row_signature).encode()).hexdigest()[:8]
+                form_key = f"cc_review_box_editor_{review_scope}_{selected_component.component_id}_{form_version}"
+                with st.form(form_key):
+                    st.selectbox("소자 종류", CLASS_OPTIONS,
+                                 index=CLASS_OPTIONS.index(current_type if current_type in CLASS_OPTIONS else "unknown"),
+                                 key=f"{form_key}_class")
+                    editable_statuses = [value for value in STATUS_OPTIONS if value != "제외"]
+                    status_value = current_status if current_status in editable_statuses else "검수 필요"
+                    st.selectbox("검수 상태", editable_statuses, index=editable_statuses.index(status_value),
+                                 key=f"{form_key}_status")
+                    with st.expander("박스 위치·크기"):
+                        cols = st.columns(2)
+                        x1 = cols[0].number_input("왼쪽 x", min_value=0, value=int(box["x1"]), key=f"{form_key}_x1")
+                        y1 = cols[1].number_input("위쪽 y", min_value=0, value=int(box["y1"]), key=f"{form_key}_y1")
+                        x2 = cols[0].number_input("오른쪽 x", min_value=0, value=int(box["x2"]), key=f"{form_key}_x2")
+                        y2 = cols[1].number_input("아래쪽 y", min_value=0, value=int(box["y2"]), key=f"{form_key}_y2")
+                    apply = st.form_submit_button("변경 적용", use_container_width=True)
+                if apply:
+                    from PIL import Image
+                    with Image.open(io.BytesIO(review_image_bytes)) as source_image:
+                        width, height = source_image.size
+                    coords = [max(0, min(width, int(x1))), max(0, min(height, int(y1))),
+                              max(0, min(width, int(x2))), max(0, min(height, int(y2)))]
+                    try:
+                        rows = list(st.session_state.get(records_key, []))
+                        review_row = ensure_review_row_for_component(rows, selected_component)
+                        next_status = st.session_state[f"{form_key}_status"]
+                        update_review_row(review_row,
+                            component_type=st.session_state[f"{form_key}_class"],
+                            status=next_status, bbox_xyxy=coords)
+                        st.session_state[records_key] = rows
+                        inventory_item["presence_status"] = "CONFIRMED" if review_row["상태"] == "확인" else "UNCONFIRMED"
+                        inventory_item["component_type_status"] = "USER_CONFIRMED" if review_row["상태"] == "확인" else "UNCONFIRMED"
+                        st.session_state[COMPONENT_INVENTORY_KEY] = inventories
+                        invalidate_component_review_state(st.session_state, scope=review_scope,
+                            project_id=project.project_id, board_id=project.board_id)
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
             type_status_options = ("UNCONFIRMED", "USER_CONFIRMED")
-            if st.session_state.get(type_status_key) not in type_status_options:
-                st.session_state[type_status_key] = inventory_item.get("component_type_status", "UNCONFIRMED")
-            component_type_status = st.radio("부품 종류 확인", type_status_options,
-                format_func=lambda value: "종류 확인됨" if value == "USER_CONFIRMED" else "종류 미확인",
-                horizontal=True, key=type_status_key,
-                on_change=_sync_inventory_widget, args=(st, owner, selected_component.component_id,
-                                                        "component_type_status", type_status_key))
-            inventory_item["component_type_status"] = component_type_status
             with st.expander("상세 식별·기능 확인", expanded=False):
                 identity_key = f"cc_part_identity_status_{hash(owner)}_{selected_component.component_id}"
                 if st.session_state.get(identity_key) not in type_status_options:
@@ -136,7 +211,7 @@ def render_inspection_panel(
             selected_component = replace(
                 selected_component,
                 component_type=current_type,
-                presence_status=presence_status,
+                presence_status=inventory_item["presence_status"],
                 confirmed_functional_roles=tuple(confirmed_roles),
             )
             if review_image_bytes is not None and review_scope:
@@ -173,7 +248,6 @@ def render_inspection_panel(
                                     edits = st.session_state.setdefault(COMPONENT_EDIT_KEY, {})
                                     edits[selected_component.component_id] = {
                                         **edits.get(selected_component.component_id, {}),
-                                        "component_type": current_type,
                                         "ocr_marking": choice,
                                         "component_info": marking_result.get("inferred_value") or current_value,
                                     }
@@ -200,25 +274,19 @@ def render_inspection_panel(
                     f"검사 이력 · {history_item.get('fault_title', history_item.get('fault_hypothesis', '고장 가설'))} · "
                     f"{history_item.get('measurement_verdict', '판정 기록')}"
                 )
-            type_key = f"cc_v4_edit_type_{selected_component.component_id}"
             marking_key = f"cc_v4_edit_marking_{selected_component.component_id}"
             value_key = f"cc_v4_edit_value_{selected_component.component_id}"
-            if st.session_state.get(type_key) not in COMPONENT_TYPE_OPTIONS:
-                st.session_state[type_key] = current_type if current_type in COMPONENT_TYPE_OPTIONS else "unknown"
             if marking_key not in st.session_state:
                 st.session_state[marking_key] = current_marking
             if value_key not in st.session_state:
                 st.session_state[value_key] = current_value
             with st.expander("인식 정보 편집", expanded=False):
-                st.selectbox("인식 부품 종류", COMPONENT_TYPE_OPTIONS,
-                             format_func=_component_label, key=type_key)
                 st.text_input("OCR 인식값 · 각인/부품번호", key=marking_key,
                               placeholder="예: 103, LM358")
                 st.text_input("소자 값 · OCR 유추값 또는 직접 입력", key=value_key,
                               placeholder="예: 10 kΩ, 100 nF, 3.3 V")
                 if st.button("인식 정보 저장", type="primary", key=f"cc_v4_save_component_{selected_component.component_id}"):
                     edits[selected_component.component_id] = {
-                        "component_type": st.session_state[type_key],
                         "ocr_marking": st.session_state[marking_key].strip(),
                         "component_info": st.session_state[value_key].strip(),
                     }
@@ -240,10 +308,13 @@ def render_inspection_panel(
                 with st.expander("검출 근거"):
                     st.write(" · ".join(selected_component.evidence))
             if review_row is not None and review_image_bytes is not None and review_scope:
-                render_selected_component_editor(
-                    st, image_bytes=review_image_bytes, scope=review_scope,
-                    component_id=selected_component.component_id,
-                )
+                rows = st.session_state.get(review_keys(review_scope)[1], [])
+                excluded_rows = [row for row in rows if row.get("상태") == "제외"]
+                if excluded_rows:
+                    st.caption(f"제외된 박스 {len(excluded_rows)}개 · 상단의 복원 메뉴에서 되살릴 수 있습니다.")
+        with st.expander("증상 진단", expanded=False):
+            render_symptom_diagnosis_panel(st, project, components=components, preview=preview,
+                                           component_inventory=inventory)
         measurements = get_measurements(
             st.session_state, project_id=project.project_id, board_id=project.board_id or "",
         )
