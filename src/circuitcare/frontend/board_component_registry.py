@@ -83,9 +83,35 @@ def measurement_component_aliases(registry: dict[str, Any]) -> dict[str, str | N
             for local_id, board_ids in candidates.items()}
 
 
+def source_observation_fingerprint(source: dict[str, Any]) -> str:
+    """Fingerprint component identity evidence, excluding UI-only state."""
+    identity_fields = (
+        "photo_id", "image_fingerprint", "component_id", "detection_id", "bbox_xyxy",
+        "detection_version", "review_evidence_version",
+        "detection_confidence", "location_confidence", "type_confidence", "source",
+        "component_type", "review_status", "presence_status", "type_status",
+        "ocr_marking", "ocr_candidates", "possible_part_number", "functional_roles", "evidence",
+    )
+    payload = {key: source.get(key) for key in identity_fields}
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def current_source_observation_fingerprint(
+    registry: dict[str, Any], *, photo_id: str | None, component_id: str,
+) -> str | None:
+    if not photo_id:
+        return None
+    key = source_component_key(photo_id, component_id)
+    source = next((source for row in registry.get("components", [])
+                   for source in row.get("source_components", []) if source.get("source_key") == key), None)
+    return source_observation_fingerprint(source) if source else None
+
+
 def resolve_measurement_board_component(
     registry: dict[str, Any], *, photo_id: str | None, component_id: str,
     photo_fingerprint: str | None = None, component_map_version: str | None = None,
+    observation_fingerprint: str | None = None,
 ) -> tuple[str | None, str]:
     """Resolve a measurement source only by exact photo/local identity or a unique legacy alias."""
     if photo_id:
@@ -100,6 +126,11 @@ def resolve_measurement_board_component(
         source = next((source for row in registry.get("components", [])
                        for source in row.get("source_components", [])
                        if source.get("source_key") == key), None)
+        if source is None:
+            return None, "RECONFIRMATION_REQUIRED"
+        current_observation = source_observation_fingerprint(source)
+        if not observation_fingerprint or observation_fingerprint != current_observation:
+            return None, "RECONFIRMATION_REQUIRED"
         if (board_id and component_map_version and source
                 and source.get("component_map_version") != component_map_version):
             return None, "PHOTO_COMPONENT_MAP_CHANGED_RECONFIRMATION_REQUIRED"
@@ -108,15 +139,17 @@ def resolve_measurement_board_component(
         return None, "UNRESOLVED"
     alias = measurement_component_aliases(registry).get(component_id)
     if alias:
-        if component_map_version:
-            candidates = [source for row in registry.get("components", [])
-                          if row.get("board_component_id") == alias
-                          for source in row.get("source_components", [])
-                          if source.get("component_id") == component_id]
-            matches = [source for source in candidates
-                       if source.get("component_map_version") == component_map_version]
-            if len(matches) != 1:
-                return None, "PHOTO_COMPONENT_MAP_CHANGED_RECONFIRMATION_REQUIRED"
+        candidates = [source for row in registry.get("components", [])
+                      if row.get("board_component_id") == alias
+                      for source in row.get("source_components", [])
+                      if source.get("component_id") == component_id]
+        if not observation_fingerprint:
+            return None, "RECONFIRMATION_REQUIRED"
+        matches = [source for source in candidates
+                   if source_observation_fingerprint(source) == observation_fingerprint
+                   and (not component_map_version or source.get("component_map_version") == component_map_version)]
+        if len(matches) != 1:
+            return None, "RECONFIRMATION_REQUIRED"
         return alias, "VERIFIED_UNIQUE_LEGACY_ALIAS"
     return None, "UNRESOLVED"
 
@@ -154,6 +187,11 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
                 "board_side": str(snapshot.get("side", "unknown")),
                 "capture_type": str(snapshot.get("capture_type", "unknown")),
                 "detection_id": local_id, "component_type": str(get("component_type", "unknown")),
+                "detection_version": get("detection_version", get("detection_model_version")),
+                "review_evidence_version": get("review_evidence_version"),
+                "detection_confidence": get("confidence", get("신뢰도")),
+                "location_confidence": get("location_confidence"),
+                "type_confidence": get("type_confidence"),
                 "bbox_xyxy": list(bbox),
                 "coordinate_frame": str(get("coordinate_frame", "SOURCE_PHOTO_PIXEL")),
                 "review_status": str(get("identification_status", "UNCONFIRMED")),
@@ -166,6 +204,7 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
                 "evidence": list(get("evidence", ()) or ()),
                 "source": get("overlay_source"),
             }
+            sources[key]["source_observation_fingerprint"] = source_observation_fingerprint(sources[key])
     return sources
 
 
@@ -174,6 +213,7 @@ def _link_source_version(source: dict[str, Any]) -> dict[str, Any]:
         "image_fingerprint": source.get("image_fingerprint"),
         "review_version": source.get("review_version"),
         "component_map_version": source.get("component_map_version"),
+        "source_observation_fingerprint": source.get("source_observation_fingerprint"),
     }
 
 

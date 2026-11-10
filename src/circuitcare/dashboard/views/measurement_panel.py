@@ -7,17 +7,21 @@ from datetime import datetime, timezone
 from typing import Any
 
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
-from circuitcare.frontend.board_component_registry import resolve_measurement_board_component
+from circuitcare.frontend.board_component_registry import (
+    current_source_observation_fingerprint, resolve_measurement_board_component,
+)
 from circuitcare.frontend.measurement_adapter import adapt_measurement_input
 from circuitcare.frontend.measurement_models import (
     BASE_UNITS, MEASUREMENT_TYPE_LABELS, MEASUREMENT_UNITS, SOURCE_LABELS,
     MeasurementRecord, parse_finite_number,
 )
 from circuitcare.frontend.measurement_state import (
-    delete_measurement, get_measurements, save_measurement, update_measurement,
+    delete_measurement, get_measurements, reconfirm_measurement_identity,
+    save_measurement, update_measurement,
 )
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.symptom_diagnosis import load_knowledge
+from circuitcare.symptom_diagnosis.measurement_validation import measurement_verification_gaps
 
 SOURCE_OPTIONS = (
     "실제 측정 · 사용자 입력", "시뮬레이션", "가상 데모", "가져온 측정값", "출처 미확인",
@@ -28,29 +32,8 @@ TYPE_OPTIONS = tuple(MEASUREMENT_TYPE_LABELS)
 
 def _measurement_verification_gaps(record: MeasurementRecord) -> list[str]:
     """Return UI-facing missing conditions; recording remains allowed without them."""
-    gaps = []
-    if not record.measurement_target:
-        gaps.append("측정 대상 미지정")
-    if not record.board_component_id or not str(record.identity_resolution_status).startswith(("USER_SELECTED_", "VERIFIED_")):
-        gaps.append("보드 소자 연결 미확인")
-    if record.mapping_status != "MAPPED" or not record.probe_id or not record.node_id:
-        gaps.append("전기적 측정 지점 연결 미확인")
-    if record.uncertainty is None or record.uncertainty <= 0:
-        gaps.append("측정 불확실도 미입력")
-    if record.source != "user_measurement" or record.verification_status != "USER_REPORTED":
-        gaps.append("실측 출처 미확인")
-    if not record.test_id:
-        gaps.append("검사 프로파일 미선택")
-    if (record.reference_min is None or record.reference_max is None
-            or record.reference_verification_status not in {"DATASHEET_VERIFIED", "BOARD_SPEC_VERIFIED"}
-            or not record.reference_source):
-        gaps.append("검증된 정상 범위·출처 없음")
-    if (not record.operating_conditions or not record.reference_conditions
-            or record.operating_conditions.strip() != record.reference_conditions.strip()):
-        gaps.append("측정 조건과 기준 조건이 일치하지 않음")
-    if not record.location_verified:
-        gaps.append("측정 지점 확인 전")
-    return gaps
+    profiles = load_knowledge().get("component_test_profiles", {})
+    return measurement_verification_gaps(record, profiles=profiles)
 
 
 def _sigma_for_input_unit(value: Any, measurement_type: str, unit: str) -> str | None:
@@ -89,10 +72,11 @@ def render_measurement_panel(
                     actual, resolution = resolve_measurement_board_component(
                         board_registry, photo_id=source_photo, component_id=source_local,
                         photo_fingerprint=row.source_photo_fingerprint,
+                        observation_fingerprint=row.source_observation_fingerprint,
                         component_map_version=(row.component_map_version
                                                if not row.source_photo_fingerprint else None))
                     if actual is None:
-                        resolved_id, resolution = None, "UNRESOLVED"
+                        resolved_id = None
                     else:
                         resolved_id = actual
                 elif (not source_photo or not source_local or not any(item.get("board_component_id") == resolved_id
@@ -103,9 +87,10 @@ def render_measurement_panel(
                     board_registry, photo_id=row.source_photo_id,
                     component_id=row.source_component_id or row.component_id,
                     photo_fingerprint=row.source_photo_fingerprint,
+                    observation_fingerprint=row.source_observation_fingerprint,
                     component_map_version=row.component_map_version)
         if (board_component_id and resolved_id == board_component_id
-                and str(resolution).startswith("VERIFIED_")):
+                and str(resolution).startswith(("VERIFIED_", "USER_RECONFIRMED_"))):
             projected = replace(
                 row, board_component_id=str(resolved_id),
                 identity_resolution_status=resolution,
@@ -117,9 +102,10 @@ def render_measurement_panel(
                 current_records.append(row)
             else:
                 stale_records.append(row)
-        elif (not str(resolution).startswith("VERIFIED_")
+        elif (not str(resolution).startswith(("VERIFIED_", "USER_RECONFIRMED_"))
               and (row.component_id == selected_component.component_id
-                   or row.source_component_id == selected_component.component_id)):
+                   or row.source_component_id == selected_component.component_id
+                   or str(resolution).endswith("RECONFIRMATION_REQUIRED"))):
             stale_records.append(row)
     st.caption(f"측정 대상 · {board_component_id or selected_component.component_id} · {selected_component.component_type}")
     st.caption("측정값을 먼저 기록하세요. 검증 조건이 부족한 기록은 보존되지만 검증 결과로 판정하지 않습니다.")
@@ -199,6 +185,10 @@ def render_measurement_panel(
                 source_photo_fingerprint=next((item.get("image_fingerprint")
                                                 for item in (board_registry or {}).get("photos", [])
                                                 if item.get("photo_id") == selected_component.canonical_frame_id), None),
+                source_observation_fingerprint=current_source_observation_fingerprint(
+                    board_registry or {}, photo_id=selected_component.canonical_frame_id,
+                    component_id=selected_component.component_id,
+                ),
                 source_component_id=selected_component.component_id,
                 measurement_location=target,
                 identity_resolution_status=("USER_SELECTED_VERIFIED" if board_component_id else "UNRESOLVED"),
@@ -233,6 +223,31 @@ def render_measurement_panel(
                     f"{record.timestamp[:16]} · Map {record.component_map_version or '없음'} · "
                     "현재 부품과 연결 미확인"
                 )
+                if isinstance(board_registry, dict) and st.button(
+                    f"현재 선택 소자로 재연결 · {record.measurement_id[:8]}",
+                    key=f"cc_reconfirm_measurement_{record.measurement_id}",
+                ):
+                    photo_id = selected_component.canonical_frame_id
+                    photo = next((item for item in board_registry.get("photos", [])
+                                  if item.get("photo_id") == photo_id), {})
+                    observation_fp = current_source_observation_fingerprint(
+                        board_registry, photo_id=photo_id, component_id=selected_component.component_id)
+                    try:
+                        reconfirm_measurement_identity(
+                            st.session_state, measurement_id=record.measurement_id,
+                            project_id=project.project_id, board_id=project.board_id,
+                            board_component_id=board_component_id or "",
+                            source_photo_id=photo_id or "",
+                            source_component_id=selected_component.component_id,
+                            source_photo_fingerprint=str(photo.get("image_fingerprint") or ""),
+                            source_observation_fingerprint=observation_fp or "",
+                            component_type=selected_component.component_type,
+                            component_map_version=component_map_version,
+                        )
+                        st.success("사용자 확인 기록을 남기고 측정을 현재 관측에 연결했습니다.")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
 
 
 def _render_record_editor(st: Any, *, project: ProjectContext, record: MeasurementRecord, owner: str) -> None:
@@ -403,6 +418,7 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
                     updated, board_component_id=record.board_component_id,
                     source_photo_id=record.source_photo_id,
                     source_photo_fingerprint=record.source_photo_fingerprint,
+                    source_observation_fingerprint=record.source_observation_fingerprint,
                     source_component_id=record.source_component_id,
                     measurement_location=target or None,
                     identity_resolution_status=record.identity_resolution_status,

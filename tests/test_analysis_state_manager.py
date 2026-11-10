@@ -9,10 +9,11 @@ from circuitcare.analysis.state_manager import (
 from circuitcare.dashboard.views.symptom_diagnosis_panel import current_analysis_snapshot
 from circuitcare.frontend.models import ImageRecord, ProjectContext, SelectionState
 from circuitcare.frontend.board_component_registry import (
-    build_board_component_registry, diagnosis_components, measurement_component_aliases,
+    build_board_component_registry, current_source_observation_fingerprint,
+    diagnosis_components, measurement_component_aliases,
 )
 from circuitcare.frontend.measurement_models import create_measurement_record
-from circuitcare.frontend.measurement_state import save_measurement
+from circuitcare.frontend.measurement_state import reconfirm_measurement_identity, save_measurement
 
 
 def _fingerprints(*, symptoms="no_power", measurements=(), rules="rules-v1"):
@@ -243,6 +244,16 @@ def test_board_analysis_projects_verified_measurements_and_drops_replaced_photo_
         analysis_target_id="board:registry:v1",
         component_id_aliases=measurement_component_aliases(registry),
         board_registry=registry,
+    )
+    current = current_analysis_snapshot(st, project, **args)
+    assert current["measurements"] == []  # Legacy record has no source observation fingerprint.
+    reconfirm_measurement_identity(
+        state, measurement_id="m-r1", project_id=project.project_id, board_id=project.board_id,
+        board_component_id=board_id, source_photo_id="front", source_component_id="R1",
+        source_photo_fingerprint="front-v1",
+        source_observation_fingerprint=current_source_observation_fingerprint(
+            registry, photo_id="front", component_id="R1"),
+        component_type="resistor", component_map_version=registry["version"],
     )
     current = current_analysis_snapshot(st, project, **args)
     assert len(current["measurements"]) == 1

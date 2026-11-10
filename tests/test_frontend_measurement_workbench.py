@@ -62,8 +62,8 @@ def test_uncertainty_may_be_absent_for_record_only_measurement():
     row = _measurement(uncertainty="")
     assert row.uncertainty is None
     assert row.verification_status == "USER_REPORTED"
-    assert "측정 불확실도 미입력" in _measurement_verification_gaps(row)
-    assert "전기적 측정 지점 연결 미확인" in _measurement_verification_gaps(row)
+    assert "측정 불확실도 또는 출처 미입력" in _measurement_verification_gaps(row)
+    assert "전기적 측정 지점 연결 미확인" not in _measurement_verification_gaps(row)
 
 
 def test_measurement_record_can_be_saved_without_verification_data():

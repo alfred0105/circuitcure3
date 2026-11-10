@@ -33,6 +33,7 @@ connectivity = [
 circuitcare = "circuitcare.cli:main"
 circuitcare-diagnose = "circuitcare.diagnosis_cli:main"
 circuitcare-advise = "circuitcare.repair_cli:main"
+circuitcare-validate = "circuitcare.benchmark.pcb_validation_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

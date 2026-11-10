@@ -126,6 +126,7 @@ def current_analysis_snapshot(
                     actual, status = resolve_measurement_board_component(
                         board_registry, photo_id=source_photo, component_id=source_local,
                         photo_fingerprint=getattr(row, "source_photo_fingerprint", None),
+                        observation_fingerprint=getattr(row, "source_observation_fingerprint", None),
                         component_map_version=(row.component_map_version
                                                if not getattr(row, "source_photo_fingerprint", None)
                                                else None))
@@ -142,6 +143,7 @@ def current_analysis_snapshot(
                 resolved, resolution = resolve_measurement_board_component(
                     board_registry, photo_id=source_photo, component_id=source_local,
                     photo_fingerprint=getattr(row, "source_photo_fingerprint", None),
+                    observation_fingerprint=getattr(row, "source_observation_fingerprint", None),
                     component_map_version=row.component_map_version)
             projected.append(replace(
                 row, component_id=str(resolved or ""),
@@ -155,7 +157,7 @@ def current_analysis_snapshot(
         # Unresolved/retired identities stay in the measurement archive and UI,
         # but are not evidence for the current diagnosis.
         measurements = [row for row in projected
-                        if str(row.identity_resolution_status).startswith("VERIFIED_")]
+                        if str(row.identity_resolution_status).startswith(("VERIFIED_", "USER_RECONFIRMED_"))]
     elif component_id_aliases is not None:
         measurements = [replace(
             row, component_id=component_id_aliases.get(row.component_id) or "",

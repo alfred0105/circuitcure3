@@ -66,6 +66,7 @@ class MeasurementRecord:
     board_component_id: str | None = None
     source_photo_id: str | None = None
     source_photo_fingerprint: str | None = None
+    source_observation_fingerprint: str | None = None
     source_component_id: str | None = None
     measurement_location: str | None = None
     identity_resolution_status: str = "UNRESOLVED"
@@ -103,6 +104,7 @@ def create_measurement_record(
     component_type: str = "unknown",
     board_component_id: str | None = None, source_photo_id: str | None = None,
     source_photo_fingerprint: str | None = None, source_component_id: str | None = None,
+    source_observation_fingerprint: str | None = None,
     measurement_location: str | None = None,
     identity_resolution_status: str = "UNRESOLVED",
 ) -> MeasurementRecord:
@@ -170,6 +172,7 @@ def create_measurement_record(
         board_component_id=(board_component_id or "").strip() or None,
         source_photo_id=(source_photo_id or "").strip() or None,
         source_photo_fingerprint=(source_photo_fingerprint or "").strip() or None,
+        source_observation_fingerprint=(source_observation_fingerprint or "").strip() or None,
         source_component_id=(source_component_id or component_id).strip() or None,
         measurement_location=(measurement_location or measurement_target or "").strip() or None,
         identity_resolution_status=str(identity_resolution_status or "UNRESOLVED"),

@@ -27,6 +27,7 @@ def test_rerun_keeps_manual_and_qwen_boxes_when_detector_misses_them():
 def test_conflicted_measurement_verdict_is_not_overwritten_by_later_measurement():
     def measurement(identifier, value):
         return {"component_id": "R1", "fault_hypothesis": "R_FAIL", "test_id": "resistance",
+                "board_component_id": "bc-r1", "identity_resolution_status": "USER_RECONFIRMED_VERIFIED",
                 "measurement_target": "A-B", "operating_conditions": "power off",
                 "measurement_id": identifier, "source": "user_measurement", "verification_status": "USER_REPORTED",
                 "component_identity_status": "USER_CONFIRMED", "location_verified": True,

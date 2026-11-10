@@ -86,10 +86,10 @@ def update_measurement(state: dict[str, Any], updated: MeasurementRecord) -> Non
             or original.component_identity_status != updated.component_identity_status):
         raise ValueError("측정 기록의 Component Map 또는 Identity를 수정할 수 없습니다.")
     if (original.component_type, original.board_component_id, original.source_photo_id, original.source_photo_fingerprint,
-            original.source_component_id,
+            original.source_observation_fingerprint, original.source_component_id,
             original.identity_resolution_status) != (
             updated.component_type, updated.board_component_id, updated.source_photo_id, updated.source_photo_fingerprint,
-            updated.source_component_id,
+            updated.source_observation_fingerprint, updated.source_component_id,
             updated.identity_resolution_status):
         raise ValueError("측정 기록의 보드 소자 연결과 원본 식별 정보는 수정할 수 없습니다.")
     before = build_measurement_fingerprint(records)
@@ -102,6 +102,43 @@ def update_measurement(state: dict[str, Any], updated: MeasurementRecord) -> Non
     _append_measurement_history(state, records[index], "UPDATED", previous=original)
     if before != build_measurement_fingerprint(scoped[key]):
         invalidate_diagnosis(state, project_id=updated.project_id, board_id=updated.board_id)
+
+
+def reconfirm_measurement_identity(
+    state: dict[str, Any], *, measurement_id: str, project_id: str, board_id: str,
+    board_component_id: str, source_photo_id: str, source_component_id: str,
+    source_photo_fingerprint: str, source_observation_fingerprint: str,
+    component_type: str, component_map_version: str | None,
+) -> None:
+    """Explicit user action to reconnect an archived reading to a current observation."""
+    records = get_measurements(state, project_id=project_id, board_id=board_id)
+    original = next((item for item in records if item.measurement_id == measurement_id), None)
+    if original is None:
+        raise ValueError("현재 보드에서 측정 기록을 찾을 수 없습니다.")
+    if not all((board_component_id, source_photo_id, source_component_id, source_photo_fingerprint,
+                source_observation_fingerprint)):
+        raise ValueError("현재 사진과 소자 관측의 식별 정보가 충분하지 않습니다.")
+    updated = replace(
+        original, board_component_id=board_component_id, component_id=board_component_id,
+        source_photo_id=source_photo_id, source_component_id=source_component_id,
+        source_photo_fingerprint=source_photo_fingerprint,
+        source_observation_fingerprint=source_observation_fingerprint,
+        component_type=component_type, component_map_version=component_map_version,
+        identity_resolution_status="USER_RECONFIRMED_VERIFIED",
+        component_identity_status="USER_CONFIRMED",
+        changed_at=datetime.now(timezone.utc).isoformat(), measurement_set_id=None,
+    )
+    scoped = dict(state.get(MEASUREMENTS_KEY, {}))
+    key = owner_key(project_id, board_id)
+    current = list(scoped.get(key, []))
+    index = next(i for i, item in enumerate(current) if item.measurement_id == measurement_id)
+    before = build_measurement_fingerprint(current)
+    current[index] = updated
+    scoped[key] = assign_measurement_set(current, project_id=project_id, board_id=board_id)
+    state[MEASUREMENTS_KEY] = scoped
+    _append_measurement_history(state, scoped[key][index], "IDENTITY_RECONFIRMED", previous=original)
+    if before != build_measurement_fingerprint(scoped[key]):
+        invalidate_diagnosis(state, project_id=project_id, board_id=board_id)
 
 
 def delete_measurement(state: dict[str, Any], *, project_id: str, board_id: str,
