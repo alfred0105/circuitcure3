@@ -47,7 +47,13 @@ def test_click_and_clear_selection_events_are_scoped_and_monotonic():
     assert validate_component_selection_event(event, **kwargs) == (True, None)
     overlapping = {**event, "overlapping_component_ids": ["c1", "c2"]}
     assert validate_component_selection_event(overlapping, **{**kwargs, "allowed_ids": {"c1", "c2"}}) == (True, None)
-    assert validate_component_selection_event(overlapping, **kwargs)[0] is False
+    # Other overlap candidates may be stale between the browser click and the
+    # current render; the selected, owner-validated ID must remain selectable.
+    assert validate_component_selection_event(overlapping, **kwargs) == (True, None)
+    assert validate_component_selection_event(
+        {**event, "component_id": "missing", "overlapping_component_ids": ["missing", "c2"]},
+        **{**kwargs, "allowed_ids": {"c1"}},
+    )[0] is False
     assert validate_component_selection_event(
         {**event, "event_epoch": "old"}, **{**kwargs, "event_epoch": "current"}
     ) == (False, "이전 Viewer 인스턴스의 선택 이벤트")
@@ -76,13 +82,13 @@ def test_viewer_click_event_updates_real_streamlit_selection_and_overlap_stack(m
 
     def fake_render(_st, **kwargs):
         key = kwargs["key"]
-        streamlit.session_state[key] = {"selection": {
+        streamlit.session_state[key] = {"selection_event": {
             "project_id": "p1", "board_id": "b1", "board_side": "TOP",
             "canonical_frame_id": "photo1", "component_id": "c1", "selection_action": "select",
             "overlapping_component_ids": ["c1", "c2"], "event_seq": 1, "event_id": "click-1",
             "event_epoch": kwargs["event_epoch"],
         }}
-        kwargs["on_selection_change"]()
+        kwargs["on_selection_event_change"]()
         return object()
 
     monkeypatch.setattr(workspace, "render_pcb_viewer", fake_render)
@@ -95,6 +101,80 @@ def test_viewer_click_event_updates_real_streamlit_selection_and_overlap_stack(m
     selection = streamlit.session_state[SELECTION_KEY]
     assert selection.selected_component == "c1"
     assert streamlit.session_state[f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"] == ["c1", "c2"]
+
+
+def test_viewer_click_keeps_valid_selection_and_filters_stale_overlap_ids(monkeypatch):
+    import circuitcare.dashboard.components.pcb_workspace as workspace
+
+    streamlit = SimpleNamespace(session_state={})
+    project = ProjectContext(project_id="p1", board_id="b1")
+    from circuitcare.frontend.workbench_state import SELECTION_KEY
+    streamlit.session_state[SELECTION_KEY] = SelectionState(project_id="p1", board_id="b1")
+    output = io.BytesIO()
+    Image.new("RGB", (32, 32), "white").save(output, format="PNG")
+    components = (_model(),)
+
+    def fake_render(_st, **kwargs):
+        key = kwargs["key"]
+        streamlit.session_state[key] = {"selection": {
+            "project_id": "p1", "board_id": "b1", "board_side": "TOP",
+            "canonical_frame_id": "photo1", "component_id": "c1", "selection_action": "select",
+            "overlapping_component_ids": ["c1", "deleted-stale-id"], "event_seq": 1,
+            "event_id": "click-stale-overlap", "event_epoch": kwargs["event_epoch"],
+        }}
+        kwargs["on_selection_change"]()
+        return object()
+
+    monkeypatch.setattr(workspace, "render_pcb_viewer", fake_render)
+    _available, viewer_key, _status = render_component_viewer(
+        streamlit, image=None, source_image_bytes=output.getvalue(), canonical_png_bytes=None,
+        image_size_px=(32, 32), components=components, project=project, board_side="TOP",
+        frame_id="photo1", selected_component_id=None, map_cache_key="map1", image_mode="원본 사진",
+    )
+    assert streamlit.session_state[SELECTION_KEY].selected_component == "c1"
+    assert streamlit.session_state[f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"] == ["c1"]
+
+
+def test_component_result_is_applied_even_when_callback_session_view_is_late(monkeypatch):
+    import circuitcare.dashboard.components.pcb_workspace as workspace
+
+    reruns = []
+    streamlit = SimpleNamespace(session_state={}, rerun=lambda: reruns.append(True))
+    project = ProjectContext(project_id="p1", board_id="b1")
+    from circuitcare.frontend.workbench_state import SELECTION_KEY
+    streamlit.session_state[SELECTION_KEY] = SelectionState(project_id="p1", board_id="b1")
+    output = io.BytesIO()
+    Image.new("RGB", (32, 32), "white").save(output, format="PNG")
+    event = {"project_id": "p1", "board_id": "b1", "board_side": "TOP",
+             "canonical_frame_id": "photo1", "component_id": "c1", "selection_action": "select",
+             "overlapping_component_ids": ["c1"], "event_seq": 1, "event_id": "result-click",
+             "event_epoch": "unused"}
+
+    def fake_render(_st, **kwargs):
+        return SimpleNamespace(selection={**event, "event_epoch": kwargs["event_epoch"]}, viewer_status=None)
+
+    monkeypatch.setattr(workspace, "render_pcb_viewer", fake_render)
+    workspace.render_component_viewer(
+        streamlit, image=None, source_image_bytes=output.getvalue(), canonical_png_bytes=None,
+        image_size_px=(32, 32), components=(_model(),), project=project, board_side="TOP",
+        frame_id="photo1", selected_component_id=None, map_cache_key="map1", image_mode="원본 사진",
+    )
+    assert streamlit.session_state[SELECTION_KEY].selected_component == "c1"
+    assert reruns == [True]
+
+
+def test_pcb_viewer_uses_shared_hit_test_from_real_click_and_does_not_capture_plain_click():
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "src/circuitcare/dashboard/components/assets/pcb_viewer.js").read_text()
+    assert 'listen(viewport,"click"' in source
+    assert "const hits=hitComponents(event)" in source
+    assert "[pcb-selection] click" in source
+    assert "viewport.setPointerCapture(event.pointerId)" in source
+    # Pointer capture is acquired only after the movement crosses the drag threshold.
+    pointerdown = source.split('listen(viewport,"pointerdown"', 1)[1].split('listen(viewport,"pointermove"', 1)[0]
+    plain_pan_start = pointerdown.split("state.drag={", 1)[1]
+    assert "setPointerCapture" not in plain_pan_start
 
 
 def test_review_row_is_single_source_for_selected_box_edit_exclusion_and_restore():

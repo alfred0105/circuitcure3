@@ -8,6 +8,7 @@ import base64
 import hashlib
 import io
 import math
+import logging
 import secrets
 from typing import Any
 
@@ -19,8 +20,17 @@ from circuitcare.frontend.models import ProjectContext
 from circuitcare.frontend.workbench_state import SELECTION_KEY, update_selection
 from circuitcare.vision.image_loader import load_board_image
 
-SELECTED_MAP_KEY = "circuitcare_v4_selection_map_key"
 OVERLAPPING_SELECTION_KEY = "circuitcare_v4_overlapping_box_ids"
+SELECTION_TRACE_KEY = "circuitcare_v4_selection_trace"
+LOGGER = logging.getLogger(__name__)
+
+
+def _record_selection_trace(state: Any, stage: str) -> None:
+    trace = state.get(SELECTION_TRACE_KEY, [])
+    if not isinstance(trace, list):
+        trace = []
+    trace.append(stage)
+    state[SELECTION_TRACE_KEY] = trace[-12:]
 
 
 def coordinate_status_for_viewer(*, api_available: bool, client_ready: bool,
@@ -57,10 +67,11 @@ def validate_component_selection_event(
         return False, "중복 또는 오래된 선택 이벤트"
     if not isinstance(event_id, str) or not event_id.strip():
         return False, "선택 이벤트 ID가 없습니다."
-    if (action == "select" and component_id in allowed_ids
-            and isinstance(overlap_ids, list) and component_id in overlap_ids
-            and all(isinstance(item, str) for item in overlap_ids)
-            and set(overlap_ids) <= allowed_ids):
+    if (action == "select" and isinstance(component_id, str)
+            and component_id in allowed_ids
+            and isinstance(overlap_ids, list)
+            and component_id in overlap_ids
+            and all(isinstance(item, str) for item in overlap_ids)):
         return True, None
     if action == "clear" and component_id is None:
         return True, None
@@ -126,7 +137,6 @@ def render_component_viewer(
             st.session_state[f"{OVERLAPPING_SELECTION_KEY}_{previous_viewer_key}"] = []
         st.session_state[f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"] = []
         update_selection(st.session_state, project=project, selected_component=None)
-        st.session_state.pop(SELECTED_MAP_KEY, None)
         st.session_state[active_frame_key] = frame_scope
         st.session_state["circuitcare_v4_active_viewer_key"] = viewer_key
     selection = st.session_state.get(SELECTION_KEY)
@@ -137,9 +147,14 @@ def render_component_viewer(
 
     mount_status_key = f"{viewer_key}_mount_status"
     expected_asset_key = f"{map_cache_key}|{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}"
+    last_id_key = f"{viewer_key}_last_event"
+    rejected_id_key = f"{viewer_key}_rejected_event"
 
-    def handle_selection_change() -> None:
-        result = st.session_state.get(viewer_key)
+    def handle_selection_change(result_override: Any | None = None) -> bool:
+        # Callback-time session state is useful, but read the concrete result
+        # from this render as well: CCv2's presented session_state can lag the
+        # returned ComponentResult during a fast consecutive click.
+        result = result_override if result_override is not None else st.session_state.get(viewer_key)
         viewer_status = (result.get("viewer_status") if isinstance(result, dict)
                          else getattr(result, "viewer_status", None))
         if isinstance(viewer_status, dict):
@@ -149,15 +164,30 @@ def render_component_viewer(
                     and isinstance(viewer_status.get("event_id"), str)
                     and bool(viewer_status.get("event_id"))):
                 st.session_state[mount_status_key] = "READY"
-        event = (result.get("selection") if isinstance(result, dict)
-                 else getattr(result, "selection", None))
+        event = None
+        if isinstance(result, dict):
+            event = result.get("selection_event") or result.get("selection")
+        else:
+            event = getattr(result, "selection_event", None) or getattr(result, "selection", None)
         if not isinstance(event, dict):
-            return
-        last_id_key = f"{viewer_key}_last_event"
+            LOGGER.debug("pcb_selection stage=python_receive viewer=%s result_type=%s selection=missing",
+                         viewer_key, type(result).__name__)
+            return False
         last_seq_key = f"{viewer_key}_last_seq"
         if event.get("event_id") == st.session_state.get(last_id_key):
-            return
+            LOGGER.debug("pcb_selection stage=python_receive viewer=%s event_id=%s result=duplicate",
+                         viewer_key, event.get("event_id"))
+            return False
         seq = event.get("event_seq")
+        LOGGER.debug("pcb_selection stage=python_receive viewer=%s event_id=%s seq=%r action=%s component_id=%s overlaps=%s owner=%s",
+                     viewer_key, event.get("event_id"), seq, event.get("selection_action"),
+                     event.get("component_id"), event.get("overlapping_component_ids"),
+                     (event.get("project_id"), event.get("board_id"), event.get("board_side"),
+                      event.get("canonical_frame_id")))
+        _record_selection_trace(
+            st.session_state,
+            f"python_receive · {event.get('event_id')} · {event.get('selection_action')} · {event.get('component_id')}",
+        )
         if (event.get("selection_action") == "draw"
                 and (event.get("project_id"), event.get("board_id"), event.get("board_side"),
                      event.get("canonical_frame_id"))
@@ -182,10 +212,10 @@ def render_component_viewer(
             st.session_state[last_id_key] = event["event_id"]
             st.session_state[last_seq_key] = seq
             on_box_draw([int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))])
-            return
+            return True
         component_id = event.get("component_id")
         allowed_ids = {item.component_id for item in components}
-        accepted, _reason = validate_component_selection_event(
+        accepted, reason = validate_component_selection_event(
             event, project_id=project.project_id, board_id=project.board_id or "",
             board_side=board_side, frame_id=frame_id, allowed_ids=allowed_ids,
             last_sequence=int(st.session_state.get(last_seq_key, 0)),
@@ -193,17 +223,33 @@ def render_component_viewer(
         )
         if not accepted:
             st.session_state[f"{viewer_key}_event_rejected"] = True
-            return
+            st.session_state[rejected_id_key] = event.get("event_id")
+            _record_selection_trace(st.session_state, f"python_validate · 거부 · {reason}")
+            LOGGER.warning("pcb_selection stage=python_validate viewer=%s event_id=%s accepted=false reason=%s selected=%s allowed_count=%s",
+                           viewer_key, event.get("event_id"), reason, component_id, len(allowed_ids))
+            return False
+        st.session_state.pop(rejected_id_key, None)
         st.session_state[last_id_key] = event.get("event_id")
         st.session_state[last_seq_key] = seq
-        st.session_state[SELECTED_MAP_KEY] = map_cache_key
-        overlap_ids = event.get("overlapping_component_ids", [component_id])
+        raw_overlap_ids = event.get("overlapping_component_ids", [component_id])
+        # A delayed browser event can contain stale *other* overlap candidates.
+        # Keep the validated selection and only expose candidates in this render.
+        overlap_ids = [item for item in raw_overlap_ids if item in allowed_ids]
+        if component_id not in overlap_ids:
+            overlap_ids.insert(0, component_id)
         overlap_key = f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"
         if component_id is None:
             st.session_state[overlap_key] = []
         else:
             st.session_state[overlap_key] = list(dict.fromkeys(overlap_ids))
         update_selection(st.session_state, project=project, selected_component=component_id)
+        LOGGER.info("pcb_selection stage=selection_state viewer=%s event_id=%s selected=%s overlaps=%s",
+                    viewer_key, event.get("event_id"), component_id, overlap_ids)
+        _record_selection_trace(
+            st.session_state,
+            f"selection_state · {component_id or '선택 해제'} · 겹침 {len(overlap_ids)}개",
+        )
+        return True
 
     payload = [{
         "component_id": item.component_id,
@@ -225,15 +271,27 @@ def render_component_viewer(
         "fault_role_status": item.fault_role_status,
         "fault_history": list(item.fault_history),
     } for item in components]
+    ack_event_id = st.session_state.get(last_id_key)
+    rejected_event_id = st.session_state.get(rejected_id_key)
     result = render_pcb_viewer(
         st, image_png_base64=image_b64, image_size_px=image_size_px, components=payload,
         project_id=project.project_id, board_id=project.board_id or "", board_side=board_side,
         frame_id=frame_id, selected_component_id=selected_id, asset_key=map_cache_key,
+        selection_ack_event_id=ack_event_id, selection_rejected_event_id=rejected_event_id,
         event_sequence_seed=int(st.session_state.get(f"{viewer_key}_last_seq", 0)),
         event_epoch=event_epoch,
         key=viewer_key, on_selection_change=handle_selection_change,
+        on_selection_event_change=handle_selection_change,
         on_viewer_status_change=handle_selection_change,
     )
+    result_processed = handle_selection_change(result)
+    if result_processed:
+        LOGGER.info("pcb_selection stage=python_render_apply viewer=%s forcing_panel_rerender=true",
+                    viewer_key)
+        st.rerun()
+    current = st.session_state.get(SELECTION_KEY)
+    LOGGER.debug("pcb_selection stage=render_result viewer=%s result_type=%s selected_state=%s",
+                 viewer_key, type(result).__name__, getattr(current, "selected_component", None))
     if result is None:
         return False, viewer_key, coordinate_status_for_viewer(api_available=False, client_ready=False)
     mounted = st.session_state.get(mount_status_key) == "READY"

@@ -8,7 +8,9 @@ from circuitcare.frontend.measurement_state import (
     diagnosis_state, get_measurements, save_measurement, update_measurement,
     delete_measurement, current_measurement_set_sha256,
 )
-from circuitcare.dashboard.views.measurement_panel import _sigma_for_input_unit
+from circuitcare.dashboard.views.measurement_panel import (
+    _measurement_verification_gaps, _sigma_for_input_unit,
+)
 
 
 def _measurement(**overrides):
@@ -55,6 +57,14 @@ def test_uncertainty_may_be_absent_for_record_only_measurement():
     row = _measurement(uncertainty="")
     assert row.uncertainty is None
     assert row.verification_status == "USER_REPORTED"
+    assert "측정 불확실도 미입력" in _measurement_verification_gaps(row)
+    assert "전기적 측정 지점 연결 미확인" in _measurement_verification_gaps(row)
+
+
+def test_measurement_record_can_be_saved_without_verification_data():
+    row = _measurement(uncertainty="", measurement_target="")
+    assert row.measurement_id == "m1"
+    assert len(_measurement_verification_gaps(row)) >= 3
 
 
 def test_measurement_history_is_project_board_and_component_scoped_and_mutations_invalidate():

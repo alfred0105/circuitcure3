@@ -14,7 +14,9 @@ def render_pcb_viewer(
     components: list[dict[str, Any]], project_id: str, board_id: str,
     board_side: str, frame_id: str, selected_component_id: str | None,
     asset_key: str, event_sequence_seed: int, event_epoch: str, key: str,
-    on_selection_change: Any, on_viewer_status_change: Any,
+    selection_ack_event_id: str | None, selection_rejected_event_id: str | None,
+    on_selection_change: Any, on_selection_event_change: Any,
+    on_viewer_status_change: Any,
 ) -> Any | None:
     """Render image and vector overlays under one SVG camera transform."""
     if not hasattr(st, "components") or not hasattr(st.components, "v2"):
@@ -38,11 +40,14 @@ def render_pcb_viewer(
             "frame_id": frame_id,
             "asset_key": asset_key,
             "selected_component_id": selected_component_id,
+            "selection_ack_event_id": selection_ack_event_id,
+            "selection_rejected_event_id": selection_rejected_event_id,
             "event_sequence_seed": event_sequence_seed,
             "event_epoch": event_epoch,
         },
         default={"selection": None, "viewer_status": None},
         on_selection_change=on_selection_change,
+        on_selection_event_change=on_selection_event_change,
         on_viewer_status_change=on_viewer_status_change,
         # Keep the component frame tall enough for its toolbar, legend, and the
         # responsive SVG viewport. The old 600px frame clipped the CSS-sized view.

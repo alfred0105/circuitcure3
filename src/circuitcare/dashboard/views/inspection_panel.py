@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import io
 import hashlib
+import logging
 from dataclasses import replace
 from typing import Any
 
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel, display_identity_status
-from circuitcare.frontend.measurement_state import get_measurements
 from circuitcare.frontend.models import ProjectContext
-from circuitcare.dashboard.views.diagnosis_panel import render_diagnosis_panel
-from circuitcare.dashboard.views.measurement_panel import render_measurement_panel
-from circuitcare.dashboard.views.symptom_diagnosis_panel import render_symptom_diagnosis_panel
 from circuitcare.vision.component_recognition_panel import (
     CLASS_OPTIONS, LAST_EXCLUDED_KEY, STATUS_OPTIONS, ensure_review_row_for_component,
     invalidate_component_review_state, record_box_exclusion, restore_review_row,
@@ -25,6 +22,7 @@ COMPONENT_EDIT_KEY = "circuitcare_v4_component_edits"
 COMPONENT_INVENTORY_KEY = "circuitcare_v4_component_inventory_by_map"
 ROLE_OPTIONS = ("power", "control", "control_input", "control_timing", "driver", "output",
                 "input", "input_output", "protection", "thermal", "buzzer", "relay")
+LOGGER = logging.getLogger(__name__)
 def render_inspection_panel(
     st: Any, project: ProjectContext, *, preview: bool = False,
     components: tuple[ComponentOverlayViewModel, ...] = (),
@@ -47,6 +45,10 @@ def render_inspection_panel(
         overlap_ids = list(dict.fromkeys(item for item in overlap_ids if item in by_id))
         selection = st.session_state.get(SELECTION_KEY)
         selected_id = getattr(selection, "selected_component", None)
+        LOGGER.info("pcb_selection stage=panel_render project=%s selected=%s component_found=%s component_count=%s overlaps=%s",
+                    project.project_id, selected_id,
+                    selected_component.component_id if selected_component is not None else None,
+                    len(components), overlap_ids)
         if len(overlap_ids) > 1:
             labels = {
                 f"{item} · {by_id[item].component_type} · "
@@ -62,7 +64,8 @@ def render_inspection_panel(
             event_seq = st.session_state.get(f"{viewer_key}_last_seq", 0)
             choice = st.selectbox("겹친 박스", list(labels), index=list(labels).index(selected_option),
                                   key=(f"cc_box_overlap_select_{st.session_state.get('cc_active_component_review_scope', 'none')}"
-                                       f"_{overlap_signature}_{selected_id or 'none'}_{event_seq}"))
+                                       f"_{overlap_signature}_{selected_id or 'none'}_{event_seq}"),
+                                  help="겹친 박스 중 편집하거나 제외할 대상을 선택합니다. Viewer 강조도 함께 바뀝니다.")
             if labels[choice] != selected_id:
                 update_selection(st.session_state, project=project, selected_component=labels[choice])
                 st.rerun()
@@ -85,7 +88,8 @@ def render_inspection_panel(
             undo_col, restore_col = st.columns(2)
             undo_id = last_excluded.get("component_id") if isinstance(last_excluded, dict) else None
             if undo_col.button("직전 제외 취소", key=f"cc_component_undo_exclusion_{active_scope}",
-                               disabled=not bool(undo_id), use_container_width=True):
+                               disabled=not bool(undo_id), use_container_width=True,
+                               help="가장 최근에 제외한 박스를 복원합니다."):
                 restored_id = undo_last_box_exclusion(st.session_state, scope=active_scope, rows=active_rows)
                 if restored_id:
                     st.session_state[active_records_key] = active_rows
@@ -95,10 +99,12 @@ def render_inspection_panel(
                     st.rerun()
             excluded_rows = [row for row in active_rows if row.get("상태") == "제외"]
             if excluded_rows:
-                with restore_col.popover(f"제외 복원 · {len(excluded_rows)}"):
+                with restore_col.popover(f"제외 복원 · {len(excluded_rows)}",
+                                         help="이전에 제외한 박스를 선택해 다시 표시합니다."):
                     for index, row in enumerate(excluded_rows):
                         st.caption(f"{row.get('component_id')} · {row.get('소자 종류', 'unknown')}")
-                        if st.button("복원", key=f"cc_restore_box_{active_scope}_{row.get('component_id')}_{index}"):
+                        if st.button("복원", key=f"cc_restore_box_{active_scope}_{row.get('component_id')}_{index}",
+                                     help="이 박스를 다시 활성 상태로 돌리고 Viewer와 진단 목록에 반영합니다."):
                             restore_review_row(row)
                             st.session_state[active_records_key] = active_rows
                             if isinstance(last_excluded, dict) and last_excluded.get("component_id") == row.get("component_id"):
@@ -137,7 +143,8 @@ def render_inspection_panel(
                 st.warning("제외된 박스입니다. 복원 전까지 진단과 기본 Viewer에서 제외됩니다.")
             elif review_scope and records_key:
                 if st.button("박스 제외", key=f"cc_selected_box_exclude_{selected_component.component_id}",
-                             type="primary", use_container_width=True):
+                             type="primary", use_container_width=True,
+                             help="선택한 박스를 기본 Viewer와 진단 대상에서 숨깁니다. 검수 기록은 보존되며 직전 제외 취소 또는 제외 복원으로 되돌릴 수 있습니다."):
                     rows = list(st.session_state.get(records_key, []))
                     review_row = ensure_review_row_for_component(rows, selected_component)
                     record_box_exclusion(st.session_state, scope=review_scope, row=review_row)
@@ -156,18 +163,25 @@ def render_inspection_panel(
                 with st.form(form_key):
                     st.selectbox("소자 종류", CLASS_OPTIONS,
                                  index=CLASS_OPTIONS.index(current_type if current_type in CLASS_OPTIONS else "unknown"),
-                                 key=f"{form_key}_class")
+                                 key=f"{form_key}_class",
+                                 help="검수 결과의 소자 종류를 바꾸면 Viewer와 진단 소자 목록에도 반영됩니다.")
                     editable_statuses = [value for value in STATUS_OPTIONS if value != "제외"]
                     status_value = current_status if current_status in editable_statuses else "검수 필요"
                     st.selectbox("검수 상태", editable_statuses, index=editable_statuses.index(status_value),
-                                 key=f"{form_key}_status")
+                                 key=f"{form_key}_status",
+                                 help="확인은 사용자 확인 기록으로 저장됩니다. 제외는 별도 제외 버튼으로 처리합니다.")
                     with st.expander("박스 위치·크기"):
                         cols = st.columns(2)
-                        x1 = cols[0].number_input("왼쪽 x", min_value=0, value=int(box["x1"]), key=f"{form_key}_x1")
-                        y1 = cols[1].number_input("위쪽 y", min_value=0, value=int(box["y1"]), key=f"{form_key}_y1")
-                        x2 = cols[0].number_input("오른쪽 x", min_value=0, value=int(box["x2"]), key=f"{form_key}_x2")
-                        y2 = cols[1].number_input("아래쪽 y", min_value=0, value=int(box["y2"]), key=f"{form_key}_y2")
-                    apply = st.form_submit_button("변경 적용", use_container_width=True)
+                        x1 = cols[0].number_input("왼쪽 x", min_value=0, value=int(box["x1"]), key=f"{form_key}_x1",
+                                                  help="원본 사진의 픽셀 좌표입니다.")
+                        y1 = cols[1].number_input("위쪽 y", min_value=0, value=int(box["y1"]), key=f"{form_key}_y1",
+                                                  help="원본 사진의 픽셀 좌표입니다.")
+                        x2 = cols[0].number_input("오른쪽 x", min_value=0, value=int(box["x2"]), key=f"{form_key}_x2",
+                                                  help="원본 사진의 픽셀 좌표입니다.")
+                        y2 = cols[1].number_input("아래쪽 y", min_value=0, value=int(box["y2"]), key=f"{form_key}_y2",
+                                                  help="원본 사진의 픽셀 좌표입니다.")
+                    apply = st.form_submit_button("변경 적용", use_container_width=True,
+                                                   help="종류·상태·좌표를 검수 기록에 저장하고 Viewer와 진단 목록에 반영합니다.")
                 if apply:
                     from PIL import Image
                     with Image.open(io.BytesIO(review_image_bytes)) as source_image:
@@ -318,24 +332,8 @@ def render_inspection_panel(
                 excluded_rows = [row for row in rows if row.get("상태") == "제외"]
                 if excluded_rows:
                     st.caption(f"제외된 박스 {len(excluded_rows)}개 · 상단의 복원 메뉴에서 되살릴 수 있습니다.")
-        with st.expander("증상 진단", expanded=False):
-            render_symptom_diagnosis_panel(st, project, components=components, preview=preview,
-                                           component_inventory=inventory)
-        measurements = get_measurements(
-            st.session_state, project_id=project.project_id, board_id=project.board_id or "",
-        )
-        map_version = st.session_state.get(MAP_VERSION_KEY)
-        with st.expander("측정 및 회로 모델 상세", expanded=False):
-            render_measurement_panel(
-                st, project, selected_component=selected_component, preview=preview,
-                component_map_version=map_version,
-            )
-            selection = st.session_state.get("circuitcare_v2_selection")
-            render_diagnosis_panel(
-                st, project, measurements=measurements,
-                analysis_context_id=getattr(selection, "analysis_context_id", None),
-                component_map_version=map_version,
-            )
+        # Fault analysis lives in its own full-width workspace. This panel is
+        # intentionally limited to PCB component review and editing.
 
 
 def _diagnosis_status_label(st: Any, project: ProjectContext) -> str:

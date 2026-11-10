@@ -34,12 +34,16 @@ from circuitcare.frontend.component_map_adapter import (
 )
 from circuitcare.frontend.photo_adapter import adapt_component_map_input
 from circuitcare.dashboard.components.pcb_workspace import (
-    OVERLAPPING_SELECTION_KEY, SELECTED_MAP_KEY, render_component_viewer, scale_overlay_to_display,
+    OVERLAPPING_SELECTION_KEY, _record_selection_trace,
+    render_component_viewer, scale_overlay_to_display,
 )
 from circuitcare.dashboard.views.inspection_panel import (
-    COMPONENT_EDIT_KEY, MAP_VERSION_KEY, render_inspection_panel,
+    COMPONENT_EDIT_KEY, COMPONENT_INVENTORY_KEY, MAP_VERSION_KEY, render_inspection_panel,
     _diagnosis_status_label,
 )
+from circuitcare.dashboard.views.symptom_diagnosis_panel import render_symptom_diagnosis_panel
+from circuitcare.dashboard.views.measurement_panel import render_measurement_panel
+from circuitcare.dashboard.views.diagnosis_panel import render_diagnosis_panel
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
     ensure_component_detection, render_component_recognition_panel,
@@ -66,6 +70,11 @@ def _style(st: Any) -> None:
     [data-testid="stMainBlockContainer"] { max-width:none; padding:1rem 1.5rem 2rem; }
     .cc-wb-header { display:flex; align-items:center; gap:.6rem; color:#e9eef4; font-weight:700; font-size:1.1rem; }
     .cc-wb-subtle { color:#9aa9b8; font-size:.82rem; }
+    .cc-analysis-hero { background:linear-gradient(135deg,#172536,#111923); border:1px solid #34475c; border-radius:12px; padding:1rem 1.15rem; margin:.25rem 0 1rem; }
+    .cc-analysis-step { color:#7fb3ef; font-size:.78rem; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
+    .cc-analysis-title { color:#edf3f9; font-size:1.15rem; font-weight:700; margin:.2rem 0 .45rem; }
+    .cc-analysis-copy { color:#aab8c7; font-size:.9rem; }
+    .cc-analysis-section { border-top:1px solid #334252; margin-top:1.1rem; padding-top:.75rem; }
     [data-testid="stVerticalBlockBorderWrapper"]:has(.cc-inspection-marker) { position:sticky; top:1.25rem; align-self:start; }
     [class*="st-key-cc_viewer_canvas"] { overflow:auto; max-height:calc(100vh - 15rem); background:#101820; border:1px solid #334252; border-radius:8px; padding:.5rem; }
     div[role="radiogroup"] label { border:1px solid #334252; border-radius:6px; padding:.35rem .8rem; }
@@ -221,11 +230,6 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
     ):
         clear_component_map_state(st.session_state, clear_viewer_selection=False)
         entry = None
-    selection = st.session_state.get(SELECTION_KEY)
-    if getattr(selection, "selected_component", None) and st.session_state.get(SELECTED_MAP_KEY) != cache_key:
-        update_selection(st.session_state, project=project, selected_component=None)
-        st.session_state.pop(SELECTED_MAP_KEY, None)
-
     if provider is None:
         st.caption("백엔드 미연결 · 원본 사진 보기")
     elif not ready_inputs:
@@ -233,9 +237,6 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
     else:
         if st.button("사진 정합 실행", key="circuitcare_v3_build_map"):
             try:
-                if getattr(st.session_state.get(SELECTION_KEY), "selected_component", None):
-                    update_selection(st.session_state, project=project, selected_component=None)
-                    st.session_state.pop(SELECTED_MAP_KEY, None)
                 raw_map = provider.build_component_map(
                     board_id=project.board_id,
                     photos=[{"data": p.data, "side": p.side, "role": p.role, "name": p.name}
@@ -332,6 +333,8 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             photo_id=selected, review_image_bytes=detector_image_bytes,
             review_image_size=display_size,
         )
+        st.session_state["circuitcare_v4_auto_detection_result"] = auto_detection_result
+        st.session_state["circuitcare_v4_auto_detection_error"] = auto_detection_error
         review_scope = component_review_scope(detector_image_bytes, project.project_id, selected)
         _result_key, records_key, _error_key = review_keys(review_scope)
         review_rows = st.session_state.get(records_key, [])
@@ -599,9 +602,14 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
     st.session_state["circuitcare_v4_detection_status"] = detection_status
     current_selection = st.session_state.get(SELECTION_KEY)
     selected_component_id = getattr(current_selection, "selected_component", None)
+    _record_selection_trace(st.session_state,
+                            f"unified_workspace · 현재 선택 {selected_component_id or '없음'} · 모델 {len(component_models)}개")
     if selected_component_id and selected_component_id not in {item.component_id for item in component_models}:
+        LOGGER.warning("pcb_selection stage=unified_invalidate reason=component_missing selected=%s current_ids=%s",
+                       selected_component_id, [item.component_id for item in component_models])
+        _record_selection_trace(st.session_state,
+                               f"unified_workspace · 현재 박스 목록에 ID 없음 · {selected_component_id}")
         update_selection(st.session_state, project=project, selected_component=None)
-        st.session_state.pop(SELECTED_MAP_KEY, None)
         selected_component_id = None
     transform = requested_view_transform(
         source_size=source_size,
@@ -661,30 +669,14 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         viewer_coordinate_status = "INVALID_COORDINATE_FRAME"
     transform["coordinate_status"] = viewer_coordinate_status
     st.session_state[VIEW_TRANSFORM_KEY] = transform
-    if overlay_result and overlay_result.status == "READY":
-        st.caption(f"검출 결과 · {len(overlay_result.components)}개 · 후보 · 고장 진단 미실행")
-    elif auto_detection_error:
-        st.error(f"자동 소자 탐지에 실패했습니다 · {auto_detection_error}")
-    elif auto_detection_result is not None and not auto_detection_result.get("detections"):
-        st.info("이 사진에서 선택할 탐지 박스를 찾지 못했습니다.")
-    elif auto_detection_result is not None:
-        st.caption(f"탐지 박스 · {len(auto_detection_result.get('detections', []))}개")
-    elif detection_status == "DETECTOR_NOT_CONFIGURED":
-        st.caption("검출 모델 미설정 · 원본 사진 보기 가능")
-    elif detection_status == "BLOCKED_MODEL_UNAVAILABLE":
-        st.caption("검출 모델을 사용할 수 없습니다 · 원본 사진 보기 가능")
-    elif component_map and not side_result.get("components"):
-        st.caption("검출 결과 없음 · 고장 진단 미실행")
     if mode == "원본 사진":
         mapped = entry.get("photo_id_map", []) if entry else []
         photo_mapping = next((row for row in mapped if row.frontend_photo_id == selected and row.project_id == project.project_id), None)
-        st.caption(f"정합 상태 · {REGISTRATION_LABELS.get(photo_mapping.registration_status, '상태 미확인') if photo_mapping else '정합 결과 없음'}")
-        with st.expander("소자 탐지 · 박스 검수", expanded=True):
-            render_component_recognition_panel(
-                st, image_bytes=detector_image_bytes or image_data,
-                project_id=project.project_id, board_id=project.board_id, photo_id=selected,
-                auto_result=auto_detection_result, auto_error=auto_detection_error,
-            )
+        st.session_state["circuitcare_v4_detection_summary"] = {
+            "count": len(auto_detection_result.get("detections", [])) if auto_detection_result else None,
+            "error": auto_detection_error,
+            "registration": REGISTRATION_LABELS.get(photo_mapping.registration_status, "상태 미확인") if photo_mapping else "정합 결과 없음",
+        }
 
 
 def _photo_label(record: Any, number: int) -> str:
@@ -696,7 +688,7 @@ def _photo_label(record: Any, number: int) -> str:
 
 
 def render_workbench_shell(st: Any, project: ProjectContext) -> None:
-    """Render PCB/schematic tabs and a fixed desktop inspection column."""
+    """Render separate component-review and fault-analysis workspaces."""
     _style(st)
     selection = st.session_state.get(SELECTION_KEY)
     if getattr(selection, "project_id", None) != project.project_id:
@@ -734,28 +726,256 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
 
     preview = st.session_state.get(MODE_KEY) == "PREVIEW_ONLY"
     with st.container(key="cc_workbench_body"):
-        left, right = st.columns([4.1, 1.2], gap="medium")
-        with left:
-            st.session_state.pop("circuitcare_v2_active_tab", None)
-            update_selection(
-                st.session_state, project=project, active_tab="pcb",
+        nav_key = f"cc_workbench_view_{project.project_id}"
+        if st.session_state.get(nav_key) not in {"PCB 소자 검수", "고장 분석"}:
+            st.session_state[nav_key] = "PCB 소자 검수"
+        st.radio("작업 영역", ("PCB 소자 검수", "고장 분석"), horizontal=True,
+                 key=nav_key, label_visibility="collapsed")
+        current_view = st.session_state[nav_key]
+        if current_view == "PCB 소자 검수":
+            left, right = st.columns([3.2, 1.15], gap="large")
+            with left:
+                _render_pcb(st, project, st.session_state.get(INTAKE_IMAGES_KEY, []))
+            with right:
+                _render_component_inspector(st, project, preview)
+        else:
+            _render_fault_analysis_workspace(st, project, preview)
+
+
+def _selected_component(st: Any) -> ComponentOverlayViewModel | None:
+    current_components = tuple(st.session_state.get("circuitcare_v4_current_components", ()))
+    selection = st.session_state.get(SELECTION_KEY)
+    selected_id = getattr(selection, "selected_component", None)
+    return next((item for item in current_components if item.component_id == selected_id), None)
+
+
+def _set_workbench_view(state: Any, *, project_id: str, view: str) -> None:
+    """Update the radio selection from a pre-render callback, before widget creation."""
+    state[f"cc_workbench_view_{project_id}"] = view
+
+
+def _render_component_inspector(st: Any, project: ProjectContext, preview: bool) -> None:
+    current_components = tuple(st.session_state.get("circuitcare_v4_current_components", ()))
+    render_inspection_panel(
+        st, project, preview=preview, components=current_components,
+        selected_component=_selected_component(st),
+        detection_status=st.session_state.get("circuitcare_v4_detection_status", "UNKNOWN"),
+        selected_marking_context=st.session_state.get("circuitcare_v4_selected_marking_context"),
+        component_map_version=st.session_state.get(MAP_VERSION_KEY),
+        inventory_scope=st.session_state.get("circuitcare_v4_component_inventory_scope"),
+        review_image_bytes=st.session_state.get("cc_active_component_review_image"),
+        review_scope=st.session_state.get("cc_active_component_review_scope"),
+    )
+    review_image = st.session_state.get("cc_active_component_review_image")
+    review_scope = st.session_state.get("cc_active_component_review_scope")
+    summary = st.session_state.get("circuitcare_v4_detection_summary", {})
+    if review_image is not None and review_scope and review_scope.startswith(f"{project.project_id}_"):
+        photo_id = st.session_state.get("circuitcare_v2_photo_choice")
+        detection_count = summary.get("count")
+        suffix = f" · {detection_count}개" if detection_count is not None else ""
+        with st.expander(f"소자 탐지 · 박스 검수{suffix}", expanded=False):
+            if summary.get("error"):
+                st.error(f"자동 탐지 실패 · {summary['error']}")
+            elif detection_count == 0:
+                st.info("이 사진에서 탐지 박스를 찾지 못했습니다.")
+            elif detection_count is None:
+                st.caption(f"검출 상태 · {st.session_state.get('circuitcare_v4_detection_status', '미확인')}")
+            st.caption(f"정합 상태 · {summary.get('registration', '정합 결과 없음')}")
+            render_component_recognition_panel(
+                st, image_bytes=review_image, project_id=project.project_id,
+                board_id=project.board_id, photo_id=photo_id,
+                auto_result=st.session_state.get("circuitcare_v4_auto_detection_result"),
+                auto_error=st.session_state.get("circuitcare_v4_auto_detection_error"),
             )
-            _render_pcb(st, project, st.session_state.get(INTAKE_IMAGES_KEY, []))
-        with right:
-            current_components = tuple(st.session_state.get("circuitcare_v4_current_components", ()))
-            selection = st.session_state.get(SELECTION_KEY)
+
+
+def _render_selected_component_summary(st: Any, project: ProjectContext) -> None:
+    item = _selected_component(st)
+    with st.container(border=True):
+        st.markdown("**선택 소자**")
+        if item is None:
+            st.caption("PCB 박스 또는 원인 후보를 선택하세요.")
+            return
+        st.markdown(f"`{item.component_id}` · **{item.component_type}**")
+        st.caption(f"신뢰도 {item.detection_confidence:.2f} · {item.identification_status}")
+        if item.ocr_marking:
+            st.caption(f"각인 후보 · {item.ocr_marking}")
+        st.button(
+            "소자 검수에서 편집", key=f"cc_open_component_review_{project.project_id}",
+            use_container_width=True, on_click=_set_workbench_view,
+            kwargs={"state": st.session_state, "project_id": project.project_id,
+                    "view": "PCB 소자 검수"},
+        )
+
+
+def _render_fault_analysis_workspace(st: Any, project: ProjectContext, preview: bool) -> None:
+    components = tuple(st.session_state.get("circuitcare_v4_current_components", ()))
+    selection = st.session_state.get(SELECTION_KEY)
+    selected = _selected_component(st)
+    review_scope = st.session_state.get("circuitcare_v4_component_inventory_scope")
+    owner = f"{project.project_id}|{project.board_id or ''}|{review_scope or st.session_state.get(MAP_VERSION_KEY) or ''}"
+    inventories = st.session_state.get(COMPONENT_INVENTORY_KEY, {})
+    inventory = inventories.get(owner, {}) if isinstance(inventories, dict) else {}
+    stored = st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {})
+    result = stored.get("result") if isinstance(stored, dict) else None
+    with st.container(border=True):
+        st.markdown('<div class="cc-analysis-step">PCB FAULT WORKSPACE</div>', unsafe_allow_html=True)
+        st.markdown('<div class="cc-analysis-title">증상 입력 → 원인 분석 → 측정 검증</div>', unsafe_allow_html=True)
+        st.markdown('<div class="cc-analysis-copy">규칙 기반 분석, 로컬 LLM 보조, 측정 판정을 같은 프로젝트 상태에서 확인합니다. 후보는 측정으로 검증되기 전까지 미확정 가설입니다.</div>', unsafe_allow_html=True)
+    symptom_tab, cause_tab, measurement_tab = st.tabs(("1 · 증상 입력", "2 · 원인 분석", "3 · 측정 검증"))
+    with symptom_tab:
+        render_symptom_diagnosis_panel(
+            st, project, components=components, preview=preview,
+            component_inventory=inventory,
+        )
+    with cause_tab:
+        _render_cause_dashboard(st, project, result)
+    with measurement_tab:
+        st.markdown("#### 측정 기록과 가설 검증")
+        if components:
+            component_ids = [item.component_id for item in components]
+            option_labels = {item.component_id: f"{item.component_id} · {item.component_type}" for item in components}
             selected_id = getattr(selection, "selected_component", None)
-            selected_component = next((item for item in current_components if item.component_id == selected_id), None)
-            render_inspection_panel(
-                st, project, preview=preview, components=current_components,
-                selected_component=selected_component,
-                detection_status=st.session_state.get("circuitcare_v4_detection_status", "UNKNOWN"),
-                selected_marking_context=st.session_state.get("circuitcare_v4_selected_marking_context"),
-                component_map_version=st.session_state.get(MAP_VERSION_KEY),
-                inventory_scope=st.session_state.get("circuitcare_v4_component_inventory_scope"),
-                review_image_bytes=st.session_state.get("cc_active_component_review_image"),
-                review_scope=st.session_state.get("cc_active_component_review_scope"),
+            default_id = selected_id if selected_id in component_ids else component_ids[0]
+            picked_id = st.selectbox(
+                "측정 대상 소자", component_ids, index=component_ids.index(default_id),
+                format_func=option_labels.get,
+                key=f"cc_measurement_target_{project.project_id}_{selected_id or 'none'}",
             )
+            if picked_id != selected_id:
+                update_selection(st.session_state, project=project, selected_component=picked_id)
+                st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
+                st.rerun()
+        render_measurement_panel(
+            st, project, selected_component=selected, preview=preview,
+            component_map_version=st.session_state.get(MAP_VERSION_KEY),
+        )
+        measurements = get_measurements(
+            st.session_state, project_id=project.project_id, board_id=project.board_id or "",
+        )
+        st.markdown("#### 측정 기반 진단")
+        render_diagnosis_panel(
+            st, project, measurements=measurements,
+            analysis_context_id=getattr(selection, "analysis_context_id", None),
+            component_map_version=st.session_state.get(MAP_VERSION_KEY),
+        )
+
+    viewer_key = f"cc_analysis_viewer_open_{project.project_id}"
+    with st.expander("PCB Viewer · 선택 후보 위치 확인", expanded=bool(st.session_state.get(viewer_key, False))):
+        st.caption("후보를 선택하면 동일한 소자 ID가 Viewer와 검수 화면에 강조됩니다.")
+        _render_pcb(st, project, st.session_state.get(INTAKE_IMAGES_KEY, []))
+        _render_selected_component_summary(st, project)
+
+
+def _render_cause_dashboard(st: Any, project: ProjectContext, result: Any) -> None:
+    """Compact, evidence-aware view of the existing symptom diagnosis result."""
+    key = f"cc_symptom_diagnosis_{project.project_id}"
+    state = st.session_state.get(key, {})
+    if not isinstance(result, dict):
+        if isinstance(state, dict) and state.get("invalidated_reason"):
+            st.warning(f"입력 변경으로 이전 분석 결과가 무효화되었습니다 · {state['invalidated_reason']} · 증상 입력 탭에서 다시 분석하세요.")
+        else:
+            st.info("증상 입력 탭에서 증상을 기록하고 원인 분석을 실행하세요.")
+        return
+    candidates = result.get("component_candidates", [])
+    groups = result.get("hypothesis_groups", {})
+    next_tests = result.get("next_tests", [])
+    next_action = next((row for row in next_tests if row.get("type") != "question"), None)
+    if next_action is None:
+        next_action = next(iter(next_tests), None)
+    with st.container(border=True):
+        st.markdown("**우선 확인할 원인**")
+        if candidates:
+            top = candidates[0]
+            st.markdown(f"### {top.get('fault_title', '원인 후보')}")
+            st.markdown(f"`{top.get('component_id', '소자 미특정')}` · {top.get('component_type', '종류 미확정')} · {top.get('candidate_rank', 1)}순위")
+            st.caption("검사 전 가설 · 점수는 상대 우선도이며 고장 확률이 아닙니다.")
+            evidence = top.get("supporting_evidence") or top.get("evidence", [])
+            if evidence:
+                st.write("**지지 근거** · " + " · ".join(evidence[:3]))
+            opposing = top.get("opposing_evidence", [])
+            if opposing:
+                st.write("**반대 근거** · " + " · ".join(opposing[:3]))
+            if any(item.component_id == top.get("component_id") for item in st.session_state.get("circuitcare_v4_current_components", ())):
+                if st.button("PCB에서 이 후보 보기", key=f"cc_analysis_dashboard_focus_{project.project_id}_{top.get('component_id')}", type="primary"):
+                    update_selection(st.session_state, project=project, selected_component=top.get("component_id"))
+                    st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
+                    st.rerun()
+        else:
+            st.info("현재 입력으로 특정 소자 후보를 좁히지 못했습니다. 기판·납땜 또는 외부 시스템 후보를 확인하세요.")
+        if next_action:
+            st.info("다음 권장 작업 · " + str(next_action.get("label") or next_action.get("name") or next_action.get("question") or next_action.get("test_id") or "추가 확인"))
+
+    category_labels = (("component", "소자 내부·기능 블록"), ("board", "기판·납땜"), ("system", "외부 시스템"))
+    for group_key, label in category_labels:
+        rows = groups.get(group_key, []) if isinstance(groups, dict) else []
+        if not rows:
+            continue
+        st.markdown(f"#### {label}")
+        for index, row in enumerate(rows[:5], start=1):
+            with st.expander(f"{index}. {row.get('title', '원인 후보')} · 미확정", expanded=index == 1):
+                st.caption("지지 근거 · " + (" · ".join(row.get("supporting_evidence", [])) or "직접 근거 없음"))
+                st.caption("반대 근거 · " + (" · ".join(row.get("opposing_evidence", [])) or "확인된 반대 근거 없음"))
+                if row.get("related_component_ids"):
+                    st.caption("관련 소자 · " + " · ".join(row["related_component_ids"]))
+                st.caption("검증 상태 · 미확정 가설")
+
+    if result.get("llm_assist") or result.get("llm_component_explanations") or result.get("llm_unverified_suggestions") or result.get("matched_rules") or result.get("functional_blocks") or result.get("measurement_evidence"):
+        with st.expander("상세 근거 · LLM 설명 · 적용 규칙 · 측정", expanded=False):
+            assist = result.get("llm_assist")
+            if assist:
+                st.markdown("**LLM 설명 보조**")
+                st.write(assist.get("summary", ""))
+                st.caption(f"모델 · {assist.get('model', '확인 불가')} · 후보 확정 없음")
+            elif result.get("llm_error"):
+                st.warning(f"LLM 설명을 사용할 수 없습니다 · {result['llm_error']} · 규칙 기반 결과는 유지됩니다.")
+            if result.get("llm_component_explanations"):
+                explanations = result["llm_component_explanations"].get("explanations", {})
+                for component_id, explanation in explanations.items():
+                    st.caption(f"{component_id} · {explanation}")
+            if result.get("matched_rules"):
+                st.caption("적용 규칙 · " + " · ".join(row.get("name", "규칙") for row in result["matched_rules"]))
+            if result.get("functional_blocks"):
+                for block in result["functional_blocks"]:
+                    st.caption(f"기능 역할 추정 · {block.get('component_id')} · {', '.join(block.get('candidate_blocks', [])) or '미분류'} · 미확정")
+            if result.get("measurement_evidence"):
+                for row in result["measurement_evidence"]:
+                    st.caption(f"측정 근거 · {row.get('component_id')} · {row.get('measurement_type')} {row.get('value')} {row.get('unit')} · {row.get('verification_status')}")
+            for suggestion in result.get("llm_unverified_suggestions", []):
+                st.caption(f"미등록 원인 제안 · {suggestion.get('title')} · {suggestion.get('reason')}")
+    questions = [row for row in next_tests if row.get("type") == "question"]
+    if questions:
+        st.markdown("#### 추가 확인 질문")
+        st.caption("질문 답변과 검사 추천은 증상 분석 패널에서 입력·반영합니다.")
+        for row in questions[:3]:
+            st.caption("· " + row.get("question", "추가 정보 확인"))
+    if state.get("invalidated_reason"):
+        st.warning(f"분석 결과가 입력 변경으로 무효화되었습니다 · {state['invalidated_reason']} · 증상 입력 탭에서 다시 분석하세요.")
+
+
+def _render_top_cause(st: Any, project: ProjectContext, result: Any) -> None:
+    candidates = result.get("component_candidates", []) if isinstance(result, dict) else []
+    next_tests = result.get("next_tests", []) if isinstance(result, dict) else []
+    top = candidates[0] if candidates else None
+    next_test = next((item for item in next_tests if item.get("type") != "question"), None)
+    if next_test is None:
+        next_test = next(iter(next_tests), None)
+    with st.container(border=True):
+        st.markdown("**우선 확인할 내용**")
+        if not top:
+            st.info("증상을 입력하고 원인 후보 분석을 실행하면 우선 후보와 다음 검사 항목이 표시됩니다.")
+            return
+        st.markdown(f"**{top.get('component_id', '소자 미특정')} · {top.get('component_type', '종류 미확정')}**  ")
+        st.write(top.get("fault_title", "원인 후보"))
+        st.caption("미확정 검사 가설 · 상대 점수는 실제 고장 확률을 뜻하지 않습니다.")
+        if top.get("evidence"):
+            st.caption("근거 · " + " · ".join(top["evidence"][:3]))
+        if next_test:
+            st.caption("다음 검사 · " + str(next_test.get("label") or next_test.get("name") or next_test.get("question") or next_test.get("test_id") or "추가 확인"))
+        if st.button("PCB에서 후보 위치 보기", key=f"cc_analysis_focus_{project.project_id}_{top.get('component_id')}", use_container_width=True):
+            update_selection(st.session_state, project=project, selected_component=top.get("component_id"))
+            st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
+            st.rerun()
 
 
 def _render_schematic(st: Any, project: ProjectContext, circuit_bytes: bytes | None = None) -> None:

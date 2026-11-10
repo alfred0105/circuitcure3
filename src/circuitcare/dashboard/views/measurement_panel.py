@@ -25,6 +25,31 @@ SOURCE_CODES = {label: code for code, label in SOURCE_LABELS.items()}
 TYPE_OPTIONS = tuple(MEASUREMENT_TYPE_LABELS)
 
 
+def _measurement_verification_gaps(record: MeasurementRecord) -> list[str]:
+    """Return UI-facing missing conditions; recording remains allowed without them."""
+    gaps = []
+    if not record.measurement_target:
+        gaps.append("측정 대상 미지정")
+    if record.mapping_status != "MAPPED" or not record.probe_id or not record.node_id:
+        gaps.append("전기적 측정 지점 연결 미확인")
+    if record.uncertainty is None or record.uncertainty <= 0:
+        gaps.append("측정 불확실도 미입력")
+    if record.source != "user_measurement" or record.verification_status != "USER_REPORTED":
+        gaps.append("실측 출처 미확인")
+    if not record.test_id:
+        gaps.append("검사 프로파일 미선택")
+    if (record.reference_min is None or record.reference_max is None
+            or record.reference_verification_status not in {"DATASHEET_VERIFIED", "BOARD_SPEC_VERIFIED"}
+            or not record.reference_source):
+        gaps.append("검증된 정상 범위·출처 없음")
+    if (not record.operating_conditions or not record.reference_conditions
+            or record.operating_conditions.strip() != record.reference_conditions.strip()):
+        gaps.append("측정 조건과 기준 조건이 일치하지 않음")
+    if not record.location_verified:
+        gaps.append("측정 지점 확인 전")
+    return gaps
+
+
 def _sigma_for_input_unit(value: Any, measurement_type: str, unit: str) -> str | None:
     """UI sigma is entered in the measurement type's base unit; adapters expect the selected unit."""
     if value is None or not str(value).strip():
@@ -37,9 +62,8 @@ def render_measurement_panel(
     st: Any, project: ProjectContext, *, selected_component: ComponentOverlayViewModel | None,
     preview: bool = False, component_map_version: str | None = None,
 ) -> None:
-    st.markdown("### 측정값")
     if selected_component is None:
-        st.caption("PCB에서 부품을 선택하면 측정값을 기록할 수 있습니다.")
+        st.info("PCB Viewer에서 소자를 선택하면 해당 소자의 측정값을 기록할 수 있습니다.")
         return
     if not project.board_id:
         st.warning("보드 ID가 없어 측정 기록을 연결할 수 없습니다.")
@@ -53,8 +77,8 @@ def render_measurement_panel(
         and row.component_identity_status not in {"IDENTITY_AMBIGUOUS", "IDENTITY_CONFLICT"}
     )]
     stale_records = [row for row in records if row not in current_records]
-    st.caption("선택 부품에 측정 기록을 저장합니다. 저장은 진단 실행을 의미하지 않습니다.")
-    st.caption("실제 측정 시 회로 전원 상태와 계측기 설정을 확인하세요. 측정 위치는 전기적 안전성 승인을 의미하지 않습니다.")
+    st.caption(f"측정 대상 · {selected_component.component_id} · {selected_component.component_type}")
+    st.caption("측정값을 먼저 기록하세요. 검증 조건이 부족한 기록은 보존되지만 검증 결과로 판정하지 않습니다.")
     if stale_records:
         st.warning(f"이전 Component Map의 측정 기록 {len(stale_records)}개는 현재 부품에 자동 연결하지 않았습니다. 부품 연결을 확인해 주세요.")
     if preview:
@@ -79,41 +103,42 @@ def render_measurement_panel(
     with st.form(f"cc_v5_add_measurement_{owner}"):
         value = st.text_input("측정값", key=f"cc_v5_value_{owner}", placeholder="예: 0, -0.25, 3.3")
         unit = st.selectbox("단위", units, key=unit_key)
-        uncertainty = st.text_input(
-            f"측정기 오차/측정 불확실도 σ ({BASE_UNITS[measurement_type]})",
-            key=f"cc_v5_sigma_{owner}", placeholder="계측기 사양에 따른 양수 입력 · 미입력 시 판정 보류",
-        )
-        uncertainty_source = st.text_input("측정 불확실도 출처", placeholder="예: 멀티미터 모델·정확도 사양")
         target = st.text_input("측정 대상/단자", placeholder="예: BZ1 양단 전압, U1 VCC-GND")
-        test_id = st.selectbox(
-            "부품별 검사 항목", test_options,
-            format_func=lambda value: "프로파일 검사 선택 안 함" if not value else value,
-            help="등록된 검사항목만 고장 가설 판정에 사용할 수 있습니다. 그 외 측정은 기록으로만 보관합니다.",
-        )
-        relations = test_profiles.get(test_id, {}).get("fault_relations", {})
-        fault_options = [""] + [fault_id for fault_id in fault_modes if fault_id in relations]
-        fault_hypothesis = st.selectbox(
-            "검사할 고장 가설", fault_options,
-            format_func=lambda code: "선택 안 함" if not code else fault_modes[code]["title"],
-        )
-        range_col_a, range_col_b = st.columns(2)
-        with range_col_a:
-            reference_min = st.text_input(f"정상 범위 하한 ({unit})")
-        with range_col_b:
-            reference_max = st.text_input(f"정상 범위 상한 ({unit})")
-        reference_source = st.text_input("정상 범위 출처", placeholder="예: 제조사 데이터시트, 보드 사양")
-        reference_source_id = st.text_input("기준 출처 ID", placeholder="예: 데이터시트 문서번호·보드 사양 항목")
-        reference_status = st.selectbox("기준 출처 검증", ("UNVERIFIED", "DATASHEET_VERIFIED", "BOARD_SPEC_VERIFIED"),
-                                        format_func=lambda value: {
-                                            "UNVERIFIED": "미검증 · 판정에 사용 안 함",
-                                            "DATASHEET_VERIFIED": "데이터시트 직접 확인",
-                                            "BOARD_SPEC_VERIFIED": "보드 사양 직접 확인",
-                                        }[value])
-        operating_conditions = st.text_input("실제 측정 조건", placeholder="예: 전원 5 V, 무부하")
-        reference_conditions = st.text_input("기준 조건", placeholder="실제 측정 조건과 같아야 판정에 사용")
-        location_verified = st.checkbox("측정 지점이 선택한 부품의 지정 단자임을 확인함")
-        source_label = st.selectbox("측정 출처", SOURCE_OPTIONS, key=f"cc_v5_source_{owner}")
-        submitted = st.form_submit_button("측정값 저장", type="primary")
+        with st.expander("검증 정보 · 정상 범위 · 출처", expanded=False):
+            uncertainty = st.text_input(
+                f"측정 불확실도 σ ({BASE_UNITS[measurement_type]})",
+                key=f"cc_v5_sigma_{owner}", placeholder="계측기 정확도 사양에 따른 양수",
+            )
+            uncertainty_source = st.text_input("불확실도 출처", placeholder="예: 멀티미터 모델·정확도 사양")
+            test_id = st.selectbox(
+                "부품별 검사 항목", test_options,
+                format_func=lambda value: "프로파일 검사 선택 안 함" if not value else value,
+                help="등록된 검사 항목만 가설 검증에 사용할 수 있습니다.",
+            )
+            relations = test_profiles.get(test_id, {}).get("fault_relations", {})
+            fault_options = [""] + [fault_id for fault_id in fault_modes if fault_id in relations]
+            fault_hypothesis = st.selectbox(
+                "검사할 고장 가설", fault_options,
+                format_func=lambda code: "선택 안 함" if not code else fault_modes[code]["title"],
+            )
+            range_col_a, range_col_b = st.columns(2)
+            with range_col_a:
+                reference_min = st.text_input(f"정상 범위 하한 ({unit})")
+            with range_col_b:
+                reference_max = st.text_input(f"정상 범위 상한 ({unit})")
+            reference_source = st.text_input("정상 범위 출처", placeholder="예: 제조사 데이터시트, 보드 사양")
+            reference_source_id = st.text_input("기준 출처 ID", placeholder="예: 데이터시트 문서번호·보드 사양 항목")
+            reference_status = st.selectbox("기준 출처", ("UNVERIFIED", "DATASHEET_VERIFIED", "BOARD_SPEC_VERIFIED"),
+                                            format_func=lambda value: {
+                                                "UNVERIFIED": "미검증",
+                                                "DATASHEET_VERIFIED": "데이터시트 확인",
+                                                "BOARD_SPEC_VERIFIED": "보드 사양 확인",
+                                            }[value])
+            operating_conditions = st.text_input("측정 조건", placeholder="예: 전원 5 V, 무부하")
+            reference_conditions = st.text_input("기준 조건", placeholder="실제 측정 조건과 동일하게")
+            location_verified = st.checkbox("측정 지점이 지정 단자임을 확인함")
+            source_label = st.selectbox("측정 출처", SOURCE_OPTIONS, key=f"cc_v5_source_{owner}")
+        submitted = st.form_submit_button("측정 기록 저장", type="primary")
     if submitted:
         try:
             record = adapt_measurement_input(
@@ -136,7 +161,7 @@ def render_measurement_panel(
                 uncertainty_source=uncertainty_source,
             )
             save_measurement(st.session_state, record)
-            st.success("측정값을 기록했습니다. 전기적 Node Mapping은 확인되지 않아 진단에는 사용되지 않습니다.")
+            st.success("측정 기록을 저장했습니다. 저장은 측정 검증 완료를 뜻하지 않습니다.")
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))
@@ -161,7 +186,12 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
     title = (f"{MEASUREMENT_TYPE_LABELS[record.measurement_type]} · "
              f"{record.entered_value:g} {record.entered_unit} · {record.timestamp[:16]}")
     with st.expander(title):
-        st.caption(f"출처 · {SOURCE_LABELS[record.source]} · 검증 상태 {record.verification_status}")
+        check_reasons = _measurement_verification_gaps(record)
+        if check_reasons:
+            st.warning("기록됨 · 검증 대기 · " + " / ".join(check_reasons))
+        else:
+            st.success("필수 정보 입력 완료 · 진단 결과와 대조 대기")
+        st.caption(f"출처 · {SOURCE_LABELS[record.source]} · 기록 상태 {record.verification_status}")
         st.caption(f"Component ID · {record.component_id} · 전기적 Mapping 미확인")
         if record.measurement_target or record.fault_hypothesis:
             st.caption(f"검사 대상 · {record.measurement_target or '미지정'} · 가설 {record.fault_hypothesis or '미지정'}")
@@ -195,21 +225,100 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
         unit_key = f"cc_v5_edit_unit_{record.measurement_id}"
         if st.session_state.get(unit_key) not in units:
             st.session_state[unit_key] = record.entered_unit if record.entered_unit in units else units[0]
+        knowledge = load_knowledge()
+        fault_modes = knowledge.get("fault_modes", {}).get("fault_modes", {})
+        type_profile = knowledge.get("component_test_profiles", {}).get("profiles", {}).get(
+            record.component_type.casefold(), {}
+        )
+        test_profiles = type_profile.get("tests", {})
+        test_options = [""] + list(test_profiles)
+        selected_test = record.test_id if record.test_id in test_profiles else ""
         with st.form(f"cc_v5_edit_form_{record.measurement_id}"):
             value = st.text_input("수정 측정값", value=f"{record.entered_value:g}",
                                   key=f"cc_v5_edit_value_{record.measurement_id}")
             unit = st.selectbox("수정 단위", units, key=unit_key)
+            target = st.text_input("측정 대상/단자", value=record.measurement_target or "",
+                                   key=f"cc_v5_edit_target_{record.measurement_id}")
+            source_label = st.selectbox(
+                "측정 출처", SOURCE_OPTIONS, index=SOURCE_OPTIONS.index(SOURCE_LABELS[record.source]),
+                key=f"cc_v5_edit_source_{record.measurement_id}",
+            )
             sigma_default = ""
             if edit_type == record.measurement_type and record.uncertainty is not None:
                 sigma_default = f"{record.uncertainty:g}"
-            uncertainty = st.text_input(
-                f"수정 불확실도 σ ({BASE_UNITS[edit_type]})", value=sigma_default,
-                key=f"cc_v5_edit_sigma_{record.measurement_id}",
-            )
-            source_label = st.selectbox(
-                "수정 출처", SOURCE_OPTIONS, index=SOURCE_OPTIONS.index(SOURCE_LABELS[record.source]),
-                key=f"cc_v5_edit_source_{record.measurement_id}",
-            )
+            with st.expander("고급 검증 조건 수정", expanded=False):
+                uncertainty = st.text_input(
+                    f"불확실도 σ ({BASE_UNITS[edit_type]})", value=sigma_default,
+                    key=f"cc_v5_edit_sigma_{record.measurement_id}",
+                )
+                uncertainty_source = st.text_input(
+                    "불확실도 출처", value=record.uncertainty_source or "",
+                    key=f"cc_v5_edit_sigma_source_{record.measurement_id}",
+                )
+                test_id = st.selectbox(
+                    "부품별 검사 항목", test_options,
+                    index=test_options.index(selected_test),
+                    format_func=lambda item: "프로파일 검사 선택 안 함" if not item else item,
+                    key=f"cc_v5_edit_test_{record.measurement_id}",
+                )
+                relations = test_profiles.get(test_id, {}).get("fault_relations", {})
+                fault_options = [""] + [item for item in fault_modes if item in relations]
+                fault_default = record.fault_hypothesis if record.fault_hypothesis in fault_options else ""
+                fault_hypothesis = st.selectbox(
+                    "검사할 고장 가설", fault_options,
+                    index=fault_options.index(fault_default),
+                    format_func=lambda code: "선택 안 함" if not code else fault_modes[code]["title"],
+                    key=f"cc_v5_edit_fault_{record.measurement_id}",
+                )
+                multiplier = MEASUREMENT_UNITS[edit_type][unit]
+                reference_min_default = ""
+                reference_max_default = ""
+                if edit_type == record.measurement_type:
+                    if record.reference_min is not None:
+                        reference_min_default = f"{record.reference_min / multiplier:g}"
+                    if record.reference_max is not None:
+                        reference_max_default = f"{record.reference_max / multiplier:g}"
+                range_left, range_right = st.columns(2)
+                with range_left:
+                    reference_min = st.text_input(
+                        f"정상 범위 하한 ({unit})", value=reference_min_default,
+                        key=f"cc_v5_edit_ref_min_{record.measurement_id}",
+                    )
+                with range_right:
+                    reference_max = st.text_input(
+                        f"정상 범위 상한 ({unit})", value=reference_max_default,
+                        key=f"cc_v5_edit_ref_max_{record.measurement_id}",
+                    )
+                reference_source = st.text_input(
+                    "정상 범위 출처", value=record.reference_source or "",
+                    key=f"cc_v5_edit_ref_source_{record.measurement_id}",
+                )
+                reference_source_id = st.text_input(
+                    "기준 출처 ID", value=record.reference_source_id or "",
+                    key=f"cc_v5_edit_ref_source_id_{record.measurement_id}",
+                )
+                reference_status_options = ("UNVERIFIED", "DATASHEET_VERIFIED", "BOARD_SPEC_VERIFIED")
+                current_reference_status = record.reference_verification_status
+                if current_reference_status not in reference_status_options:
+                    current_reference_status = "UNVERIFIED"
+                reference_status = st.selectbox(
+                    "기준 출처 검증", reference_status_options,
+                    index=reference_status_options.index(current_reference_status),
+                    format_func=lambda item: {"UNVERIFIED": "미검증", "DATASHEET_VERIFIED": "데이터시트 확인", "BOARD_SPEC_VERIFIED": "보드 사양 확인"}[item],
+                    key=f"cc_v5_edit_ref_status_{record.measurement_id}",
+                )
+                operating_conditions = st.text_input(
+                    "측정 조건", value=record.operating_conditions or "",
+                    key=f"cc_v5_edit_operating_{record.measurement_id}",
+                )
+                reference_conditions = st.text_input(
+                    "기준 조건", value=record.reference_conditions or "",
+                    key=f"cc_v5_edit_reference_conditions_{record.measurement_id}",
+                )
+                location_verified = st.checkbox(
+                    "측정 지점이 지정 단자임을 확인함", value=record.location_verified,
+                    key=f"cc_v5_edit_location_{record.measurement_id}",
+                )
             edit = st.form_submit_button("변경 저장")
             delete = st.form_submit_button("측정값 삭제")
         if edit:
@@ -223,20 +332,18 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
                     source=SOURCE_CODES[source_label],
                     component_map_version=record.component_map_version,
                     measurement_id=record.measurement_id, timestamp=record.timestamp,
-                    measurement_target=record.measurement_target,
-                    fault_hypothesis=record.fault_hypothesis,
-                    test_id=record.test_id,
-                    reference_min=(record.reference_min / MEASUREMENT_UNITS[edit_type][unit]
-                                   if edit_type == record.measurement_type and record.reference_min is not None else None),
-                    reference_max=(record.reference_max / MEASUREMENT_UNITS[edit_type][unit]
-                                   if edit_type == record.measurement_type and record.reference_max is not None else None),
-                    reference_source=record.reference_source,
-                    reference_source_id=record.reference_source_id,
-                    reference_verification_status=record.reference_verification_status,
-                    operating_conditions=record.operating_conditions,
-                    reference_conditions=record.reference_conditions,
-                    location_verified=record.location_verified,
-                    uncertainty_source=record.uncertainty_source,
+                    measurement_target=target,
+                    fault_hypothesis=fault_hypothesis or None,
+                    test_id=test_id or None,
+                    reference_min=reference_min,
+                    reference_max=reference_max,
+                    reference_source=reference_source,
+                    reference_source_id=reference_source_id,
+                    reference_verification_status=reference_status,
+                    operating_conditions=operating_conditions,
+                    reference_conditions=reference_conditions,
+                    location_verified=location_verified,
+                    uncertainty_source=uncertainty_source,
                 )
                 updated = replace(updated, changed_at=datetime.now(timezone.utc).isoformat())
                 update_measurement(st.session_state, updated)

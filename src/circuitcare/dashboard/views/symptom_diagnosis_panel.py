@@ -21,7 +21,7 @@ from circuitcare.symptom_diagnosis.observation_store import ObservationStore
 from circuitcare.symptom_diagnosis.diagnosis_state import build_overlay_state
 from circuitcare.symptom_diagnosis.schemas import ComponentRecord, Observation
 from circuitcare.symptom_diagnosis.symptom_parser import parse_user_report
-from circuitcare.frontend.workbench_state import ACTIVE_PHOTO_KEY
+from circuitcare.frontend.workbench_state import ACTIVE_PHOTO_KEY, update_selection
 
 
 def _project_key(project: ProjectContext) -> str:
@@ -161,8 +161,12 @@ def render_symptom_diagnosis_panel(
     key = _project_key(project)
     state = st.session_state.setdefault(key, {"manual_observations": {}, "result": None})
     state.setdefault("manual_observations", state.pop("observations", {}))
-    st.markdown("### 증상 기반 고장 추론")
-    st.caption("부품 연결도가 없어도 증상과 관측 사실로 원인 후보를 정리합니다. 모든 후보는 검증 전 상태입니다.")
+    if state.pop("measurement_refresh_notice", False):
+        st.info("측정 기록이 변경되어 기존 결과를 무효화하고 새 입력으로 원인 후보를 다시 계산했습니다. 측정 근거와 판정 상태를 확인하세요.")
+    if state.get("invalidated_reason"):
+        st.warning(f"입력이 변경되어 이전 분석 결과를 무효화했습니다 · {state['invalidated_reason']} · 다시 분석해 주세요.")
+    st.markdown("#### 증상 입력 및 원인 분석")
+    st.caption("자연어로 증상을 설명하세요. 원인 후보는 검사 전 가설이며 실제 고장 확률로 해석하지 않습니다.")
     description_key = f"{key}_description"
     if description_key not in st.session_state:
         st.session_state[description_key] = project.symptom_description or ""
@@ -174,24 +178,23 @@ def render_symptom_diagnosis_panel(
         st.session_state[symptom_widget_key] = [
             code_to_label[code] for code in state.get("symptoms", []) if code in code_to_label
         ]
-    selected_labels = st.multiselect(
-        "확인된 증상", list(code_to_label.values()), key=symptom_widget_key,
-    )
+    selected_labels = st.session_state.get(symptom_widget_key, [])
     selected_codes = [code for code, label in code_to_label.items() if label in selected_labels]
     component_inventory = component_inventory or {}
     component_rows = _component_rows(components, component_inventory)
     confirmed_component_ids = sorted(
         row["component_id"] for row in component_rows if row.get("presence_status") == "CONFIRMED"
     )
-    st.markdown("**PCB에서 확인한 소자 목록**")
-    st.caption(f"박스를 클릭해 오른쪽 **선택 부품**에서 확인/제외 상태를 바꾸세요 · 확인 {len(confirmed_component_ids)}개 / 검출 {len(component_rows)}개")
-    inventory_complete = st.checkbox(
-        "PCB의 전체 부품 목록을 확인 완료했습니다",
-        value=bool(state.get("inventory_complete", False)),
-        key=f"{key}_inventory_complete",
-        help="체크하면 선택한 소자 목록을 현재 PCB의 전체 부품 목록으로 취급합니다. 체크하지 않으면 누락 여부를 단정하지 않습니다.",
-    )
-    with st.expander("추가로 확인한 사실", expanded=False):
+    st.caption(f"PCB 검수 목록 · 확인 {len(confirmed_component_ids)} / 표시 {len(component_rows)}개")
+    with st.expander("추가 관측·고급 분석 설정", expanded=False):
+        st.multiselect("구조화된 증상", list(code_to_label.values()), key=symptom_widget_key,
+                       help="자연어 설명 외에 분류된 증상을 추가합니다.")
+        inventory_complete = st.checkbox(
+            "PCB 전체 부품 목록을 확인 완료했습니다",
+            value=bool(state.get("inventory_complete", False)),
+            key=f"{key}_inventory_complete",
+            help="누락 여부 분석에만 사용됩니다. 확실하지 않으면 선택하지 마세요.",
+        )
         yes_no_unknown = ("모름", "예", "아니오")
         evidence_fields = {
             "POWER_SOURCE_VERIFIED": "외부 전원/배터리 입력이 정상임",
@@ -212,6 +215,27 @@ def render_symptom_diagnosis_panel(
             observations["POWER_OFF_CONFIRMED"] = True
         else:
             observations.pop("POWER_OFF_CONFIRMED", None)
+        model_cache = state.get("ollama_models")
+        checked_at = float(state.get("ollama_checked_at", 0))
+        if time.time() - checked_at > 30:
+            try:
+                local_client = OllamaClient(timeout_seconds=2)
+                model_cache = [str(item.get("name")) for item in local_client.list_models() if item.get("name")]
+                state["ollama_error"] = None
+            except (LocalLLMError, ValueError) as exc:
+                model_cache = []
+                state["ollama_error"] = str(exc)
+            state["ollama_models"] = model_cache
+            state["ollama_checked_at"] = time.time()
+            st.session_state[key] = state
+        if model_cache:
+            selected_model = st.selectbox("로컬 LLM", model_cache, key=f"{key}_model")
+            llm_key = f"{key}_llm_enabled"
+            if llm_key not in st.session_state:
+                st.session_state[llm_key] = True
+            llm_enabled = st.checkbox("LLM 설명 보조 사용", key=llm_key)
+        else:
+            st.caption("Ollama를 사용할 수 없어 규칙 기반 분석으로 실행합니다.")
     measurements = get_measurements(
         st.session_state, project_id=project.project_id, board_id=project.board_id or "",
     )
@@ -226,6 +250,16 @@ def render_symptom_diagnosis_panel(
     )
     measurement_fingerprint = _measurement_fingerprint(project, measurements)
     if state.get("input_fingerprint") != fingerprint:
+        had_result = state.get("result") is not None
+        old_measurement_fingerprint = state.get("measurement_fingerprint")
+        if had_result:
+            if old_measurement_fingerprint and old_measurement_fingerprint != measurement_fingerprint:
+                reason = "측정 기록 변경"
+            elif state.get("symptoms") != selected_codes:
+                reason = "증상 입력 변경"
+            else:
+                reason = "소자 검수 또는 분석 조건 변경"
+            state["invalidated_reason"] = reason
         state["result"] = None
         state["answers"] = {}
         state["input_fingerprint"] = fingerprint
@@ -233,32 +267,11 @@ def render_symptom_diagnosis_panel(
         state["diagnosis_id"] = str(uuid4())
         st.session_state[key] = state
         st.rerun()
-    llm_enabled = False
-    selected_model = None
-    model_cache = state.get("ollama_models")
-    checked_at = float(state.get("ollama_checked_at", 0))
-    if time.time() - checked_at > 30:
-        try:
-            local_client = OllamaClient(timeout_seconds=2)
-            model_cache = [str(item.get("name")) for item in local_client.list_models()
-                           if item.get("name")]
-            state["ollama_error"] = None
-        except (LocalLLMError, ValueError) as exc:
-            model_cache = []
-            state["ollama_error"] = str(exc)
-        state["ollama_models"] = model_cache
-        state["ollama_checked_at"] = time.time()
-        st.session_state[key] = state
-    if model_cache:
-        selected_model = st.selectbox("로컬 LLM 모델", model_cache, key=f"{key}_model")
-        llm_key = f"{key}_llm_enabled"
-        if llm_key not in st.session_state:
-            st.session_state[llm_key] = True
-        llm_enabled = st.checkbox("LLM으로 후보 설명 보조", key=llm_key)
-    else:
-        st.caption("로컬 LLM 연결을 사용할 수 없어 규칙 기반 진단만 실행합니다. Ollama가 켜지면 이곳에서 모델을 선택할 수 있습니다.")
+    llm_enabled = bool(st.session_state.get(f"{key}_llm_enabled", False))
+    selected_model = st.session_state.get(f"{key}_model")
     if (state.get("result") and state.get("input_fingerprint") == fingerprint
             and state.get("measurement_fingerprint") != measurement_fingerprint):
+        state["measurement_refresh_notice"] = True
         combined_observations = _combined_observations(state)
         result = diagnose(
             symptoms=state.get("symptoms", selected_codes), symptom_text="",
@@ -279,12 +292,13 @@ def render_symptom_diagnosis_panel(
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 result["llm_component_error"] = str(exc)
         state["result"] = result
+        state.pop("invalidated_reason", None)
         state["measurement_fingerprint"] = measurement_fingerprint
         _persist_diagnosis(project, state, result, components, combined_observations)
         _sync_component_candidates(st, project, result)
         st.session_state[key] = state
         st.rerun()
-    if st.button("고장 원인 후보 추론", type="primary", disabled=preview,
+    if st.button("원인 후보 분석" if not state.get("result") else "다시 분석", type="primary", disabled=preview,
                  key=f"{key}_run"):
         state["symptoms"] = selected_codes
         state["confirmed_component_ids"] = confirmed_component_ids
@@ -349,13 +363,14 @@ def render_symptom_diagnosis_panel(
         _persist_diagnosis(project, state, result, components, combined_observations)
         _sync_component_candidates(st, project, result)
         state["result"] = result
+        state.pop("invalidated_reason", None)
         state["input_fingerprint"] = fingerprint
         state["measurement_fingerprint"] = measurement_fingerprint
         st.session_state[key] = state
         st.rerun()
     result = state.get("result")
     if not result:
-        st.info("증상을 입력하고 **고장 원인 후보 추론**을 눌러 시작하세요.")
+        st.info("증상을 입력하고 **원인 후보 분석**을 실행하세요.")
         return
     if result.get("evidence_conflicts"):
         st.warning("서로 다른 입력이 있어 해당 사실은 확정하지 않았습니다. 증상/측정값을 확인해 주세요.")
@@ -369,6 +384,7 @@ def render_symptom_diagnosis_panel(
         st.info("실제 존재한다고 확인한 소자가 없습니다. 소자 내부 고장 후보는 생성되지 않았습니다.")
     if not inventory.get("complete"):
         st.caption("전체 부품 목록은 아직 미확정입니다. 미검출 소자가 실제로 없는지 판단하지 않으며, 선택한 실재 확인 ID만 부품 고장 후보에 사용합니다.")
+    st.markdown("#### 원인 후보")
     st.success(result["message"])
     component_candidates = result.get("component_candidates", [])[:3]
     if component_candidates:
@@ -389,10 +405,23 @@ def render_symptom_diagnosis_panel(
             reason = explanations.get(candidate["component_id"])
             if reason:
                 st.caption(reason)
-            elif candidate.get("evidence"):
-                st.caption("근거 · " + " · ".join(candidate["evidence"][:3]))
-            else:
-                st.caption("부품 종류와 증상으로 좁힌 미확정 검사 후보입니다.")
+            with st.expander("이 소자 후보의 근거·판정", expanded=False):
+                supporting = candidate.get("supporting_evidence") or candidate.get("evidence", [])
+                opposing = candidate.get("opposing_evidence", [])
+                st.caption("뒷받침 · " + (" · ".join(supporting[:5]) if supporting else "직접 근거 없음"))
+                st.caption("반대 근거 · " + (" · ".join(opposing[:5]) if opposing else "확인된 반대 근거 없음"))
+                if candidate.get("measurement_reason"):
+                    st.caption("측정 판정 · " + str(candidate["measurement_reason"]))
+                elif candidate.get("recommended_tests"):
+                    st.caption("다음 검사 · " + " · ".join(candidate["recommended_tests"][:3]))
+                elif not supporting:
+                    st.caption("부품 종류와 증상으로 좁힌 미확정 검사 후보입니다.")
+            if any(item.component_id == candidate.get("component_id") for item in components):
+                if st.button("PCB에서 위치 보기", key=f"cc_symptom_candidate_focus_{project.project_id}_{candidate.get('component_id')}"):
+                    update_selection(st.session_state, project=project,
+                                     selected_component=candidate.get("component_id"))
+                    st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
+                    st.rerun()
         if result.get("llm_component_explanations"):
             st.caption(f"후보별 설명 · {result['llm_component_explanations'].get('model', '')} · 후보 추가/확정 없음")
         elif result.get("llm_component_error"):
