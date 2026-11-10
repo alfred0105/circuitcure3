@@ -18,6 +18,12 @@ from circuitcare.vision.box_reconciliation import (
 DEFAULT_REVIEW_MODEL = "qwen3.5:9b"
 REVIEW_CLASSES = COMPONENT_LABELS
 
+
+class AIReviewStageError(RuntimeError):
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
+
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
@@ -37,9 +43,15 @@ REVIEW_SCHEMA = {
             "parent_id": {"type": "string"},
             "decision": {"type": "string", "enum": ["single_component", "multiple_components", "uncertain"]},
             "child_ids": {"type": "array", "items": {"type": "string"}},
+            "new_components": {"type": "array", "items": {"type": "object", "properties": {
+                "bbox_norm_999": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 999}, "minItems": 4, "maxItems": 4},
+                "proposed_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "evidence": {"type": "string"},
+            }, "required": ["bbox_norm_999", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
-        }, "required": ["parent_id", "decision", "child_ids", "confidence", "evidence"], "additionalProperties": False}},
+        }, "required": ["parent_id", "decision", "child_ids", "new_components", "confidence", "evidence"], "additionalProperties": False}},
         "missed_component_candidates": {"type": "array", "items": {"type": "object", "properties": {
             "image_index": {"type": "integer", "minimum": 0, "maximum": 48},
             "bbox_norm_999": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 999}, "minItems": 4, "maxItems": 4},
@@ -53,12 +65,13 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 
-_SYSTEM = """You review a PCB photo and its YOLO component proposals. Use only the supplied shared component labels. Return unknown whenever appearance is ambiguous; return not_component only when the box clearly contains no physical component. Be conservative: only suggest a class when the physical component appearance is clear. Small SMD parts are often visually ambiguous. Use body markings and nearby OCR/silkscreen as cross-check evidence; a reference such as C12 may not label the closest body. Conflicting evidence means decision=uncertain and proposed_class=unknown. Do not claim certainty. Do not invent unseen parts. Existing boxes are identified by IDs; assess duplicate pairs only when their IDs are listed in duplicate_pair_crops, using the associated paired crop and surrounding board context. For group_candidate_crops, decide whether the parent box encloses multiple independent components or one physical component/package (including a connector); never split pins or internal regions of one package. Reuse listed child detection IDs. Return multiple_components only when the crop clearly shows separate physical component bodies. Search for at most a few clearly visible missed components, including when there are no detector proposals. Every proposed box is only a rough review candidate and must be manually checked. Each supplied image has an image_index from image_sources; missed boxes must be normalized relative to the image they cite. Return only the requested JSON object."""
+_SYSTEM = """You review a PCB photo and its YOLO component proposals. Use only the supplied shared component labels. Return unknown whenever appearance is ambiguous; return not_component only when the box clearly contains no physical component. Be conservative: only suggest a class when the physical component appearance is clear. Small SMD parts are often visually ambiguous. Use body markings and nearby OCR/silkscreen as cross-check evidence; a reference such as C12 may not label the closest body. Conflicting evidence means decision=uncertain and proposed_class=unknown. Do not claim certainty. Do not invent unseen parts. Existing boxes are identified by IDs; assess duplicate pairs only when their IDs are listed in duplicate_pair_crops, using the associated paired crop and surrounding board context. For group_candidate_crops, decide whether the parent box encloses multiple independent components or one physical component/package (including a connector); never split pins or internal regions of one package. Reuse listed child detection IDs first. If clearly visible separate components have no listed box, provide their tight body boxes in new_components, normalized 0..999 within that group's crop image. Do not duplicate listed child boxes. Return multiple_components only when the crop clearly shows separate physical component bodies. Search for at most a few clearly visible missed components, including when there are no detector proposals. Every proposed box is only a rough review candidate and must be manually checked. Each supplied image has an image_index from image_sources; missed boxes must be normalized relative to the image they cite. Return only the requested JSON object."""
 
 
 def _review_images(
     image_bytes: bytes, detections: list[dict[str, Any]], *,
-    group_candidates: list[dict[str, Any]] | None = None, max_crop_count: int = 10,
+    group_candidates: list[dict[str, Any]] | None = None,
+    review_diagnostics: list[dict[str, Any]] | None = None, max_crop_count: int = 10,
 ) -> tuple[list[bytes], tuple[int, int], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     with Image.open(io.BytesIO(image_bytes)) as source_image:
         image = source_image.convert("RGB")
@@ -68,7 +81,7 @@ def _review_images(
     sx, sy = guide.width / width, guide.height / height
     painter = ImageDraw.Draw(guide)
     ordered = sorted(detections, key=lambda row: float(row.get("confidence") or 0.0))[:max_crop_count]
-    pair_candidates = _duplicate_pair_candidates(detections)
+    pair_candidates = _duplicate_pair_candidates(detections, diagnostics=review_diagnostics)
     ids_to_crop = {str(row["detection_id"]) for row in ordered}
     for row in detections:
         box = row.get("bbox_xyxy")
@@ -188,7 +201,10 @@ def _review_images(
     return encoded, (width, height), manifest, pair_manifest, group_manifest
 
 
-def _duplicate_pair_candidates(detections: list[dict[str, Any]], *, limit: int = 8) -> list[dict[str, Any]]:
+def _duplicate_pair_candidates(
+    detections: list[dict[str, Any]], *, limit: int = 8,
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Select only nearby, similar-scale pairs for focused visual re-review."""
     pairs = []
     for index, left in enumerate(detections):
@@ -200,14 +216,62 @@ def _duplicate_pair_candidates(detections: list[dict[str, Any]], *, limit: int =
             if not isinstance(right_box, (list, tuple)) or len(right_box) != 4:
                 continue
             metrics = duplicate_box_metrics(left_box, right_box)
-            if metrics["area_ratio"] < .30 or metrics["center_distance_norm"] > .60:
+            pair_ids = [str(left.get("detection_id", "")), str(right.get("detection_id", ""))]
+            if metrics["area_ratio"] < .12:
+                if diagnostics is not None:
+                    diagnostics.append({"stage": "duplicate_pair_search", "detection_ids": pair_ids,
+                                        "status": "rejected", "reason": "area_ratio_too_small", "metrics": metrics})
                 continue
-            if metrics["iou"] < .05 and metrics["smaller_coverage"] < .20:
+            if metrics["center_distance_norm"] > .80:
+                if diagnostics is not None:
+                    diagnostics.append({"stage": "duplicate_pair_search", "detection_ids": pair_ids,
+                                        "status": "rejected", "reason": "centers_too_far", "metrics": metrics})
+                continue
+            if metrics["iou"] < .02 and metrics["smaller_coverage"] < .10:
+                if diagnostics is not None:
+                    diagnostics.append({"stage": "duplicate_pair_search", "detection_ids": pair_ids,
+                                        "status": "rejected", "reason": "insufficient_overlap", "metrics": metrics})
                 continue
             pairs.append({"detections": (left, right), "metrics": metrics,
                           "rank": metrics["iou"] + .35 * metrics["smaller_coverage"]
-                          + max(0.0, .60 - metrics["center_distance_norm"]) * .15})
-    return sorted(pairs, key=lambda item: item["rank"], reverse=True)[:limit]
+                          + max(0.0, .80 - metrics["center_distance_norm"]) * .15})
+            if diagnostics is not None:
+                diagnostics.append({"stage": "duplicate_pair_search", "detection_ids": pair_ids,
+                                    "status": "candidate", "reason": "overlap_or_nearby_scale_match",
+                                    "metrics": metrics})
+    ranked = sorted(pairs, key=lambda item: item["rank"], reverse=True)
+    if diagnostics is not None:
+        for pair in ranked[limit:]:
+            diagnostics.append({"stage": "duplicate_pair_search",
+                                "detection_ids": [row.get("detection_id") for row in pair["detections"]],
+                                "status": "deferred", "reason": "duplicate_crop_limit",
+                                "metrics": pair["metrics"]})
+    return ranked[:limit]
+
+
+def _map_normalized_box(
+    box: Any, image_index: Any, image_manifest: list[dict[str, Any]], *, min_size_px: float = 4.0,
+) -> tuple[list[float] | None, str | None]:
+    """Validate a Qwen box and map its cited image/crop coordinates to source pixels."""
+    if type(image_index) is not int or not 0 <= image_index < len(image_manifest):
+        return None, "invalid_image_index"
+    if (not isinstance(box, list) or len(box) != 4
+            or any(type(value) is not int or not 0 <= value <= 999 for value in box)):
+        return None, "invalid_normalized_coordinates"
+    x1, y1, x2, y2 = box
+    if x2 <= x1 or y2 <= y1:
+        return None, "degenerate_normalized_box"
+    region = image_manifest[image_index].get("bbox_xyxy")
+    if not isinstance(region, (list, tuple)) or len(region) != 4:
+        return None, "invalid_source_region"
+    left, top, right, bottom = map(float, region)
+    if right <= left or bottom <= top:
+        return None, "invalid_source_region"
+    mapped = [left + x1 * (right - left) / 999, top + y1 * (bottom - top) / 999,
+              left + x2 * (right - left) / 999, top + y2 * (bottom - top) / 999]
+    if mapped[2] - mapped[0] < min_size_px or mapped[3] - mapped[1] < min_size_px:
+        return None, "box_below_minimum_source_size"
+    return mapped, None
 
 
 def review_components_with_qwen(
@@ -229,9 +293,20 @@ def review_components_with_qwen(
                            "ocr_class_hints": row.get("ocr_class_hints", []),
                            "reference_designators": row.get("reference_designators", []),
                            "body_marking": row.get("body_marking")})
-    group_candidates = find_group_box_candidates(identified)
-    images, (width, height), image_manifest, pair_manifest, group_manifest = _review_images(
-        image_bytes, identified, group_candidates=group_candidates)
+    candidate_diagnostics: list[dict[str, Any]] = []
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            image_size = source.size
+        group_candidates = find_group_box_candidates(identified, image_size=image_size,
+                                                     diagnostics=candidate_diagnostics)
+        for group in group_candidates[8:]:
+            candidate_diagnostics.append({"stage": "candidate_search", "component_id": group["parent"]["detection_id"],
+                                          "status": "deferred", "reason": "group_crop_limit"})
+        images, (width, height), image_manifest, pair_manifest, group_manifest = _review_images(
+            image_bytes, identified, group_candidates=group_candidates,
+            review_diagnostics=candidate_diagnostics)
+    except Exception as exc:
+        raise AIReviewStageError("candidate_search", str(exc)) from exc
     payload = {
         "image_coordinates_px": {"width": width, "height": height},
         "annotated_image_box_ids": [row["detection_id"] for row in identified],
@@ -248,12 +323,15 @@ def review_components_with_qwen(
                                        for row in ocr_records[:120]],
         "coordinate_rule": "For each missed candidate, provide image_index and bbox_norm_999=[x1,y1,x2,y2] normalized 0..999 within that exact image.",
     }
-    response = client.chat_json(
-        model, [{"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": "Review the PCB image, YOLO proposals, and OCR evidence. Return conservative candidate findings.\n" + json.dumps(payload, ensure_ascii=False)}],
-        output_schema=REVIEW_SCHEMA, images=images,
-    )
-    content = response["content"]
+    try:
+        response = client.chat_json(
+            model, [{"role": "system", "content": _SYSTEM},
+                    {"role": "user", "content": "Review the PCB image, YOLO proposals, and OCR evidence. Return conservative candidate findings.\n" + json.dumps(payload, ensure_ascii=False)}],
+            output_schema=REVIEW_SCHEMA, images=images,
+        )
+        content = response["content"]
+    except Exception as exc:
+        raise AIReviewStageError("qwen", str(exc)) from exc
     known_ids = {row["detection_id"] for row in identified}
     allowed_pairs = {tuple(sorted(pair["detection_ids"])) for pair in pair_manifest}
     class_reviews = []
@@ -304,45 +382,86 @@ def review_components_with_qwen(
     for row in content.get("group_reviews", []):
         parent_id = row.get("parent_id")
         child_ids = row.get("child_ids", [])
-        confidence = row.get("confidence")
+        group_confidence = row.get("confidence")
         if (parent_id not in allowed_groups or parent_id in seen_group_ids
                 or row.get("decision") not in {"single_component", "multiple_components", "uncertain"}
                 or not isinstance(child_ids, list) or len(child_ids) != len(set(child_ids))
                 or not set(child_ids) <= allowed_groups[parent_id]
-                or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
-                or not 0 <= float(confidence) <= 1):
+                or not isinstance(group_confidence, (int, float)) or not math.isfinite(float(group_confidence))
+                or not 0 <= float(group_confidence) <= 1):
             continue
-        if row["decision"] == "multiple_components" and len(child_ids) < 2:
+        raw_new_components = row.get("new_components", [])
+        if not isinstance(raw_new_components, list):
+            raw_new_components = []
+        mapped_new_components = []
+        group_image = next((item for item in group_manifest if item["parent_id"] == parent_id), None)
+        parent_box = next((item["bbox_xyxy"] for item in identified
+                           if item["detection_id"] == parent_id), None)
+        for new_index, candidate in enumerate(raw_new_components[:6] if row["decision"] == "multiple_components" else []):
+            mapped, rejection_reason = _map_normalized_box(
+                candidate.get("bbox_norm_999"), group_image["image_index"] if group_image else None,
+                image_manifest,
+            )
+            class_name = normalize_component_class(candidate.get("proposed_class"))
+            candidate_confidence = candidate.get("confidence")
+            if class_name == "not_component":
+                rejection_reason = "not_component_cannot_be_added_as_box"
+            elif (not isinstance(candidate_confidence, (int, float)) or not math.isfinite(float(candidate_confidence))
+                  or not 0 <= float(candidate_confidence) <= 1):
+                rejection_reason = "invalid_confidence"
+            elif mapped and parent_box:
+                candidate_area = max(1.0, (mapped[2] - mapped[0]) * (mapped[3] - mapped[1]))
+                intersection_width = max(0.0, min(mapped[2], parent_box[2]) - max(mapped[0], parent_box[0]))
+                intersection_height = max(0.0, min(mapped[3], parent_box[3]) - max(mapped[1], parent_box[1]))
+                if intersection_width * intersection_height / candidate_area < 0.80:
+                    rejection_reason = "group_candidate_outside_parent_box"
+            if not rejection_reason and mapped and any(
+                    same_component_box_pair(mapped, existing["bbox_xyxy"])
+                    for existing in identified
+                    if isinstance(existing.get("bbox_xyxy"), (list, tuple)) and len(existing["bbox_xyxy"]) == 4):
+                rejection_reason = "duplicates_existing_detection"
+            if rejection_reason:
+                candidate_diagnostics.append({"stage": "qwen_candidate_validation", "parent_id": parent_id,
+                                              "candidate_index": new_index, "status": "rejected",
+                                              "reason": rejection_reason})
+                continue
+            mapped_new_components.append({**candidate, "proposed_class": class_name,
+                                          "confidence": float(candidate_confidence), "bbox_xyxy": mapped,
+                                          "review_status": "검수 필요", "source": "qwen_suggestion"})
+            candidate_diagnostics.append({"stage": "qwen_candidate_validation", "parent_id": parent_id,
+                                          "candidate_index": new_index, "status": "candidate",
+                                          "reason": "validated_group_crop_box"})
+        if row["decision"] == "multiple_components" and len(child_ids) + len(mapped_new_components) < 2:
+            candidate_diagnostics.append({"stage": "qwen_group_validation", "parent_id": parent_id,
+                                          "status": "rejected", "reason": "fewer_than_two_component_boxes"})
             continue
         if row["decision"] != "multiple_components":
             child_ids = []
+            mapped_new_components = []
         seen_group_ids.add(parent_id)
-        group_reviews.append({**row, "child_ids": child_ids, "confidence": float(confidence),
+        group_reviews.append({**row, "child_ids": child_ids, "confidence": float(group_confidence),
+                              "new_components": mapped_new_components,
                               "evidence": str(row.get("evidence", ""))[:500],
                               "review_status": "AI_SUGGESTIONS_ONLY"})
     missed = []
     for row in content.get("missed_component_candidates", [])[:8]:
-        box = row.get("bbox_norm_999", [])
         proposed = normalize_component_class(row.get("proposed_class"))
         confidence = row.get("confidence")
         image_index = row.get("image_index", 0)
-        if (type(image_index) is not int or not 0 <= image_index < len(image_manifest)
-                or len(box) != 4 or any(type(value) is not int or not 0 <= value <= 999 for value in box)
-                or proposed == "not_component"
-                or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
-                or not 0 <= float(confidence) <= 1):
-            continue
-        x1, y1, x2, y2 = box
-        if x2 <= x1 or y2 <= y1:
-            continue
-        region = image_manifest[image_index]["bbox_xyxy"]
-        region_width, region_height = region[2] - region[0], region[3] - region[1]
-        candidate = [region[0] + x1 * region_width / 999, region[1] + y1 * region_height / 999,
-                     region[0] + x2 * region_width / 999, region[1] + y2 * region_height / 999]
-        if candidate[2] - candidate[0] < 4 or candidate[3] - candidate[1] < 4:
+        candidate, rejection_reason = _map_normalized_box(row.get("bbox_norm_999"), image_index, image_manifest)
+        if proposed == "not_component":
+            rejection_reason = "not_component_cannot_be_added_as_box"
+        elif (not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
+              or not 0 <= float(confidence) <= 1):
+            rejection_reason = "invalid_confidence"
+        if rejection_reason:
+            candidate_diagnostics.append({"stage": "qwen_candidate_validation", "image_index": image_index,
+                                          "status": "rejected", "reason": rejection_reason})
             continue
         if any(same_component_box_pair(candidate, row["bbox_xyxy"])
                for row in identified if isinstance(row.get("bbox_xyxy"), (list, tuple)) and len(row["bbox_xyxy"]) == 4):
+            candidate_diagnostics.append({"stage": "qwen_candidate_validation", "image_index": image_index,
+                                          "status": "rejected", "reason": "duplicates_existing_detection"})
             continue
         possible_duplicate_ids = [det["detection_id"] for det in identified
             if isinstance(det.get("bbox_xyxy"), (list, tuple)) and len(det["bbox_xyxy"]) == 4
@@ -353,6 +472,10 @@ def review_components_with_qwen(
                        "possible_duplicate_ids": possible_duplicate_ids,
                        "geometry_review_required": bool(possible_duplicate_ids),
                        "review_status": "검수 필요", "source": "qwen_suggestion"})
+        candidate_diagnostics.append({"stage": "qwen_candidate_validation", "image_index": image_index,
+                                      "status": "candidate", "reason": "validated_image_box"})
+    qwen_diagnostic_items = [item for item in candidate_diagnostics
+                             if item.get("stage") in {"qwen_candidate_validation", "qwen_group_validation"}]
     return {"class_reviews": class_reviews, "duplicate_reviews": duplicate_reviews,
             "group_reviews": group_reviews,
             "missed_component_candidates": missed,
@@ -360,4 +483,15 @@ def review_components_with_qwen(
             "model": response.get("model", model), "image_size_px": [width, height],
             "review_image_count": len(images), "review_tiles": sum(item["kind"] == "native_resolution_tile" for item in image_manifest),
             "duplicate_pair_crop_count": len(pair_manifest),
+            "review_diagnostics": {
+                "candidate_search": {"status": "complete", "candidate_count": len(group_candidates),
+                                      "items": [item for item in candidate_diagnostics
+                                                if item.get("stage") == "candidate_search"][:160]},
+                "duplicate_pair_search": {"status": "complete", "pair_count": len(pair_manifest),
+                                          "items": [item for item in candidate_diagnostics
+                                                    if item.get("stage") == "duplicate_pair_search"][:160]},
+                "qwen": {"status": "complete", "group_response_count": len(content.get("group_reviews", [])),
+                         "accepted_group_reviews": len(group_reviews), "items": qwen_diagnostic_items[:160]},
+                "ui": {"status": "pending", "events": []},
+            },
             "verification_status": "AI_SUGGESTIONS_ONLY"}

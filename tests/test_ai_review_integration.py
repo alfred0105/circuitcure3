@@ -5,9 +5,12 @@ import io
 import json
 
 from PIL import Image
+import pytest
 
 from circuitcare.local_llm import OllamaClient
-from circuitcare.vision.ai_review_service import _review_images, review_components_with_qwen
+from circuitcare.vision.ai_review_service import (
+    AIReviewStageError, _duplicate_pair_candidates, _review_images, review_components_with_qwen,
+)
 from circuitcare.vision.box_reconciliation import associate_ocr_with_components
 from circuitcare.vision.box_reconciliation import (
     board_visible_review_rows, boxes_overlap_candidate, deduplicate_component_boxes,
@@ -18,6 +21,7 @@ from circuitcare.vision.component_recognition_panel import (
     CLASS_OPTIONS, _legacy_secondary_scope, _migrate_legacy_review_state, _review_fingerprint,
     _run_ai_review_workflow, duplicate_exclusion_enabled, invalidate_qwen_review, review_aux_keys,
     review_keys, review_scope,
+    _make_group_child_row,
 )
 from circuitcare.component_taxonomy import COMPONENT_CLASSES, COMPONENT_LABELS, normalize_component_class
 
@@ -343,6 +347,36 @@ def test_duplicate_boxes_and_single_connector_package_are_not_group_candidates()
     assert find_group_box_candidates(connector_package) == []
 
 
+def test_large_parent_with_zero_or_one_child_is_sent_for_review_with_diagnostics():
+    no_children = find_group_box_candidates([
+        {"component_id": "large", "class_name": "unknown", "bbox_xyxy": [100, 100, 650, 650]},
+    ], image_size=(1000, 1000))
+    one_child = find_group_box_candidates([
+        {"component_id": "large", "class_name": "unknown", "bbox_xyxy": [100, 100, 650, 650]},
+        {"component_id": "c1", "class_name": "capacitor", "bbox_xyxy": [180, 180, 220, 220]},
+    ], image_size=(1000, 1000))
+    assert len(no_children) == len(one_child) == 1
+    assert no_children[0]["children"] == []
+    assert len(one_child[0]["children"]) == 1
+    rejected = []
+    assert find_group_box_candidates([
+        {"component_id": "ordinary", "class_name": "capacitor", "confidence": .9,
+         "bbox_xyxy": [100, 100, 220, 180]},
+    ], image_size=(1000, 1000), diagnostics=rejected) == []
+    assert rejected[0]["reason"] == "insufficient_children_or_size_evidence"
+
+
+def test_known_class_parent_with_one_much_smaller_child_is_reviewed():
+    groups = find_group_box_candidates([
+        {"component_id": "outer", "class_name": "connector", "confidence": .9,
+         "bbox_xyxy": [100, 100, 300, 200]},
+        {"component_id": "small", "class_name": "resistor", "bbox_xyxy": [150, 130, 190, 170]},
+    ], image_size=(1000, 1000))
+    assert len(groups) == 1
+    assert groups[0]["parent"]["detection_id"] == "outer"
+    assert groups[0]["metrics"]["largest_child_area_ratio"] == pytest.approx(12.5)
+
+
 def test_qwen_group_review_uses_focused_crop_and_rejects_unlisted_child_ids():
     class GroupClient:
         def chat_json(self, _model, messages, *, output_schema, images):
@@ -367,6 +401,56 @@ def test_qwen_group_review_uses_focused_crop_and_rejects_unlisted_child_ids():
     ], [])
     assert len(result["group_reviews"]) == 1
     assert result["group_reviews"][0]["decision"] == "multiple_components"
+
+
+def test_group_review_maps_qwen_new_child_box_to_original_pixels():
+    class GroupMissingClient:
+        def chat_json(self, _model, messages, *, output_schema, images):
+            payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
+            assert payload["group_candidate_crops"][0]["parent_id"] == "outer"
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [],
+                "group_reviews": [{"parent_id": "outer", "decision": "multiple_components",
+                    "child_ids": ["c1"], "new_components": [
+                        {"bbox_norm_999": [600, 500, 800, 750], "proposed_class": "resistor",
+                         "confidence": .82, "evidence": "Separate body without an existing box."},
+                    ], "confidence": .91, "evidence": "One known and one unboxed part."}],
+                "missed_component_candidates": [], "notes": [],
+            }}
+
+    result = review_components_with_qwen(GroupMissingClient(), "qwen3.5:9b", _png(), [
+        {"component_id": "outer", "class_name": "unknown", "bbox_xyxy": [0, 0, 98, 78]},
+        {"component_id": "c1", "class_name": "capacitor", "bbox_xyxy": [10, 10, 25, 25]},
+    ], [])
+    review = result["group_reviews"][0]
+    proposal = review["new_components"][0]
+    assert review["decision"] == "multiple_components"
+    assert proposal["bbox_xyxy"] == pytest.approx([60.06, 40.04, 80.08, 60.06], abs=1e-3)
+    assert proposal["review_status"] == "검수 필요"
+    assert result["review_diagnostics"]["qwen"]["status"] == "complete"
+
+
+def test_group_review_rejects_new_box_outside_parent_bounds():
+    class OutsideParentClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [],
+                "group_reviews": [{"parent_id": "outer", "decision": "multiple_components",
+                    "child_ids": ["c1"], "new_components": [
+                        {"bbox_norm_999": [0, 0, 100, 100], "proposed_class": "resistor",
+                         "confidence": .9, "evidence": "Outside the proposed parent."},
+                    ], "confidence": .9, "evidence": "Bad coordinate proposal."}],
+                "missed_component_candidates": [], "notes": [],
+            }}
+
+    result = review_components_with_qwen(OutsideParentClient(), "qwen3.5:9b", _png(), [
+        {"component_id": "outer", "class_name": "unknown", "bbox_xyxy": [20, 15, 80, 65]},
+        {"component_id": "c1", "class_name": "capacitor", "bbox_xyxy": [40, 30, 50, 40]},
+    ], [])
+    assert result["group_reviews"] == []
+    rejected = [item for item in result["review_diagnostics"]["qwen"]["items"]
+                if item.get("reason") == "group_candidate_outside_parent_box"]
+    assert len(rejected) == 1
 
 
 def test_qwen_false_split_remains_a_suggestion_until_user_action():
@@ -436,6 +520,65 @@ def test_group_parent_exclusion_keeps_children_and_review_history():
     saved_parent = next(row for row in rerun_rows if row["component_id"] == "outer")
     assert saved_parent["exclusion_reason"] == "qwen_group_container"
     assert saved_parent["ai_review"]["child_ids"] == ["r1", "c1"]
+
+
+def test_group_child_ui_addition_stays_unconfirmed_and_rejects_duplicate():
+    candidate = {"bbox_xyxy": [50, 20, 70, 40], "proposed_class": "resistor", "confidence": .8,
+                 "evidence": "Visible separate body."}
+    row, error = _make_group_child_row("scope", "outer", 0, candidate, [])
+    assert error is None and row["상태"] == "검수 필요"
+    assert row["source"] == "qwen_suggestion" and row["group_parent_id"] == "outer"
+    duplicate, duplicate_error = _make_group_child_row("scope", "outer", 0, candidate,
+        [{"x1": 51, "y1": 21, "x2": 69, "y2": 39}])
+    assert duplicate is None and duplicate_error == "duplicates_existing_detection"
+
+
+def test_duplicate_review_includes_moderate_overlap_pair_and_reports_candidates():
+    detections = [
+        {"detection_id": "large", "bbox_xyxy": [10, 10, 110, 110]},
+        {"detection_id": "small", "bbox_xyxy": [55, 55, 100, 100]},
+    ]
+    diagnostics = []
+    pairs = _duplicate_pair_candidates(detections, diagnostics=diagnostics)
+    assert len(pairs) == 1
+    assert diagnostics[0]["status"] == "candidate"
+    assert diagnostics[0]["stage"] == "duplicate_pair_search"
+
+
+def test_qwen_transport_failure_is_reported_as_qwen_stage_error():
+    class BrokenClient:
+        def chat_json(self, *_args, **_kwargs):
+            raise TimeoutError("Qwen timed out")
+
+    with pytest.raises(AIReviewStageError) as error:
+        review_components_with_qwen(BrokenClient(), "qwen3.5:9b", _png(), [], [])
+    assert error.value.stage == "qwen"
+    assert "timed out" in str(error.value)
+
+
+def test_review_workflow_stores_distinct_candidate_search_failure_diagnostic(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import circuitcare.vision.component_recognition_panel as panel
+
+    def fail_candidate_search(*_args, **_kwargs):
+        raise AIReviewStageError("candidate_search", "group box search failed")
+
+    monkeypatch.setattr("circuitcare.vision.ocr_backend.run_local_ocr", lambda _image: {"records": []})
+    monkeypatch.setattr("circuitcare.vision.ai_review_service.review_components_with_qwen", fail_candidate_search)
+    monkeypatch.setattr("circuitcare.local_llm.OllamaClient", lambda **_kwargs: object())
+    warnings = []
+    state = {}
+    st_api = SimpleNamespace(session_state=state, spinner=lambda *_args, **_kwargs: nullcontext(),
+                             warning=warnings.append)
+    rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
+             "신뢰도": .8, "x1": 2, "y1": 2, "x2": 20, "y2": 18}]
+    _run_ai_review_workflow(st_api, image_bytes=_png(), scope="s", rows=rows,
+                            records_key="rows", ocr_key="ocr", qwen_key="qwen")
+    diagnostics = state["qwen"]["review_diagnostics"]
+    assert diagnostics["candidate_search"]["status"] == "failed"
+    assert diagnostics["qwen"]["status"] == "not_reached"
+    assert warnings and "묶음 후보 탐색 실패" in warnings[0]
 
 
 def test_unreviewed_legacy_yolo2_rows_removed_but_user_reviewed_rows_remain():

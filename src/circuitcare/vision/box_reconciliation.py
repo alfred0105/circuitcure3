@@ -90,63 +90,127 @@ def same_component_box_pair(
 
 
 def find_group_box_candidates(
-    detections: list[dict[str, Any]], *, min_children: int = 2,
+    detections: list[dict[str, Any]], *, min_children: int = 0,
+    image_size: tuple[int, int] | None = None,
+    diagnostics: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Find a large container box around multiple spatially independent boxes.
+    """Propose likely oversized boxes for Qwen review without suppressing detections.
 
-    This is separate from duplicate detection: a parent is only flagged for Qwen
-    review, and no box is removed here. The relative size, containment, and center
-    spacing filters reduce duplicate and single-package false positives.
+    Two or more well-contained children are strong evidence. A single child or no
+    child can still be reviewed when the parent is unusually large for the source
+    image or other detections. This deliberately proposes review candidates rather
+    than declaring that the parent must be split.
     """
     normalized = []
+    stage_log = diagnostics if diagnostics is not None else []
     for row in detections:
         box = row.get("bbox_xyxy")
         if not isinstance(box, (list, tuple)):
             box = [row.get(key) for key in ("x1", "y1", "x2", "y2")]
         component_id = row.get("detection_id", row.get("component_id"))
-        if component_id and len(box) == 4 and all(isinstance(v, (int, float)) for v in box):
-            normalized.append({**row, "detection_id": str(component_id), "bbox_xyxy": list(map(float, box))})
+        if not component_id or len(box) != 4 or not all(isinstance(v, (int, float)) for v in box):
+            stage_log.append({"stage": "candidate_search", "component_id": str(component_id or ""),
+                              "status": "rejected", "reason": "invalid_or_missing_box_id"})
+            continue
+        normalized_box = list(map(float, box))
+        if normalized_box[2] <= normalized_box[0] or normalized_box[3] <= normalized_box[1]:
+            stage_log.append({"stage": "candidate_search", "component_id": str(component_id),
+                              "status": "rejected", "reason": "degenerate_box"})
+            continue
+        normalized.append({**row, "detection_id": str(component_id), "bbox_xyxy": normalized_box})
 
     groups = []
+    image_area = max(1, int(image_size[0]) * int(image_size[1])) if image_size else None
+    areas = [max(1.0, (row["bbox_xyxy"][2] - row["bbox_xyxy"][0])
+                 * (row["bbox_xyxy"][3] - row["bbox_xyxy"][1])) for row in normalized]
+    median_area = sorted(areas)[len(areas) // 2] if areas else 0.0
+    accepted_ids = set()
     for parent in normalized:
         child_metrics = []
         parent_box = parent["bbox_xyxy"]
+        parent_area = max(1.0, (parent_box[2] - parent_box[0]) * (parent_box[3] - parent_box[1]))
         for child in normalized:
             if child["detection_id"] == parent["detection_id"]:
                 continue
+            child_box = child["bbox_xyxy"]
+            child_area = max(1.0, (child_box[2] - child_box[0]) * (child_box[3] - child_box[1]))
+            if parent_area < child_area * 1.20:
+                continue
             metrics = duplicate_box_metrics(parent_box, child["bbox_xyxy"])
-            if (metrics["area_ratio"] <= 0.45 and metrics["smaller_coverage"] >= 0.72
-                    and metrics["center_distance_norm"] <= 0.48):
+            # Keep an intentionally broad provisional set. Qwen sees the crop and
+            # user confirmation is still required before excluding the parent.
+            if (metrics["area_ratio"] <= 0.72 and metrics["smaller_coverage"] >= 0.52
+                    and metrics["center_distance_norm"] <= 0.90):
                 child_metrics.append((child, metrics))
         independent = []
         for child, metrics in sorted(child_metrics, key=lambda item: item[1]["area_ratio"]):
             child_box = child["bbox_xyxy"]
             if any(same_component_box_pair(child_box, other["bbox_xyxy"])
-                   or box_iou(child_box, other["bbox_xyxy"]) >= 0.35 for other in independent):
+                   or box_iou(child_box, other["bbox_xyxy"]) >= 0.60 for other in independent):
                 continue
             independent.append(child)
-        if len(independent) < min_children:
-            continue
         child_pair_metrics = [duplicate_box_metrics(left["bbox_xyxy"], right["bbox_xyxy"])
                               for index, left in enumerate(independent)
                               for right in independent[index + 1:]]
-        if not child_pair_metrics or any(
-                pair["center_distance_norm"] < 0.28 and pair["iou"] > 0.15
-                for pair in child_pair_metrics):
+        if any(pair["center_distance_norm"] < 0.12 and pair["iou"] > 0.35
+               for pair in child_pair_metrics):
             continue
+        parent_fraction = parent_area / image_area if image_area else 0.0
+        relative_large = median_area > 0 and parent_area >= median_area * 3.0
+        largest_child_ratio = max(
+            (parent_area / max(1.0, (child["bbox_xyxy"][2] - child["bbox_xyxy"][0])
+                               * (child["bbox_xyxy"][3] - child["bbox_xyxy"][1]))
+             for child in independent), default=0.0,
+        )
+        image_large = parent_fraction >= 0.04
+        parent_class = str(parent.get("class_name", "unknown")).casefold()
+        try:
+            weak_localization = float(parent.get("confidence", 1.0)) <= 0.20
+        except (TypeError, ValueError):
+            weak_localization = False
+        enough_children = len(independent) >= min_children and len(independent) >= 2
+        # For 0-1 child cases require large-box evidence. With no image metadata,
+        # use relative detection scale; never infer a split from a lone box alone.
+        fallback_review = len(independent) < 2 and (
+            relative_large or parent_fraction >= 0.10
+            or (len(independent) == 1 and largest_child_ratio >= 5.0 and parent_fraction >= 0.02)
+            or (image_large and (parent_class in {"unknown", "unknown_component"} or weak_localization))
+        )
+        if not enough_children and not fallback_review:
+            stage_log.append({"stage": "candidate_search", "component_id": parent["detection_id"],
+                              "status": "rejected", "reason": "insufficient_children_or_size_evidence",
+                              "contained_children": len(independent), "area_fraction": parent_fraction,
+                              "largest_child_area_ratio": largest_child_ratio,
+                              "relative_area_ratio": parent_area / median_area if median_area else None})
+            continue
+        reason = "multiple_contained_boxes" if enough_children else "oversized_parent_review"
+        accepted_ids.add(parent["detection_id"])
         groups.append({
             "parent": parent,
             "children": independent,
+            "review_reason": reason,
             "metrics": {
                 "child_count": len(independent),
-                "containment_min": min(duplicate_box_metrics(parent_box, row["bbox_xyxy"])["smaller_coverage"]
-                                        for row in independent),
-                "child_parent_area_ratio_max": max(duplicate_box_metrics(parent_box, row["bbox_xyxy"])["area_ratio"]
-                                                   for row in independent),
-                "child_center_distance_min": min(pair["center_distance_norm"] for pair in child_pair_metrics),
-                "child_iou_max": max(pair["iou"] for pair in child_pair_metrics),
+                "containment_min": min((duplicate_box_metrics(parent_box, row["bbox_xyxy"])["smaller_coverage"]
+                                         for row in independent), default=0.0),
+                "child_parent_area_ratio_max": max((duplicate_box_metrics(parent_box, row["bbox_xyxy"])["area_ratio"]
+                                                     for row in independent), default=0.0),
+                "child_center_distance_min": min((pair["center_distance_norm"] for pair in child_pair_metrics), default=None),
+                "child_iou_max": max((pair["iou"] for pair in child_pair_metrics), default=0.0),
+                "parent_area_fraction": parent_fraction,
+                "largest_child_area_ratio": largest_child_ratio,
+                "parent_to_median_area_ratio": parent_area / median_area if median_area else None,
             },
         })
+        stage_log.append({"stage": "candidate_search", "component_id": parent["detection_id"],
+                          "status": "candidate", "reason": reason,
+                          "contained_children": len(independent), "metrics": groups[-1]["metrics"]})
+    if diagnostics is not None:
+        diagnostics.extend({"stage": "candidate_search", "component_id": row["detection_id"],
+                            "status": "rejected", "reason": "not_a_group_parent"}
+                           for row in normalized if row["detection_id"] not in accepted_ids
+                           and not any(entry.get("component_id") == row["detection_id"]
+                                       for entry in stage_log))
     return sorted(groups, key=lambda item: (item["metrics"]["child_count"],
                                              item["metrics"]["containment_min"]), reverse=True)
 

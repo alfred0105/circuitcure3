@@ -18,6 +18,7 @@ from circuitcare.vision.box_reconciliation import (
     exclude_review_row, remove_unreviewed_legacy_secondary_rows, same_component_box_pair,
 )
 from circuitcare.component_taxonomy import COMPONENT_LABELS, normalize_component_class
+from circuitcare.vision.ai_review_service import AIReviewStageError
 
 APP_DIR = Path(__file__).resolve().parents[3] / "apps" / "pcb-component-recognition"
 MODULE_NAME = "circuitcare_pcb_component_app_server"
@@ -300,7 +301,55 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
         review["source_fingerprint"] = _review_fingerprint(rows, ocr_result)
         st_api.session_state[qwen_key] = review
     except Exception as exc:
-        st_api.warning(f"Qwen 검수 제안을 만들지 못했습니다 · {exc} · 탐지와 사용자 검수 기록은 보존됩니다.")
+        stage = getattr(exc, "stage", "qwen_validation")
+        qwen_status = ("failed" if stage == "qwen" else
+                       "response_invalid" if stage == "qwen_validation" else "not_reached")
+        search_status = "failed" if stage == "candidate_search" else "complete"
+        st_api.session_state[qwen_key] = {
+            "class_reviews": [], "duplicate_reviews": [], "group_reviews": [],
+            "missed_component_candidates": [], "notes": [],
+            "model": DEFAULT_REVIEW_MODEL, "verification_status": "AI_REVIEW_FAILED",
+            "source_fingerprint": _review_fingerprint(rows, ocr_result),
+            "review_diagnostics": {"candidate_search": {"status": search_status,
+                                                           "error": str(exc) if stage == "candidate_search" else None},
+                                   "qwen": {"status": qwen_status, "error": str(exc)},
+                                   "ui": {"status": "not_reached", "events": []}},
+        }
+        stage_label = {"candidate_search": "묶음 후보 탐색", "qwen": "Qwen 응답",
+                       "qwen_validation": "Qwen 응답 검증"}.get(stage, "AI 검수")
+        st_api.warning(f"{stage_label} 실패 · {exc} · 탐지와 사용자 검수 기록은 보존됩니다.")
+
+
+def _make_group_child_row(scope: str, parent_id: str, index: int, proposal: dict,
+                          rows: list[dict]) -> tuple[dict | None, str | None]:
+    """Build a still-unconfirmed user-addable row from a validated Qwen group box."""
+    box = proposal.get("bbox_xyxy")
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None, "invalid_box_shape"
+    try:
+        coordinates = [float(value) for value in box]
+    except (TypeError, ValueError):
+        return None, "non_numeric_coordinates"
+    if (coordinates[0] < 0 or coordinates[1] < 0 or coordinates[2] <= coordinates[0]
+            or coordinates[3] <= coordinates[1]):
+        return None, "invalid_box_bounds"
+    if coordinates[2] - coordinates[0] < 4 or coordinates[3] - coordinates[1] < 4:
+        return None, "box_below_minimum_size"
+    label = normalize_component_class(proposal.get("proposed_class"))
+    if label == "not_component":
+        return None, "not_component_cannot_be_added_as_box"
+    if any(same_component_box_pair(coordinates, [row[key] for key in ("x1", "y1", "x2", "y2")])
+           for row in rows if all(isinstance(row.get(key), (int, float))
+                                  for key in ("x1", "y1", "x2", "y2"))):
+        return None, "duplicates_existing_detection"
+    digest = hashlib.sha256(f"{scope}:{parent_id}:{index}:{coordinates}".encode()).hexdigest()[:16]
+    row = _record(label, coordinates, confidence=proposal.get("confidence", 0.0),
+                  location_confidence=proposal.get("confidence", 0.0),
+                  type_confidence=proposal.get("confidence"))
+    row.update({"component_id": f"qwen-group-{digest}", "source": "qwen_suggestion",
+                "상태": "검수 필요", "group_parent_id": parent_id,
+                "ai_evidence": proposal.get("evidence", "")})
+    return row, None
 
 
 def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, project_id: str,
@@ -412,6 +461,19 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
             invalidate_qwen_review(st_api.session_state, scope)
             qwen_review = None
         if isinstance(qwen_review, dict):
+            if qwen_review.get("verification_status") == "AI_REVIEW_FAILED":
+                diagnostics = qwen_review.get("review_diagnostics", {})
+                st_api.error(f"AI 검수 실패 · 탐색 {diagnostics.get('candidate_search', {}).get('status')} · "
+                             f"Qwen {diagnostics.get('qwen', {}).get('status')} · "
+                             f"{diagnostics.get('qwen', {}).get('error') or diagnostics.get('candidate_search', {}).get('error')}")
+            diagnostics = qwen_review.get("review_diagnostics", {})
+            failed_items = [item for section in ("candidate_search", "duplicate_pair_search", "qwen")
+                            for item in diagnostics.get(section, {}).get("items", [])
+                            if item.get("status") == "rejected"]
+            if failed_items:
+                with st_api.expander(f"박스 검수 상세 · 탈락 {len(failed_items)}건", expanded=False):
+                    for item in failed_items:
+                        st_api.caption(f"{item.get('stage')} · {item.get('component_id', item.get('parent_id', ''))} · {item.get('reason')}")
             st_api.caption(f"제안 모델 · {qwen_review.get('model', 'Qwen3.5 9B')} · 상태 {qwen_review.get('verification_status', 'AI_SUGGESTIONS_ONLY')} · 1024px 고해상도 타일 {qwen_review.get('review_tiles', 0)}개 확인 · 모든 제안은 미확인")
             by_id = {str(row.get("component_id")): row for row in rows}
             for index, proposal in enumerate(qwen_review.get("class_reviews", [])):
@@ -487,6 +549,8 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     st_api.caption("기존 개별 박스 재사용 · " + " · ".join(
                         f"{child['component_id']} ({child.get('소자 종류', 'unknown')})" for child in children))
                 st_api.caption(proposal.get("evidence") or "큰 박스와 내부 소자 후보의 관계를 검토했습니다.")
+                for event in parent.get("group_review_diagnostics", []):
+                    st_api.caption(f"UI 반영 · {event.get('status')} · {event.get('reason', event.get('component_id', ''))}")
                 if proposal.get("decision") == "multiple_components" and len(children) >= 2:
                     if st_api.button("묶음 박스만 제외 · 개별 박스 유지", key=f"cc_qwen_group_exclude_{scope}_{index}"):
                         review = {**proposal, "child_ids": [child["component_id"] for child in children]}
@@ -505,6 +569,36 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         st_api.session_state[records_key] = rows
                         invalidate_qwen_review(st_api.session_state, scope)
                         st_api.rerun()
+                for child_index, candidate in enumerate(proposal.get("new_components", [])):
+                    st_api.markdown(f"묶음 내부 신규 후보 · {candidate['proposed_class']} · 점수 {candidate['confidence']:.2f}")
+                    st_api.caption(f"원본 좌표 · {', '.join(f'{value:.1f}' for value in candidate['bbox_xyxy'])} · 미확인")
+                    st_api.caption(candidate.get("evidence") or "Qwen이 확대 영역에서 제안한 누락 후보")
+                    if st_api.button("신규 개별 박스 추가 · 검수 필요", key=f"cc_qwen_group_child_{scope}_{index}_{child_index}"):
+                        try:
+                            candidate_row, reject_reason = _make_group_child_row(
+                                scope, parent_id, child_index, candidate, rows)
+                            if reject_reason:
+                                parent.setdefault("group_review_diagnostics", []).append({
+                                    "stage": "ui_apply", "status": "rejected", "reason": reject_reason,
+                                    "candidate_index": child_index,
+                                })
+                                st_api.session_state[records_key] = rows
+                                st_api.warning(f"묶음 후보 박스를 추가하지 않았습니다 · {reject_reason}")
+                            else:
+                                rows.append(candidate_row)
+                                parent.setdefault("group_review_diagnostics", []).append({
+                                    "stage": "ui_apply", "status": "added", "component_id": candidate_row["component_id"],
+                                })
+                                st_api.session_state[records_key] = rows
+                                invalidate_qwen_review(st_api.session_state, scope)
+                                st_api.rerun()
+                        except Exception as exc:
+                            parent.setdefault("group_review_diagnostics", []).append({
+                                "stage": "ui_apply", "status": "failed", "reason": str(exc),
+                                "candidate_index": child_index,
+                            })
+                            st_api.session_state[records_key] = rows
+                            st_api.error(f"묶음 후보 UI 반영 실패 · {exc}")
             for index, proposal in enumerate(qwen_review.get("missed_component_candidates", [])):
                 box = proposal.get("bbox_xyxy")
                 if not isinstance(box, list) or len(box) != 4:
