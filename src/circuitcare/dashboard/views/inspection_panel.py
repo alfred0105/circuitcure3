@@ -52,18 +52,6 @@ def render_inspection_panel(
     inventory = inventories.setdefault(owner, {})
     with st.container(border=True):
         st.markdown('<span class="cc-inspection-marker"></span>', unsafe_allow_html=True)
-        st.markdown("### 전체 진단")
-        st.info("미리보기 · 진단 미실행" if preview else _diagnosis_status_label(st, project))
-        st.caption(f"사진 · {len(project.image_records)}장")
-        symptom = {
-            "power_failure": "전원 불량", "output_anomaly": "출력 이상",
-            "overheating": "과열", "intermittent_operation": "간헐적 작동",
-            "unknown": "증상 불명",
-        }.get(project.symptom_category or "unknown", "증상 불명")
-        st.caption(f"증상 · {symptom}")
-        if project.symptom_description:
-            st.caption(project.symptom_description)
-        st.divider()
         render_symptom_diagnosis_panel(st, project, components=components, preview=preview,
                                        component_inventory=inventory)
         st.divider()
