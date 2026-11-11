@@ -21,8 +21,8 @@ from circuitcare.frontend.component_overlay_adapter import (
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.frontend.board_component_registry import (
     REGISTRY_KEY, build_board_component_registry, confirm_component_match,
-    diagnosis_components, measurement_component_aliases, remove_component_match,
-    source_key_for_component,
+    diagnosis_components, measurement_component_aliases, measurement_view_model_for_board_component,
+    remove_component_match, source_key_for_component,
 )
 from circuitcare.frontend.measurement_state import get_measurements
 from circuitcare.analysis.models import AnalysisScope, AnalysisStatus
@@ -48,13 +48,14 @@ from circuitcare.dashboard.views.symptom_diagnosis_panel import (
     render_symptom_diagnosis_panel, _simple_candidate_rows,
 )
 from circuitcare.dashboard.views.measurement_panel import render_measurement_panel
+from circuitcare.symptom_diagnosis import load_knowledge
 from circuitcare.dashboard.views.diagnosis_panel import render_diagnosis_panel
 from circuitcare.dashboard.views.report_panel import render_report_panel
 from circuitcare.reporting.report_builder import build_pcb_diagnostic_snapshot
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
-    ensure_component_detection, render_component_recognition_panel,
-    review_keys, review_scope as component_review_scope,
+    ensure_ai_component_review, ensure_component_detection, render_component_recognition_panel,
+    review_aux_keys, review_keys, review_scope as component_review_scope,
 )
 from circuitcare.vision.box_reconciliation import board_visible_review_rows, same_component_box_pair
 from circuitcare.frontend.state import (
@@ -226,6 +227,18 @@ def _prepare_photo_component_snapshot(
     review_scope = component_review_scope(detector_image_bytes, project.project_id, photo_id)
     _result_key, records_key, _error_key = review_keys(review_scope)
     rows = list(st.session_state.get(records_key, []))
+    review_state = "unavailable"
+    if (auto_result is not None and not auto_error
+            and auto_result.get("image_width") and auto_result.get("image_height")):
+        review_state = ensure_ai_component_review(
+            st, image_bytes=detector_image_bytes, scope=review_scope,
+            rows=rows, records_key=records_key,
+        )
+        rows = list(st.session_state.get(records_key, []))
+    _ocr_key, qwen_key = (f"cc_component_ocr_{review_scope}", f"cc_component_qwen_review_{review_scope}")
+    qwen_result = st.session_state.get(qwen_key, {})
+    qwen_types = {str(item.get("detection_id")): item for item in qwen_result.get("class_reviews", [])
+                  if isinstance(item, dict)} if isinstance(qwen_result, dict) else {}
     inventory_version = component_inventory_version(
         project_id=project.project_id, board_id=project.board_id, photo_id=photo_id,
         image_sha256=hashlib.sha256(image_data).hexdigest(), components=[
@@ -311,6 +324,15 @@ def _prepare_photo_component_snapshot(
                     "component_type_status": "USER_CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED",
                     "ocr_marking": row.get("body_marking"),
                     "ocr_candidates": row.get("ocr_candidates", []),
+                    "ocr_class_hints": row.get("ocr_class_hints", []),
+                    "ocr_inferred_value": row.get("ocr_inferred_value"),
+                    "ocr_inference_method": row.get("ocr_inference_method"),
+                    "qwen_component_type_candidate": qwen_types.get(str(row.get("component_id")), {}).get("proposed_class"),
+                    "qwen_component_type_evidence": qwen_types.get(str(row.get("component_id")), {}).get("evidence"),
+                    "qwen_component_type_confidence": qwen_types.get(str(row.get("component_id")), {}).get("confidence"),
+                    "qwen_component_type_decision": qwen_types.get(str(row.get("component_id")), {}).get("decision"),
+                    "qwen_component_type_status": ("AI_PROPOSED_UNVERIFIED"
+                        if str(row.get("component_id")) in qwen_types else "NOT_REVIEWED"),
                     "possible_part_number": None,
                     "confirmed_functional_roles": inventory.get(str(row.get("component_id")), {}).get(
                         "confirmed_functional_roles", []),
@@ -322,6 +344,7 @@ def _prepare_photo_component_snapshot(
                 "components": models, "component_ids": tuple(item.component_id for item in models),
                 "detection_status": ("BLOCKED_MODEL_UNAVAILABLE" if auto_error else
                                      "INFERENCE_COMPLETE" if auto_result is not None else "UNKNOWN"),
+                "ai_review_status": review_state,
                 "error": auto_error, "version": inventory_version,
                 "analysis_scope_key": scope.key}
     by_scope[scope.key] = snapshot
@@ -1049,6 +1072,19 @@ def _render_component_inspector(st: Any, project: ProjectContext, preview: bool,
         compact=compact,
     )
     if compact:
+        active_review_scope = st.session_state.get("cc_active_component_review_scope")
+        if active_review_scope:
+            ocr_key, qwen_key = review_aux_keys(active_review_scope)
+            qwen_review = st.session_state.get(qwen_key)
+            review_status = ("일부 확인 필요" if not isinstance(qwen_review, dict)
+                             or qwen_review.get("verification_status") == "AI_REVIEW_FAILED"
+                             else "완료 · 제안은 미확인")
+            st.caption(f"소자 AI 분석 · {review_status}")
+            if st.button("소자 AI 검토 다시 실행", key=f"cc_ai_review_retry_{active_review_scope}"):
+                st.session_state.pop(qwen_key, None)
+                st.session_state.pop(ocr_key, None)
+                st.session_state.pop(f"cc_ai_review_run_{active_review_scope}", None)
+                st.rerun()
         return
     review_image = st.session_state.get("cc_active_component_review_image")
     review_scope = st.session_state.get("cc_active_component_review_scope")
@@ -1201,12 +1237,71 @@ def _render_fault_analysis_workspace(
             return
         strategy = "candidate_fusion_v1" if isinstance(current_result.get("candidate_fusion"), dict) else "baseline"
         candidates = _simple_candidate_rows(current_result)
-        candidate_id = str(candidates[0].get("board_component_id") or candidates[0].get("component_id")) if candidates else None
-        measurement_component = next((item for item in components
-                                      if candidate_id and (item.board_component_id == candidate_id
-                                                           or item.component_id == candidate_id)), None)
-        if measurement_component is None and selected is not None:
+        candidate_id = None
+        selected_candidate = None
+        fault_id = None
+        recommended_test_id = None
+        if candidates:
+            candidate_ids = [str(row.get("board_component_id") or row.get("component_id")) for row in candidates]
+            candidate_labels = {
+                str(row.get("board_component_id") or row.get("component_id")): (
+                    f"{row.get('candidate_rank', index + 1)}순위 · {row.get('component_type', '소자')} · "
+                    f"{row.get('fault_hypotheses', [{}])[0].get('fault_title') or '원인 가설'} · "
+                    f"{row.get('board_component_id') or row.get('component_id')}")
+                for index, row in enumerate(candidates)
+            }
+            candidate_widget_key = f"cc_measure_candidate_{project.project_id}"
+            if st.session_state.get(candidate_widget_key) not in candidate_ids:
+                st.session_state[candidate_widget_key] = candidate_ids[0]
+            selected_candidate_id = st.selectbox(
+                "검사할 후보", candidate_ids, key=candidate_widget_key,
+                format_func=lambda value: candidate_labels.get(value, value),
+            )
+            candidate_id = selected_candidate_id if selected_candidate_id in candidate_ids else candidate_ids[0]
+            selected_candidate = next(row for row in candidates
+                                      if str(row.get("board_component_id") or row.get("component_id")) == candidate_id)
+            hypotheses = [row for row in selected_candidate.get("fault_hypotheses", []) if row.get("fault_id")]
+            if hypotheses:
+                hypothesis_ids = list(dict.fromkeys(str(row["fault_id"]) for row in hypotheses))
+                fault_id = hypothesis_ids[0]
+                if len(hypothesis_ids) > 1:
+                    hypothesis_widget_key = f"cc_measure_fault_{project.project_id}_{candidate_id}"
+                    if st.session_state.get(hypothesis_widget_key) not in hypothesis_ids:
+                        st.session_state[hypothesis_widget_key] = hypothesis_ids[0]
+                    fault_id = st.selectbox(
+                        "검증할 고장 가설", hypothesis_ids,
+                        format_func=lambda value: next((row.get("fault_title") or value for row in hypotheses
+                                                        if row.get("fault_id") == value), value),
+                        key=hypothesis_widget_key,
+                    )
+                hypothesis = next((row for row in hypotheses if row.get("fault_id") == fault_id), hypotheses[0])
+            else:
+                hypothesis = {}
+            if isinstance(board_registry, dict):
+                registry_component = next((row for row in board_registry.get("components", [])
+                                           if row.get("board_component_id") == candidate_id), {})
+                component_type = str(registry_component.get("component_type") or selected_candidate.get("component_type") or "unknown")
+            else:
+                component_type = str(selected_candidate.get("component_type") or "unknown")
+            tests = load_knowledge().get("component_test_profiles", {}).get("profiles", {}).get(
+                component_type.casefold(), {}).get("tests", {})
+            recommended_test_id = next((test_id for test_id, profile in tests.items()
+                                        if fault_id in profile.get("fault_relations", {})), None)
+            if not recommended_test_id and hypothesis.get("recommended_tests"):
+                st.caption("권장 확인 · " + " · ".join(str(item) for item in hypothesis["recommended_tests"][:2]))
+        measurement_component = None
+        if candidate_id and isinstance(board_registry, dict):
+            measurement_component = measurement_view_model_for_board_component(
+                board_registry, board_component_id=candidate_id,
+                preferred_photo_id=st.session_state.get(ACTIVE_PHOTO_KEY),
+            )
+        if measurement_component is None and isinstance(selected, ComponentOverlayViewModel):
             measurement_component = selected
+        if (measurement_component is None and not isinstance(board_registry, dict)
+                and candidate_id):
+            measurement_component = next((item for item in components
+                if isinstance(item, ComponentOverlayViewModel)
+                and (item.board_component_id == candidate_id or item.component_id == candidate_id)), None)
         if candidates or get_measurements(st.session_state, project_id=project.project_id,
                                           board_id=project.board_id or ""):
             st.markdown("#### 다음 확인 · 측정")
@@ -1215,6 +1310,7 @@ def _render_fault_analysis_workspace(
                 component_map_version=(board_registry.get("version") if isinstance(board_registry, dict)
                                        else st.session_state.get(MAP_VERSION_KEY)),
                 board_registry=board_registry, compact=True,
+                fault_hypothesis=fault_id, recommended_test_id=recommended_test_id,
             )
         if isinstance(board_registry, dict):
             with st.popover("진단 보고서 다운로드"):

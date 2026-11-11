@@ -31,6 +31,15 @@ class OllamaClient:
             raise LocalLLMError("Ollama /api/tags returned no models list")
         return models
 
+    def show_model(self, model_name: str) -> dict:
+        """Return Ollama /api/show metadata, including declared model capabilities."""
+        return self._request("POST", "/api/show", {"model": model_name})
+
+    def model_supports_vision(self, model_name: str) -> bool:
+        metadata = self.show_model(model_name)
+        capabilities = metadata.get("capabilities", [])
+        return isinstance(capabilities, list) and "vision" in capabilities
+
     def model_info(self, model_name: str) -> dict:
         models = self.list_models()
         match = next((item for item in models if item.get("name") == model_name or item.get("model") == model_name), None)

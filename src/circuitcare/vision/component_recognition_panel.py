@@ -315,14 +315,18 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
     """Run RapidOCR and Qwen review on the existing first-pass YOLO proposals."""
     invalidate_qwen_review(st_api.session_state, scope)
     ocr_result = st_api.session_state.get(ocr_key)
+    image_fingerprint = hashlib.sha256(image_bytes).hexdigest()
     try:
         from PIL import Image
         from circuitcare.vision.ocr_backend import run_local_ocr
 
-        with st_api.spinner("PCB 실크스크린 OCR 중…"):
-            with Image.open(io.BytesIO(image_bytes)) as source_image:
-                ocr_result = run_local_ocr(source_image.convert("RGB"))
-        st_api.session_state[ocr_key] = ocr_result
+        if (not isinstance(ocr_result, dict)
+                or ocr_result.get("source_image_fingerprint") != image_fingerprint):
+            with st_api.spinner("PCB 실크스크린 OCR 중…"):
+                with Image.open(io.BytesIO(image_bytes)) as source_image:
+                    ocr_result = run_local_ocr(source_image.convert("RGB"))
+            ocr_result["source_image_fingerprint"] = image_fingerprint
+            st_api.session_state[ocr_key] = ocr_result
         associated = associate_ocr_with_components([
             {**row, "bbox_xyxy": [row["x1"], row["y1"], row["x2"], row["y2"]]}
             for row in rows
@@ -338,7 +342,18 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
         from circuitcare.local_llm import OllamaClient
         from circuitcare.vision.ai_review_service import DEFAULT_REVIEW_MODEL, review_components_with_qwen
 
+        ollama = OllamaClient(timeout_seconds=300, num_predict=4096)
+        vision_check = getattr(ollama, "model_supports_vision", None)
+        if callable(vision_check) and not vision_check(DEFAULT_REVIEW_MODEL):
+            raise RuntimeError(f"{DEFAULT_REVIEW_MODEL} 모델이 Ollama에서 vision 기능을 선언하지 않았습니다.")
         live_rows = [row for row in rows if row.get("상태") != "제외"]
+        # Prioritize uncertain and low-confidence observations and cap large-board
+        # review load; Qwen still receives the full board image plus their crops.
+        live_rows = sorted(live_rows, key=lambda row: (
+            row.get("소자 종류") != "unknown",
+            row.get("상태") == "확인",
+            float(row.get("type_confidence") or row.get("신뢰도") or 0.0),
+        ))[:24]
         detections = [{"component_id": row["component_id"], "class_name": row.get("소자 종류", "unknown"),
                        "confidence": row.get("신뢰도"), "bbox_xyxy": [row["x1"], row["y1"], row["x2"], row["y2"]],
                        "ocr_candidates": row.get("ocr_candidates", []),
@@ -346,7 +361,7 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                        "reference_designators": row.get("reference_designators", []),
                        "body_marking": row.get("body_marking")} for row in live_rows]
         with st_api.spinner("Qwen3.5 9B로 소자 종류·중복·미탐지 후보 검수 중…"):
-            review = review_components_with_qwen(OllamaClient(timeout_seconds=300, num_predict=4096), DEFAULT_REVIEW_MODEL,
+            review = review_components_with_qwen(ollama, DEFAULT_REVIEW_MODEL,
                 image_bytes, detections, (ocr_result or {}).get("records", []))
         review["source_fingerprint"] = _review_fingerprint(rows, ocr_result)
         st_api.session_state[qwen_key] = review
@@ -368,6 +383,30 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
         stage_label = {"candidate_search": "묶음 후보 탐색", "qwen": "Qwen 응답",
                        "qwen_validation": "Qwen 응답 검증"}.get(stage, "AI 검수")
         st_api.warning(f"{stage_label} 실패 · {exc} · 탐지와 사용자 검수 기록은 보존됩니다.")
+
+
+def ensure_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
+                                rows: list[dict], records_key: str) -> str:
+    """Run the existing OCR→Qwen review once for each unchanged photo observation."""
+    ocr_key, qwen_key = review_aux_keys(scope)
+    fingerprint = _review_fingerprint(rows, st_api.session_state.get(ocr_key))
+    cached = st_api.session_state.get(qwen_key)
+    if isinstance(cached, dict) and cached.get("source_fingerprint") == fingerprint:
+        return "failed" if cached.get("verification_status") == "AI_REVIEW_FAILED" else "complete"
+    # A separate in-flight/completed key prevents slow-model retries on every Streamlit
+    # rerun, including failures. Explicit re-review clears this key in the UI.
+    run_key = f"cc_ai_review_run_{scope}"
+    if st_api.session_state.get(run_key) == fingerprint:
+        return "failed" if isinstance(cached, dict) and cached.get("verification_status") == "AI_REVIEW_FAILED" else "complete"
+    st_api.session_state[run_key] = fingerprint
+    _run_ai_review_workflow(st_api, image_bytes=image_bytes, scope=scope, rows=rows,
+                            records_key=records_key, ocr_key=ocr_key, qwen_key=qwen_key)
+    result = st_api.session_state.get(qwen_key)
+    if isinstance(result, dict):
+        st_api.session_state[run_key] = _review_fingerprint(
+            rows, st_api.session_state.get(ocr_key))
+        return "failed" if result.get("verification_status") == "AI_REVIEW_FAILED" else "complete"
+    return "unavailable"
 
 
 def _make_group_child_row(scope: str, parent_id: str, index: int, proposal: dict,

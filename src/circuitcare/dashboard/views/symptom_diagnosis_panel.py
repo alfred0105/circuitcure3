@@ -192,6 +192,16 @@ def _render_simple_diagnosis_result(
 ) -> None:
     if state.get("ollama_error"):
         st.caption("로컬 AI에 연결할 수 없어 규칙 기반 기본 진단으로 진행합니다.")
+    pending = state.pop("followup_pending_comparison", None)
+    if isinstance(pending, dict):
+        current_ids = [str(row.get("board_component_id") or row.get("component_id"))
+                       for row in _simple_candidate_rows(result)]
+        previous_ids = list(pending.get("candidate_ids", []))
+        old_order = {value: index for index, value in enumerate(previous_ids)}
+        movement = sum(old_order.get(value, index) != index for index, value in enumerate(current_ids))
+        improved = set(current_ids) != set(previous_ids) or movement > 0
+        state["followup_no_improvement_streak"] = 0 if improved else int(
+            state.get("followup_no_improvement_streak", 0)) + 1
     if result.get("status") == "NEEDS_SYMPTOMS":
         st.info("증상 정보가 더 필요합니다. 모르는 항목은 ‘모르겠음’을 선택할 수 있습니다.")
         fallback = _safe_initial_followup(
@@ -283,14 +293,35 @@ def _render_simple_diagnosis_result(
     if not isinstance(question, dict) or question.get("test_id") in answered:
         question = next((row for row in next_tests if isinstance(row, dict)
                          and row.get("type") == "question" and str(row.get("test_id")) not in answered), None)
+    answered_followups = set(str(value) for value in state.get("answered_test_ids", [])) - {INITIAL_SYMPTOM_QUESTION_ID}
+    followup_count = len(answered_followups)
+    followup_stopped = bool(state.get("followup_questions_stopped"))
+    no_improvement = int(state.get("followup_no_improvement_streak", 0))
+    if followup_count >= 5 or no_improvement >= 2:
+        question = None
+        state["followup_questions_stopped"] = True
+    if followup_stopped:
+        question = None
     if question:
-        st.markdown("#### 다음 질문")
+        st.markdown("#### 새로운 확인 질문")
+        st.caption(f"질문 진행 · {followup_count} / 5")
+        if question.get("selection_reason"):
+            st.caption(str(question["selection_reason"]))
         st.write(question.get("question", "확인할 내용이 있나요?"))
         answer_key = f"{_project_key(project)}_simple_answer_{question.get('test_id')}"
         answer = st.radio("답변", ("예", "아니오", "모르겠음"), horizontal=True, key=answer_key)
         if st.button("답변 반영", key=f"{answer_key}_submit", disabled=preview):
+            before_ids = [str(row.get("board_component_id") or row.get("component_id"))
+                          for row in candidates]
+            state["followup_pending_comparison"] = {"test_id": str(question.get("test_id")),
+                                                       "candidate_ids": before_ids}
             _save_follow_up_answer(state, question, answer)
             state["run_after_initial_answer"] = True
+            st.session_state[_project_key(project)] = state
+            st.rerun()
+    if not followup_stopped and followup_count < 5 and no_improvement < 2:
+        if st.button("현재 정보로 검사 진행", key=f"{_project_key(project)}_stop_followup", disabled=preview):
+            state["followup_questions_stopped"] = True
             st.session_state[_project_key(project)] = state
             st.rerun()
     history = state.get("question_answers", {})
@@ -513,6 +544,10 @@ def _component_rows(components: tuple[Any, ...],
              "component_type_status": type_status,
              "part_identity_status": inventory.get(item.component_id, {}).get("part_identity_status", "UNCONFIRMED"),
              "confirmed_functional_roles": roles,
+             "candidate_component_types": list(getattr(item, "candidate_component_types", ()) or ()),
+             "ai_review_evidence": list(getattr(item, "ai_review_evidence", ()) or ()),
+             "ocr_marking_candidates": list(getattr(item, "ocr_marking_candidates", ()) or ()),
+             "type_evidence_status": "CONFIRMED" if type_status == "USER_CONFIRMED" else "TENTATIVE",
              "role_status": "CONFIRMED" if roles else "UNKNOWN",
              "role_evidence": ("사용자가 선택한 기능 역할",) if roles else ()})
     return result

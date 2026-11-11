@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import base64
 import io
 import json
@@ -590,3 +592,30 @@ def test_unreviewed_legacy_yolo2_rows_removed_but_user_reviewed_rows_remain():
     ]
     retained = remove_unreviewed_legacy_secondary_rows(rows)
     assert {row["component_id"] for row in retained} == {"old-confirmed", "old-edited", "manual"}
+
+
+def test_automatic_ai_review_is_cached_by_photo_observations(monkeypatch):
+    import circuitcare.vision.component_recognition_panel as panel
+    calls = []
+    def fake_run(st_api, *, image_bytes, scope, rows, records_key, ocr_key, qwen_key):
+        calls.append((scope, rows[0]["x1"]))
+        ocr = {"records": []}
+        st_api.session_state[ocr_key] = ocr
+        st_api.session_state[qwen_key] = {
+            "verification_status": "AI_SUGGESTIONS_ONLY",
+            "source_fingerprint": panel._review_fingerprint(rows, ocr),
+            "class_reviews": [],
+        }
+    monkeypatch.setattr(panel, "_run_ai_review_workflow", fake_run)
+    st_api = SimpleNamespace(session_state={})
+    rows = [{"component_id": "r1", "소자 종류": "unknown", "상태": "검수 필요",
+             "x1": 2, "y1": 2, "x2": 20, "y2": 18}]
+    assert panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="s", rows=rows,
+                                            records_key="rows") == "complete"
+    assert panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="s", rows=rows,
+                                            records_key="rows") == "complete"
+    assert len(calls) == 1
+    changed = [{**rows[0], "x1": 3}]
+    assert panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="s", rows=changed,
+                                            records_key="rows") == "complete"
+    assert len(calls) == 2

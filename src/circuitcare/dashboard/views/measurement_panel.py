@@ -49,6 +49,8 @@ def render_measurement_panel(
     preview: bool = False, component_map_version: str | None = None,
     board_registry: dict[str, Any] | None = None,
     compact: bool = False,
+    fault_hypothesis: str | None = None,
+    recommended_test_id: str | None = None,
 ) -> None:
     if selected_component is None:
         st.info("PCB Viewer에서 소자를 선택하면 해당 소자의 측정값을 기록할 수 있습니다.")
@@ -57,7 +59,7 @@ def render_measurement_panel(
         st.warning("보드 ID가 없어 측정 기록을 연결할 수 없습니다.")
         return
     board_component_id = selected_component.board_component_id
-    owner = f"{project.project_id}-{project.board_id}-{board_component_id or selected_component.component_id}"
+    owner = f"{project.project_id}-{project.board_id}-{board_component_id or selected_component.component_id}-{fault_hypothesis or 'no-fault'}"
     all_records = get_measurements(st.session_state, project_id=project.project_id,
                                    board_id=project.board_id)
     current_records: list[MeasurementRecord] = []
@@ -133,6 +135,15 @@ def render_measurement_panel(
     type_profile = knowledge.get("component_test_profiles", {}).get("profiles", {}).get(normalized_type, {})
     test_profiles = type_profile.get("tests", {})
     test_options = [""] + list(test_profiles)
+    if recommended_test_id in test_profiles:
+        default_test_id = recommended_test_id
+    else:
+        default_test_id = next((test_id for test_id, profile in test_profiles.items()
+                                if fault_hypothesis in profile.get("fault_relations", {})), "")
+    if default_test_id:
+        default_measurement = test_profiles[default_test_id].get("measurement_type")
+        if default_measurement in TYPE_OPTIONS:
+            st.session_state.setdefault(f"cc_v5_type_{owner}", default_measurement)
     unit_key = f"cc_v5_unit_{owner}"
     if st.session_state.get(unit_key) not in units:
         st.session_state[unit_key] = units[0]
@@ -156,15 +167,20 @@ def render_measurement_panel(
                 key=f"cc_v5_sigma_{owner}", placeholder="계측기 정확도 사양에 따른 양수",
             )
             uncertainty_source = st.text_input("불확실도 출처", placeholder="예: 멀티미터 모델·정확도 사양")
+            test_index = test_options.index(default_test_id) if default_test_id in test_options else 0
             test_id = st.selectbox(
-                "부품별 검사 항목", test_options,
+                "부품별 검사 항목", test_options, index=test_index,
+                key=f"cc_v5_test_{owner}",
                 format_func=lambda value: "프로파일 검사 선택 안 함" if not value else value,
                 help="등록된 검사 항목만 가설 검증에 사용할 수 있습니다.",
             )
             relations = test_profiles.get(test_id, {}).get("fault_relations", {})
             fault_options = [""] + [fault_id for fault_id in fault_modes if fault_id in relations]
+            default_fault = fault_hypothesis if fault_hypothesis in fault_options else ""
+            fault_index = fault_options.index(default_fault) if default_fault in fault_options else 0
             fault_hypothesis = st.selectbox(
-                "검사할 고장 가설", fault_options,
+                "검사할 고장 가설", fault_options, index=fault_index,
+                key=f"cc_v5_fault_{owner}",
                 format_func=lambda code: "선택 안 함" if not code else fault_modes[code]["title"],
             )
             range_col_a, range_col_b = st.columns(2)

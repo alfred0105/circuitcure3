@@ -164,6 +164,82 @@ def render_inspection_panel(
                 st.markdown(f"**{selected_component.reference_designators[0] if selected_component.reference_designators else component_id}** · {selected_component.component_type}")
                 if selected_component.ocr_marking:
                     st.caption(f"각인 후보 · {selected_component.ocr_marking}")
+                if review_scope and review_image_bytes is not None:
+                    from circuitcare.vision.ocr_backend import infer_passive_value
+                    marking_cache = st.session_state.setdefault("cc_component_marking_ocr", {})
+                    marking_key = f"{review_scope}:{component_id}:{selected_component.bbox_xyxy}"
+                    marking_result = marking_cache.get(marking_key)
+                    if st.button("선택 소자 각인 판독", key=f"cc_marking_ocr_run_{marking_key}"):
+                        try:
+                            from PIL import Image
+                            from circuitcare.vision.ocr_backend import run_component_marking_ocr
+                            with Image.open(io.BytesIO(review_image_bytes)) as source_image:
+                                marking_result = run_component_marking_ocr(
+                                    source_image.convert("RGB"), selected_component.bbox_xyxy,
+                                    selected_component.component_type,
+                                )
+                            marking_cache[marking_key] = marking_result
+                            st.session_state["cc_component_marking_ocr"] = marking_cache
+                            rows = list(st.session_state.get(records_key, [])) if records_key else []
+                            source_row = next((row for row in rows if row.get("component_id") == component_id), None)
+                            if source_row is not None:
+                                source_row["body_marking"] = marking_result.get("marking")
+                                source_row["body_marking_candidates"] = marking_result.get("candidates", [])
+                                source_row["ocr_inferred_value"] = marking_result.get("inferred_value")
+                                source_row["ocr_inference_method"] = marking_result.get("inference_method")
+                                source_row["body_marking_verification_status"] = "unverified"
+                                st.session_state[records_key] = rows
+                                invalidate_component_review_state(st.session_state, scope=review_scope,
+                                    project_id=project.project_id, board_id=project.board_id)
+                        except Exception as exc:
+                            st.warning(f"각인 판독을 완료하지 못했습니다 · {exc}")
+                    if isinstance(marking_result, dict):
+                        candidates = marking_result.get("candidates", [])
+                        marking = marking_result.get("marking")
+                        if marking:
+                            st.caption(f"본체 각인 후보 · {marking} · 미확인")
+                        inferred = infer_passive_value(selected_component.component_type, marking or "")
+                        if inferred and selected_component.component_type.casefold() == "resistor":
+                            st.caption(f"OCR 공칭값 후보 · {inferred['value']} · {inferred['method']} · 미확인 (실측값 아님)")
+                        if selected_component.component_type.casefold() in {"ic", "integrated_circuit"}:
+                            refs = list(selected_component.reference_designators or ())
+                            if refs:
+                                st.caption("실크스크린 ID 후보 · " + ", ".join(refs[:3]))
+                            if marking:
+                                st.caption("부품번호 후보 · 데이터시트 확인 전까지 미검증")
+                        if not marking and not candidates:
+                            st.caption("읽을 수 있는 각인이 없습니다.")
+                if isinstance(board_registry, dict):
+                    registry_component = next((row for row in board_registry.get("components", [])
+                                               if str(row.get("board_component_id")) == str(selected_component.board_component_id or component_id)), None)
+                    if registry_component:
+                        qwen_candidates = [source for source in registry_component.get("source_components", [])
+                                           if source.get("qwen_component_type_candidate")]
+                        selected_source = next((source for source in qwen_candidates
+                                                if source.get("component_id") == component_id), None)
+                        for source in qwen_candidates[:2]:
+                            candidate_type = source.get("qwen_component_type_candidate")
+                            st.caption(f"Qwen 종류 제안 · {candidate_type} · 미확인")
+                            if source.get("qwen_component_type_evidence"):
+                                st.caption(str(source["qwen_component_type_evidence"]))
+                        if (selected_source and selected_source.get("qwen_component_type_candidate") == "not_component"
+                                and selected_source.get("qwen_component_type_decision") == "suggest"
+                                and review_scope and records_key):
+                            if st.button("Qwen 오탐 제안 · 선택 박스 제외", key=f"cc_compact_qwen_exclude_{review_scope}_{component_id}"):
+                                rows = list(st.session_state.get(records_key, []))
+                                target = next((row for row in rows if row.get("component_id") == component_id), None)
+                                if target is not None:
+                                    record_box_exclusion(st.session_state, scope=review_scope, row=target,
+                                        reason="qwen_not_component", review={
+                                            "decision": selected_source.get("qwen_component_type_decision"),
+                                            "proposed_class": "not_component",
+                                            "confidence": selected_source.get("qwen_component_type_confidence"),
+                                            "evidence": selected_source.get("qwen_component_type_evidence"),
+                                        })
+                                    st.session_state[records_key] = rows
+                                    invalidate_component_review_state(st.session_state, scope=review_scope,
+                                        project_id=project.project_id, board_id=project.board_id)
+                                    st.rerun()
                 edits = st.session_state.setdefault(COMPONENT_EDIT_KEY, {})
                 current_type = str(edits.get(component_id, {}).get("component_type") or selected_component.component_type)
                 if review_scope and review_image_bytes is not None:

@@ -7,6 +7,7 @@ from circuitcare.frontend.board_component_registry import (
     REGISTRY_KEY, build_board_component_registry, confirm_component_match,
     current_source_observation_fingerprint, diagnosis_components, measurement_component_aliases, remove_component_match,
     resolve_measurement_board_component, source_component_key,
+    measurement_view_model_for_board_component,
 )
 
 
@@ -213,3 +214,40 @@ def test_excluded_photo_box_is_retained_in_registry_but_not_sent_to_diagnosis():
                                               photo_snapshots=snapshots)
     assert registry["components"][0]["source_components"][0]["review_status"] == "EXCLUDED"
     assert diagnosis_components(registry) == ()
+
+
+def test_measurement_adapter_resolves_real_source_geometry_and_rejects_missing_or_excluded():
+    registry = build_board_component_registry({}, project_id="p1", board_id="b1",
+                                             photo_snapshots=_snapshots())
+    front_source = source_component_key("front", "local-1")
+    board_id = registry["source_to_board_id"][front_source]
+    model = measurement_view_model_for_board_component(
+        registry, board_component_id=board_id, preferred_photo_id="front")
+    assert model is not None
+    assert model.canonical_frame_id == "front"
+    assert model.component_id == "local-1"
+    assert model.bbox_xyxy == (1.0, 2.0, 8.0, 9.0)
+    assert model.board_component_id == board_id
+
+    excluded_registry = build_board_component_registry({}, project_id="p1", board_id="b1",
+        photo_snapshots={"front": {"components": (_component("x", status="EXCLUDED"),),
+                                    "image_fingerprint": "x", "review_version": "x"}})
+    excluded_id = excluded_registry["components"][0]["board_component_id"]
+    assert measurement_view_model_for_board_component(
+        excluded_registry, board_component_id=excluded_id) is None
+
+
+def test_qwen_type_suggestion_stays_unverified_in_diagnosis_dto():
+    state = {}
+    snapshots = _snapshots()
+    snapshots["front"]["components"] = (_component("R1", status="UNCONFIRMED"),)
+    source = snapshots["front"]["components"][0]
+    source.qwen_component_type_candidate = "capacitor"
+    source.qwen_component_type_evidence = "visual suggestion"
+    source.qwen_component_type_status = "AI_PROPOSED_UNVERIFIED"
+    registry = build_board_component_registry(
+        state, project_id="p-qwen", board_id="b-qwen", photo_snapshots={"front": snapshots["front"]})
+    diagnosis_row = diagnosis_components(registry)[0]
+    assert diagnosis_row.component_type == "unknown"
+    assert diagnosis_row.candidate_component_types == ("capacitor",)
+    assert diagnosis_row.ai_review_evidence == ("visual suggestion",)

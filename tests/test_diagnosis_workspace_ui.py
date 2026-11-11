@@ -208,7 +208,9 @@ def test_integrated_workspace_uses_candidate_rows_and_guides_measurement(monkeyp
         photo_snapshot={"components": (component,)}, board_components=(component,),
     )
 
-    assert measured == [component]
+    # A board-level diagnosis DTO has no photo-local geometry and must not be
+    # passed directly into a form that expects a viewer/measurement model.
+    assert measured == [None]
 
 
 def test_real_streamlit_app_test_renders_workbench_without_runtime_errors():

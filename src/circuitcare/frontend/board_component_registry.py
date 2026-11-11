@@ -12,6 +12,8 @@ import hashlib
 import json
 from typing import Any
 
+from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
+
 
 REGISTRY_KEY = "circuitcare_v7_board_component_registry"
 
@@ -35,6 +37,9 @@ class BoardDiagnosisComponent:
     identity_status: str
     overlay_source: str = "board_registry"
     detection_confidence: float | None = None
+    candidate_component_types: tuple[str, ...] = ()
+    ai_review_evidence: tuple[str, ...] = ()
+    ocr_marking_candidates: tuple[str, ...] = ()
 
 
 def diagnosis_components(registry: dict[str, Any]) -> tuple[BoardDiagnosisComponent, ...]:
@@ -66,9 +71,61 @@ def diagnosis_components(registry: dict[str, Any]) -> tuple[BoardDiagnosisCompon
             source_photo_ids=tuple(row.get("source_photo_ids", ())),
             identity_status=str(row.get("identity_status", "PHOTO_LOCAL")),
             detection_confidence=None,
+            candidate_component_types=tuple(dict.fromkeys(
+                str(source.get("qwen_component_type_candidate")) for source in source_rows
+                if source.get("qwen_component_type_candidate") not in {None, "not_component"}
+                and source.get("qwen_component_type_status") == "AI_PROPOSED_UNVERIFIED"
+            )),
+            ai_review_evidence=tuple(str(source.get("qwen_component_type_evidence")) for source in source_rows
+                                     if source.get("qwen_component_type_evidence")),
+            ocr_marking_candidates=tuple(dict.fromkeys(str(source.get("ocr_marking")) for source in source_rows
+                                                        if source.get("ocr_marking"))),
         ))
     return tuple(result)
 
+
+
+def measurement_view_model_for_board_component(
+    registry: dict[str, Any], *, board_component_id: str, preferred_photo_id: str | None = None,
+) -> ComponentOverlayViewModel | None:
+    """Resolve a board identity to a real, non-excluded photo observation for measurement UI."""
+    component = next((row for row in registry.get("components", [])
+                      if str(row.get("board_component_id")) == str(board_component_id)), None)
+    if not component:
+        return None
+    sources = [row for row in component.get("source_components", [])
+               if row.get("review_status") != "EXCLUDED"
+               and row.get("coordinate_frame") == "SOURCE_PHOTO_PIXEL"
+               and isinstance(row.get("bbox_xyxy"), (list, tuple)) and len(row["bbox_xyxy"]) == 4]
+    if preferred_photo_id:
+        sources.sort(key=lambda row: row.get("photo_id") != preferred_photo_id)
+    source = next((row for row in sources if all(isinstance(value, (int, float)) for value in row["bbox_xyxy"])), None)
+    if source is None:
+        return None
+    box = tuple(float(value) for value in source["bbox_xyxy"])
+    local_id = str(source.get("component_id") or "")
+    photo_id = str(source.get("photo_id") or "")
+    if not local_id or not photo_id:
+        return None
+    confirmed = source.get("review_status") in {"USER_CONFIRMED", "user_confirmed"}
+    return ComponentOverlayViewModel(
+        project_id=str(component.get("project_id") or ""), board_id=str(component.get("board_id") or ""),
+        board_side=str(source.get("board_side") or "unknown"), component_id=local_id,
+        board_component_id=str(board_component_id), component_type=str(source.get("component_type") or "unknown"),
+        display_label=local_id, canonical_frame_id=photo_id, coordinate_frame="SOURCE_PHOTO_PIXEL",
+        bbox_xyxy=box, polygon_xy=(), source_backend_photo_ids=(photo_id,), observation_ids=(),
+        detection_confidence=source.get("detection_confidence"),
+        identification_status="USER_CONFIRMED" if confirmed else "SUGGESTED_CLASS_ONLY",
+        identity_match_status=str(component.get("identity_status") or "PHOTO_LOCAL"),
+        ocr_marking=source.get("ocr_marking"), possible_part_number=source.get("possible_part_number"),
+        evidence=tuple(source.get("evidence") or ()), overlay_status="CANDIDATE",
+        ocr_status="UNVERIFIED" if source.get("ocr_marking") else None,
+        ocr_candidates=tuple(source.get("ocr_candidates") or ()),
+        presence_status=str(source.get("presence_status") or "UNCONFIRMED"),
+        location_confidence=source.get("location_confidence"), type_confidence=source.get("type_confidence"),
+        component_type_status=str(source.get("type_status") or "UNCONFIRMED"),
+        overlay_source="board_registry_measurement_adapter",
+    )
 
 def measurement_component_aliases(registry: dict[str, Any]) -> dict[str, str | None]:
     """Map legacy local measurement IDs only when their identity is unambiguous."""
@@ -91,6 +148,9 @@ def source_observation_fingerprint(source: dict[str, Any]) -> str:
         "detection_confidence", "location_confidence", "type_confidence", "source",
         "component_type", "review_status", "presence_status", "type_status",
         "ocr_marking", "ocr_candidates", "possible_part_number", "functional_roles", "evidence",
+        "qwen_component_type_candidate", "qwen_component_type_evidence", "qwen_component_type_status",
+        "qwen_component_type_confidence", "qwen_component_type_decision",
+        "ocr_inferred_value", "ocr_inference_method",
     )
     payload = {key: source.get(key) for key in identity_fields}
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
@@ -246,6 +306,13 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
                 "functional_roles": list(get("confirmed_functional_roles", ()) or ()),
                 "evidence": list(get("evidence", ()) or ()),
                 "source": get("overlay_source"),
+                "qwen_component_type_candidate": get("qwen_component_type_candidate"),
+                "qwen_component_type_evidence": get("qwen_component_type_evidence"),
+                "qwen_component_type_confidence": get("qwen_component_type_confidence"),
+                "qwen_component_type_decision": get("qwen_component_type_decision"),
+                "qwen_component_type_status": get("qwen_component_type_status"),
+                "ocr_inferred_value": get("ocr_inferred_value"),
+                "ocr_inference_method": get("ocr_inference_method"),
             }
             sources[key]["source_observation_fingerprint"] = source_observation_fingerprint(sources[key])
     return sources
@@ -374,6 +441,10 @@ def build_board_component_registry(
             "presence_status": group_presence,
             "identity_status": "USER_CONFIRMED" if len(keys) > 1 else "PHOTO_LOCAL",
             "ocr_markings": list(dict.fromkeys(row["ocr_marking"] for row in group_sources if row["ocr_marking"])),
+            "candidate_component_types": list(dict.fromkeys(
+                row["qwen_component_type_candidate"] for row in group_sources
+                if row.get("qwen_component_type_candidate") not in {None, "not_component"}
+                and row.get("qwen_component_type_status") == "AI_PROPOSED_UNVERIFIED")),
             "functional_roles": functional_roles,
             "evidence": list(dict.fromkeys(e for row in group_sources for e in row["evidence"])),
             "source_keys": keys,

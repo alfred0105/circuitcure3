@@ -247,6 +247,8 @@ def build_pcb_context(
             "component_type_status": row.get("component_type_status", "UNCONFIRMED"),
             "candidate_component_types": candidate_types,
             "ocr_marking": ocr_marking,
+            "ocr_marking_candidates": list(dict.fromkeys(
+                str(source.get("ocr_marking")) for source in raw_sources if source.get("ocr_marking"))),
             "ocr_evidence_status": "CONFIRMED" if review_state == "USER_CONFIRMED" and ocr_marking else "TENTATIVE",
             "possible_part_number": row.get("possible_part_number"),
             "ocr_candidates": list(dict.fromkeys(str(item) for source in raw_sources
