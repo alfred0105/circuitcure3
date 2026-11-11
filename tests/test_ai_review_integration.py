@@ -22,10 +22,13 @@ from circuitcare.vision.box_reconciliation import (
 from circuitcare.vision.component_recognition_panel import (
     CLASS_OPTIONS, _legacy_secondary_scope, _migrate_legacy_review_state, _review_fingerprint,
     _run_ai_review_workflow, duplicate_exclusion_enabled, invalidate_qwen_review, review_aux_keys,
-    review_keys, review_scope,
+    review_keys, review_scope, _review_detection_batches, _marking_ocr_targets,
     _make_group_child_row,
 )
-from circuitcare.component_taxonomy import COMPONENT_CLASSES, COMPONENT_LABELS, normalize_component_class
+from circuitcare.component_taxonomy import (
+    COMPONENT_CLASSES, COMPONENT_LABELS, QWEN_REVIEW_CLASSES, QWEN_SUBTYPE_DEFINITIONS, QWEN_SUBTYPES,
+    normalize_component_class, normalize_qwen_class, normalize_qwen_subtype,
+)
 
 
 def _png() -> bytes:
@@ -169,11 +172,11 @@ def test_removing_second_pass_migrates_existing_reviewed_and_added_boxes():
     assert old_records not in state
 
 
-def test_qwen_uncertain_class_is_preserved_as_unknown_and_ocr_conflict_downgrades(monkeypatch):
+def test_qwen_uncertain_class_stays_unknown_and_weak_ocr_hint_is_preserved_as_conflict(monkeypatch):
     class TaxonomyClient:
         def chat_json(self, _model, _messages, *, output_schema, images):
             allowed = output_schema["properties"]["class_reviews"]["items"]["properties"]["proposed_class"]["enum"]
-            assert set(allowed) == set(COMPONENT_LABELS)
+            assert set(allowed) == set(QWEN_REVIEW_CLASSES)
             return {"model": "qwen3.5:9b", "content": {
                 "class_reviews": [
                     {"detection_id": "r1", "decision": "suggest", "proposed_class": "capacitor",
@@ -189,7 +192,90 @@ def test_qwen_uncertain_class_is_preserved_as_unknown_and_ocr_conflict_downgrade
         {"component_id": "r2", "class_name": "unknown", "bbox_xyxy": [30, 2, 50, 18]},
     ], [])
     assert [(row["proposed_class"], row["decision"]) for row in result["class_reviews"]] == [
-        ("unknown", "uncertain"), ("unknown", "uncertain")]
+        ("capacitor", "suggest"), ("unknown", "uncertain")]
+    assert result["class_reviews"][0]["review_status"] == "AI_CONFLICTED"
+    assert result["class_reviews"][0]["needs_user_review"] is True
+    assert result["class_reviews"][0]["detector_class"] == "resistor"
+
+
+def test_qwen_extension_taxonomy_does_not_change_yolo_18_classes_and_validates_subtypes():
+    assert len(COMPONENT_CLASSES) == 18
+    assert normalize_qwen_class("FPC-FFC") == "unknown"
+    assert normalize_qwen_class("other_component") == "other_component"
+    assert normalize_qwen_subtype("other_component", "ic_socket") == "ic_socket"
+    assert normalize_qwen_subtype("ic", "fpc_ffc") is None
+    assert all(subtype in QWEN_SUBTYPE_DEFINITIONS
+               for subtypes in QWEN_SUBTYPES.values() for subtype in subtypes)
+
+    class ExtensionClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [{"detection_id": "j1", "decision": "suggest",
+                    "proposed_class": "other_component", "proposed_base_class": "other_component",
+                    "proposed_subtype": "ic_socket", "is_physical_component": True,
+                    "is_board_feature": False, "confidence": .78,
+                    "visual_evidence": "Empty socket body and repeated contacts.",
+                    "alternative_classes": ["ic"], "marking_candidates": [],
+                    "part_number_candidates": [], "functional_role_candidates": [],
+                    "conflicting_evidence": [], "needs_user_review": True}],
+                "duplicate_reviews": [], "group_reviews": [],
+                "missed_component_candidates": [], "notes": [],
+            }}
+
+    result = review_components_with_qwen(ExtensionClient(), "qwen3.5:9b", _png(), [
+        {"component_id": "j1", "class_name": "ic", "bbox_xyxy": [2, 2, 30, 30]},
+    ], [])
+    proposal = result["class_reviews"][0]
+    assert proposal["detector_class"] == "ic"
+    assert proposal["proposed_base_class"] == "other_component"
+    assert proposal["proposed_subtype"] == "ic_socket"
+    assert proposal["is_physical_component"] is True
+    assert proposal["review_status"] == "AI_SUGGESTED"
+
+
+@pytest.mark.parametrize(("detector_class", "qwen_class"), [("ic", "connector"), ("connector", "ic")])
+def test_qwen_class_review_can_reclassify_ic_connector_both_directions(detector_class, qwen_class):
+    class IndependentVisionClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            return {"model": "qwen3.5:9b", "content": {"class_reviews": [{
+                "detection_id": "d1", "detector_class": detector_class,
+                "decision": "suggest", "proposed_class": qwen_class,
+                "proposed_base_class": qwen_class, "proposed_subtype": None,
+                "is_physical_component": True, "is_board_feature": False,
+                "confidence": .72, "visual_evidence": "Visible housing and contact arrangement.",
+                "ocr_evidence": "No type solely inferred from designator.",
+                "conflicting_evidence": [], "needs_user_review": True,
+                "alternative_classes": [], "marking_candidates": [],
+                "part_number_candidates": [], "functional_role_candidates": [],
+            }], "duplicate_reviews": [], "group_reviews": [],
+                "missed_component_candidates": [], "notes": []}}
+
+    result = review_components_with_qwen(IndependentVisionClient(), "qwen3.5:9b", _png(), [
+        {"component_id": "d1", "class_name": detector_class, "bbox_xyxy": [2, 2, 30, 30]},
+    ], [])
+    assert result["class_reviews"][0]["detector_class"] == detector_class
+    assert result["class_reviews"][0]["proposed_base_class"] == qwen_class
+
+
+def test_large_board_review_batches_cover_every_detection_once():
+    detections = [{"detection_id": f"d{i}"} for i in range(53)]
+    batches = _review_detection_batches(detections, batch_size=24)
+    assert [len(batch) for batch in batches] == [24, 24, 5]
+    assert [row["detection_id"] for batch in batches for row in batch] == [
+        row["detection_id"] for row in detections]
+
+
+def test_marking_ocr_targets_prioritize_ic_and_passives_and_skip_excluded_rows():
+    rows = [{"component_id": f"r{i}", "소자 종류": "resistor", "상태": "검수 필요",
+             "신뢰도": .8} for i in range(20)]
+    rows += [{"component_id": "ic1", "소자 종류": "ic", "상태": "검수 필요", "신뢰도": .2},
+             {"component_id": "excluded", "소자 종류": "ic", "상태": "제외", "신뢰도": .1},
+             {"component_id": "mlcc", "소자 종류": "capacitor", "상태": "검수 필요", "신뢰도": .1}]
+    targets = _marking_ocr_targets(rows, limit=12)
+    assert len(targets) == 12
+    assert targets[0]["component_id"] == "ic1"
+    assert "excluded" not in {row["component_id"] for row in targets}
+    assert "mlcc" not in {row["component_id"] for row in targets}
 
 
 def test_containment_is_a_review_signal_but_small_true_component_is_not_suppressed():
@@ -300,6 +386,8 @@ def test_qwen_duplicate_exclusion_is_only_enabled_for_confident_same_component()
     assert not duplicate_exclusion_enabled({"decision": "same_component", "confidence": .99}, *far_pair)
     assert not duplicate_exclusion_enabled({"decision": "different_components", "confidence": .99}, *pair)
     assert not duplicate_exclusion_enabled({"decision": "same_component", "confidence": .5}, *pair)
+    assert not duplicate_exclusion_enabled({"decision": "same_component", "confidence": .99}, *pair,
+                                           protected=True)
 
 
 def test_qwen_duplicate_claim_for_far_apart_objects_is_rejected():
@@ -559,6 +647,15 @@ def test_duplicate_review_includes_moderate_overlap_pair_and_reports_candidates(
     assert diagnostics[0]["stage"] == "duplicate_pair_search"
 
 
+def test_large_duplicate_queue_reviews_more_than_eight_pairs_per_bounded_batch():
+    detections = [{"detection_id": f"d{i}", "bbox_xyxy": [10, 10, 110, 110]}
+                  for i in range(10)]
+    diagnostics = []
+    pairs = _duplicate_pair_candidates(detections, diagnostics=diagnostics)
+    assert len(pairs) == 12
+    assert sum(item.get("reason") == "duplicate_crop_limit" for item in diagnostics) > 0
+
+
 def test_qwen_transport_failure_is_reported_as_qwen_stage_error():
     class BrokenClient:
         def chat_json(self, *_args, **_kwargs):
@@ -580,7 +677,9 @@ def test_review_workflow_stores_distinct_candidate_search_failure_diagnostic(mon
 
     monkeypatch.setattr("circuitcare.vision.ocr_backend.run_local_ocr", lambda _image: {"records": []})
     monkeypatch.setattr("circuitcare.vision.ai_review_service.review_components_with_qwen", fail_candidate_search)
-    monkeypatch.setattr("circuitcare.local_llm.OllamaClient", lambda **_kwargs: object())
+    monkeypatch.setattr(panel, "_ollama_review_client", lambda: object())
+    monkeypatch.setattr("circuitcare.vision.ocr_backend.run_component_marking_ocr",
+                        lambda *_args, **_kwargs: {"status": "OCR_NO_TEXT", "candidates": []})
     warnings = []
     state = {}
     st_api = SimpleNamespace(session_state=state, spinner=lambda *_args, **_kwargs: nullcontext(),

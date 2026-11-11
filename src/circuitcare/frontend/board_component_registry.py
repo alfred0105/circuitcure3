@@ -40,6 +40,10 @@ class BoardDiagnosisComponent:
     candidate_component_types: tuple[str, ...] = ()
     ai_review_evidence: tuple[str, ...] = ()
     ocr_marking_candidates: tuple[str, ...] = ()
+    candidate_component_subtypes: tuple[str, ...] = ()
+    candidate_functional_roles: tuple[str, ...] = ()
+    ai_review_statuses: tuple[str, ...] = ()
+    candidate_board_features: tuple[str, ...] = ()
 
 
 def diagnosis_components(registry: dict[str, Any]) -> tuple[BoardDiagnosisComponent, ...]:
@@ -74,12 +78,31 @@ def diagnosis_components(registry: dict[str, Any]) -> tuple[BoardDiagnosisCompon
             candidate_component_types=tuple(dict.fromkeys(
                 str(source.get("qwen_component_type_candidate")) for source in source_rows
                 if source.get("qwen_component_type_candidate") not in {None, "not_component"}
-                and source.get("qwen_component_type_status") == "AI_PROPOSED_UNVERIFIED"
+                and source.get("qwen_component_type_candidate") != "board_feature"
+                and source.get("qwen_component_type_status") in {"AI_PROPOSED_UNVERIFIED", "USER_CONFIRMED_EXTENSION"}
             )),
             ai_review_evidence=tuple(str(source.get("qwen_component_type_evidence")) for source in source_rows
                                      if source.get("qwen_component_type_evidence")),
             ocr_marking_candidates=tuple(dict.fromkeys(str(source.get("ocr_marking")) for source in source_rows
                                                         if source.get("ocr_marking"))),
+            candidate_component_subtypes=tuple(dict.fromkeys(
+                str(source.get("qwen_component_subtype_candidate")) for source in source_rows
+                if source.get("qwen_component_subtype_candidate")
+                and source.get("qwen_component_type_status") in {"AI_PROPOSED_UNVERIFIED", "USER_CONFIRMED_EXTENSION"}
+            )),
+            candidate_functional_roles=tuple(dict.fromkeys(
+                str(role) for source in source_rows
+                if source.get("qwen_component_type_status") in {"AI_PROPOSED_UNVERIFIED", "USER_CONFIRMED_EXTENSION"}
+                for role in source.get("qwen_functional_role_candidates", ())
+            )),
+            ai_review_statuses=tuple(dict.fromkeys(str(source.get("qwen_review_status"))
+                                                  for source in source_rows
+                                                  if source.get("qwen_review_status"))),
+            candidate_board_features=tuple(dict.fromkeys(
+                str(source.get("component_id")) for source in source_rows
+                if source.get("qwen_component_type_candidate") == "board_feature"
+                and source.get("qwen_component_type_status") in {"AI_PROPOSED_UNVERIFIED", "USER_CONFIRMED_EXTENSION"}
+            )),
         ))
     return tuple(result)
 
@@ -147,9 +170,13 @@ def source_observation_fingerprint(source: dict[str, Any]) -> str:
         "detection_version", "review_evidence_version",
         "detection_confidence", "location_confidence", "type_confidence", "source",
         "component_type", "review_status", "presence_status", "type_status",
-        "ocr_marking", "ocr_candidates", "possible_part_number", "functional_roles", "evidence",
+        "ocr_marking", "ocr_candidates", "marking_candidates", "part_identity_status", "ic_identity_candidate",
+        "possible_part_number", "functional_roles", "evidence",
         "qwen_component_type_candidate", "qwen_component_type_evidence", "qwen_component_type_status",
         "qwen_component_type_confidence", "qwen_component_type_decision",
+        "qwen_component_subtype_candidate", "qwen_component_type_alternatives", "qwen_review_status",
+        "qwen_visual_evidence", "qwen_ocr_evidence", "qwen_conflicting_evidence",
+        "qwen_marking_candidates", "qwen_part_number_candidates", "qwen_functional_role_candidates",
         "ocr_inferred_value", "ocr_inference_method",
     )
     payload = {key: source.get(key) for key in identity_fields}
@@ -302,7 +329,10 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
                 "type_status": str(get("component_type_status", "UNCONFIRMED")),
                 "ocr_marking": get("ocr_marking"),
                 "ocr_candidates": list(get("ocr_candidates", ()) or ()),
+                "marking_candidates": list(get("marking_candidates", ()) or ()),
                 "possible_part_number": get("possible_part_number"),
+                "part_identity_status": get("part_identity_status"),
+                "ic_identity_candidate": get("ic_identity_candidate"),
                 "functional_roles": list(get("confirmed_functional_roles", ()) or ()),
                 "evidence": list(get("evidence", ()) or ()),
                 "source": get("overlay_source"),
@@ -311,6 +341,15 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
                 "qwen_component_type_confidence": get("qwen_component_type_confidence"),
                 "qwen_component_type_decision": get("qwen_component_type_decision"),
                 "qwen_component_type_status": get("qwen_component_type_status"),
+                "qwen_component_subtype_candidate": get("qwen_component_subtype_candidate"),
+                "qwen_component_type_alternatives": list(get("qwen_component_type_alternatives", ()) or ()),
+                "qwen_review_status": get("qwen_review_status"),
+                "qwen_visual_evidence": get("qwen_visual_evidence"),
+                "qwen_ocr_evidence": get("qwen_ocr_evidence"),
+                "qwen_conflicting_evidence": list(get("qwen_conflicting_evidence", ()) or ()),
+                "qwen_marking_candidates": list(get("qwen_marking_candidates", ()) or ()),
+                "qwen_part_number_candidates": list(get("qwen_part_number_candidates", ()) or ()),
+                "qwen_functional_role_candidates": list(get("qwen_functional_role_candidates", ()) or ()),
                 "ocr_inferred_value": get("ocr_inferred_value"),
                 "ocr_inference_method": get("ocr_inference_method"),
             }

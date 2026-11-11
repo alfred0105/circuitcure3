@@ -10,13 +10,16 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 from circuitcare.local_llm import OllamaClient
-from circuitcare.component_taxonomy import COMPONENT_LABELS, UNKNOWN_CLASS, normalize_component_class
+from circuitcare.component_taxonomy import (
+    COMPONENT_CLASSES, COMPONENT_LABELS, QWEN_REVIEW_CLASSES, UNKNOWN_CLASS,
+    normalize_component_class, normalize_qwen_class, normalize_qwen_subtype,
+)
 from circuitcare.vision.box_reconciliation import (
     boxes_overlap_candidate, duplicate_box_metrics, find_group_box_candidates, same_component_box_pair,
 )
 
 DEFAULT_REVIEW_MODEL = "qwen3.5:9b"
-REVIEW_CLASSES = COMPONENT_LABELS
+REVIEW_CLASSES = QWEN_REVIEW_CLASSES
 
 
 class AIReviewStageError(RuntimeError):
@@ -24,12 +27,31 @@ class AIReviewStageError(RuntimeError):
         super().__init__(message)
         self.stage = stage
 
+
+def _clean_string_list(value: Any, *, limit: int = 8, max_length: int = 240) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip()[:max_length] for item in value[:limit] if str(item).strip()]
+
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
         "class_reviews": {"type": "array", "items": {"type": "object", "properties": {
             "detection_id": {"type": "string"}, "decision": {"type": "string", "enum": ["suggest", "uncertain"]},
+            "detector_class": {"type": "string", "enum": list(COMPONENT_LABELS)},
             "proposed_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
+            "proposed_base_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
+            "proposed_subtype": {"type": ["string", "null"]},
+            "alternative_classes": {"type": "array", "items": {"type": "string", "enum": list(REVIEW_CLASSES)}},
+            "is_physical_component": {"type": ["boolean", "null"]},
+            "is_board_feature": {"type": ["boolean", "null"]},
+            "visual_evidence": {"type": "string"},
+            "ocr_evidence": {"type": "string"},
+            "conflicting_evidence": {"type": "array", "items": {"type": "string"}},
+            "needs_user_review": {"type": "boolean"},
+            "marking_candidates": {"type": "array", "items": {"type": "string"}},
+            "part_number_candidates": {"type": "array", "items": {"type": "string"}},
+            "functional_role_candidates": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
         }, "required": ["detection_id", "decision", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
@@ -46,6 +68,7 @@ REVIEW_SCHEMA = {
             "new_components": {"type": "array", "items": {"type": "object", "properties": {
                 "bbox_norm_999": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 999}, "minItems": 4, "maxItems": 4},
                 "proposed_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
+                "proposed_subtype": {"type": ["string", "null"]},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "evidence": {"type": "string"},
             }, "required": ["bbox_norm_999", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
@@ -56,6 +79,7 @@ REVIEW_SCHEMA = {
             "image_index": {"type": "integer", "minimum": 0, "maximum": 48},
             "bbox_norm_999": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 999}, "minItems": 4, "maxItems": 4},
             "proposed_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
+            "proposed_subtype": {"type": ["string", "null"]},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
         }, "required": ["image_index", "bbox_norm_999", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
@@ -65,7 +89,7 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 
-_SYSTEM = """You review a PCB photo and its YOLO component proposals. Use only the supplied shared component labels. Return unknown whenever appearance is ambiguous; return not_component only when the box clearly contains no physical component. Be conservative: only suggest a class when the physical component appearance is clear. Small SMD parts are often visually ambiguous. Use body markings and nearby OCR/silkscreen as cross-check evidence; a reference such as C12 may not label the closest body. Conflicting evidence means decision=uncertain and proposed_class=unknown. Do not claim certainty. Do not invent unseen parts. Existing boxes are identified by IDs; assess duplicate pairs only when their IDs are listed in duplicate_pair_crops, using the associated paired crop and surrounding board context. For group_candidate_crops, decide whether the parent box encloses multiple independent components or one physical component/package (including a connector); never split pins or internal regions of one package. Reuse listed child detection IDs first. If clearly visible separate components have no listed box, provide their tight body boxes in new_components, normalized 0..999 within that group's crop image. Do not duplicate listed child boxes. Return multiple_components only when the crop clearly shows separate physical component bodies. Search for at most a few clearly visible missed components, including when there are no detector proposals. Every proposed box is only a rough review candidate and must be manually checked. Each supplied image has an image_index from image_sources; missed boxes must be normalized relative to the image they cite. Return only the requested JSON object."""
+_SYSTEM = """Review the PCB images independently of YOLO. For each detection first decide whether the crop shows a physical electronic component, a relevant non-component board feature, or an uncertain/non-relevant object. Preserve the detector's class as evidence but do not copy it as your answer; an IC detector proposal may be a connector or socket. Choose a base class from the existing 18 detector classes when it applies; otherwise use other_component for a physical part, board_feature for a PCB structure, unknown when unclear, or not_component only for a clear false positive. These Qwen-only classes do not change YOLO labels. Set proposed_class equal to proposed_base_class for compatibility. Propose a subtype only when visually distinctive; otherwise use null. IC socket is an other_component subtype, not an installed IC. Explain visible body/package/pin/housing evidence, compare body OCR separately from nearby silkscreen, and do not infer a class solely from U3/J1/CN1. OCR/designator conflicts should be recorded in conflicting_evidence and require user review, but a weak nearby designator must not override clear visual evidence. Confidence is an uncalibrated model score, never a probability. Retain alternatives and uncertainty. Do not claim identity, electrical rating, pinout, or datasheet facts not visible or independently verified. Existing detections are ID-scoped; use only supplied IDs. Assess duplicate pairs only in supplied paired crops; do not delete anything. For group candidates, distinguish multiple separate bodies from a single package, connector, pins, or internal structure. Reuse listed child IDs and only suggest missing boxes as unverified. Return only the requested JSON object."""
 
 
 def _review_images(
@@ -202,7 +226,7 @@ def _review_images(
 
 
 def _duplicate_pair_candidates(
-    detections: list[dict[str, Any]], *, limit: int = 8,
+    detections: list[dict[str, Any]], *, limit: int = 12,
     diagnostics: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Select only nearby, similar-scale pairs for focused visual re-review."""
@@ -292,7 +316,10 @@ def review_components_with_qwen(
                            "ocr_text": row.get("ocr_candidates", []),
                            "ocr_class_hints": row.get("ocr_class_hints", []),
                            "reference_designators": row.get("reference_designators", []),
-                           "body_marking": row.get("body_marking")})
+                           "body_marking": row.get("body_marking"),
+                           "marking_candidates": row.get("marking_candidates", []),
+                           "marking_ocr": row.get("marking_ocr"),
+                           "possible_part_number": row.get("possible_part_number")})
     candidate_diagnostics: list[dict[str, Any]] = []
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
@@ -337,7 +364,7 @@ def review_components_with_qwen(
     class_reviews = []
     for row in content.get("class_reviews", []):
         confidence = row.get("confidence")
-        proposed = normalize_component_class(row.get("proposed_class"))
+        proposed = normalize_qwen_class(row.get("proposed_base_class", row.get("proposed_class")))
         if (row.get("detection_id") not in known_ids
                 or row.get("decision") not in {"suggest", "uncertain"}
                 or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
@@ -349,15 +376,58 @@ def review_components_with_qwen(
         hints = {normalize_component_class(item, allow_not_component=False)
                  for item in target.get("ocr_class_hints", [])}
         hints.discard(UNKNOWN_CLASS)
+        conflicts = _clean_string_list(row.get("conflicting_evidence"))
+        # OCR-derived reference-designator hints are weak contextual evidence. Keep
+        # them visible but do not let them erase a visually supported suggestion.
         if hints and proposed not in hints and proposed not in {UNKNOWN_CLASS, "not_component"}:
-            proposed = UNKNOWN_CLASS
-            decision = "uncertain"
-            evidence = (str(row.get("evidence", "")) + " OCR/silkscreen type hint conflicts with visual class.").strip()
-        else:
-            decision = row["decision"]
-            evidence = str(row.get("evidence", ""))
-        class_reviews.append({**row, "decision": decision, "proposed_class": proposed,
-                              "confidence": float(confidence), "evidence": evidence[:500]})
+            conflicts.append("Nearby OCR/reference-designator hint differs from visual proposal; verify manually.")
+        ocr_markings = {"".join(character for character in str(value).upper() if character.isalnum())
+                        for value in (target.get("marking_candidates") or [])}
+        qwen_markings = _clean_string_list(row.get("marking_candidates"), max_length=80)
+        normalized_qwen_markings = {"".join(character for character in value.upper() if character.isalnum())
+                                    for value in qwen_markings}
+        if ocr_markings and normalized_qwen_markings and not ocr_markings.intersection(normalized_qwen_markings):
+            conflicts.append("Qwen marking candidate differs from RapidOCR body marking; keep both unverified.")
+        subtype = normalize_qwen_subtype(proposed, row.get("proposed_subtype"))
+        alternatives = []
+        for alternative in _clean_string_list(row.get("alternative_classes"), limit=5, max_length=80):
+            normalized = normalize_qwen_class(alternative)
+            if normalized != proposed and normalized not in alternatives:
+                alternatives.append(normalized)
+        physical_value = row.get("is_physical_component")
+        physical = physical_value if isinstance(physical_value, bool) else None
+        board_feature_value = row.get("is_board_feature")
+        board_feature = (board_feature_value if isinstance(board_feature_value, bool)
+                         else proposed == "board_feature")
+        if physical is None:
+            physical = proposed in {*COMPONENT_CLASSES, "other_component"}
+        if proposed == "board_feature":
+            physical = False
+            board_feature = True
+        elif proposed == "not_component":
+            physical = False
+            board_feature = False
+        elif proposed in {*COMPONENT_CLASSES, "other_component"}:
+            physical = True
+            board_feature = False
+        evidence = str(row.get("visual_evidence") or row.get("evidence", ""))[:500]
+        ocr_evidence = str(row.get("ocr_evidence") or "")[:500]
+        review_status = ("AI_CONFLICTED" if conflicts else
+                         "UNKNOWN" if proposed == UNKNOWN_CLASS else
+                         "NOT_COMPONENT_SUGGESTED" if proposed == "not_component" else "AI_SUGGESTED")
+        class_reviews.append({**row, "detector_class": target["class_name"],
+                              "decision": row["decision"],
+                              "proposed_class": proposed, "proposed_base_class": proposed,
+                              "proposed_subtype": subtype, "alternative_classes": alternatives,
+                              "is_physical_component": bool(physical), "is_board_feature": board_feature,
+                              "visual_evidence": evidence, "ocr_evidence": ocr_evidence,
+                              "conflicting_evidence": conflicts,
+                              "needs_user_review": bool(row.get("needs_user_review", True) or conflicts),
+                              "marking_candidates": qwen_markings,
+                              "part_number_candidates": _clean_string_list(row.get("part_number_candidates"), max_length=100),
+                              "functional_role_candidates": _clean_string_list(row.get("functional_role_candidates"), max_length=100),
+                              "review_status": review_status,
+                              "confidence": float(confidence), "evidence": evidence})
     duplicate_reviews = []
     seen_pairs = set()
     for row in content.get("duplicate_reviews", []):
@@ -402,7 +472,7 @@ def review_components_with_qwen(
                 candidate.get("bbox_norm_999"), group_image["image_index"] if group_image else None,
                 image_manifest,
             )
-            class_name = normalize_component_class(candidate.get("proposed_class"))
+            class_name = normalize_qwen_class(candidate.get("proposed_class"))
             candidate_confidence = candidate.get("confidence")
             if class_name == "not_component":
                 rejection_reason = "not_component_cannot_be_added_as_box"
@@ -426,6 +496,8 @@ def review_components_with_qwen(
                                               "reason": rejection_reason})
                 continue
             mapped_new_components.append({**candidate, "proposed_class": class_name,
+                                          "proposed_subtype": normalize_qwen_subtype(
+                                              class_name, candidate.get("proposed_subtype")),
                                           "confidence": float(candidate_confidence), "bbox_xyxy": mapped,
                                           "review_status": "검수 필요", "source": "qwen_suggestion"})
             candidate_diagnostics.append({"stage": "qwen_candidate_validation", "parent_id": parent_id,
@@ -445,7 +517,7 @@ def review_components_with_qwen(
                               "review_status": "AI_SUGGESTIONS_ONLY"})
     missed = []
     for row in content.get("missed_component_candidates", [])[:8]:
-        proposed = normalize_component_class(row.get("proposed_class"))
+        proposed = normalize_qwen_class(row.get("proposed_class"))
         confidence = row.get("confidence")
         image_index = row.get("image_index", 0)
         candidate, rejection_reason = _map_normalized_box(row.get("bbox_norm_999"), image_index, image_manifest)
@@ -468,6 +540,7 @@ def review_components_with_qwen(
             and boxes_overlap_candidate(candidate, det["bbox_xyxy"])
             and not same_component_box_pair(candidate, det["bbox_xyxy"])]
         missed.append({**row, "proposed_class": proposed,
+                       "proposed_subtype": normalize_qwen_subtype(proposed, row.get("proposed_subtype")),
                        "confidence": float(confidence), "bbox_xyxy": candidate, "evidence": str(row.get("evidence", ""))[:500],
                        "possible_duplicate_ids": possible_duplicate_ids,
                        "geometry_review_required": bool(possible_duplicate_ids),

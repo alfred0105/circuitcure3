@@ -265,9 +265,50 @@ def render_inspection_panel(
                                                 if source.get("component_id") == component_id), None)
                         for source in qwen_candidates[:2]:
                             candidate_type = source.get("qwen_component_type_candidate")
-                            st.caption(f"Qwen 종류 제안 · {candidate_type} · 미확인")
+                            candidate_subtype = source.get("qwen_component_subtype_candidate")
+                            subtype_label = f" / {candidate_subtype}" if candidate_subtype else ""
+                            review_status = source.get("qwen_review_status") or "AI_SUGGESTED"
+                            st.caption(f"Qwen 종류 제안 · {candidate_type}{subtype_label} · {review_status} · 미확인")
                             if source.get("qwen_component_type_evidence"):
                                 st.caption(str(source["qwen_component_type_evidence"]))
+                            alternatives = source.get("qwen_component_type_alternatives", [])
+                            if alternatives:
+                                st.caption("다른 후보 · " + ", ".join(alternatives))
+                            conflicts = source.get("qwen_conflicting_evidence", [])
+                            if conflicts:
+                                st.warning("Qwen/OCR 근거 충돌 · " + " · ".join(str(value) for value in conflicts))
+                        if (selected_source and selected_source.get("qwen_component_type_status") == "AI_PROPOSED_UNVERIFIED"
+                                and review_scope and records_key):
+                            candidate_type = str(selected_source.get("qwen_component_type_candidate") or "")
+                            if candidate_type in CLASS_OPTIONS and candidate_type != "not_component":
+                                if st.button("Qwen 종류 사용자 확인", key=f"cc_compact_qwen_confirm_{review_scope}_{component_id}"):
+                                    rows = list(st.session_state.get(records_key, []))
+                                    target = next((row for row in rows if row.get("component_id") == component_id), None)
+                                    if target is not None:
+                                        target["소자 종류"] = candidate_type
+                                        target["상태"] = "확인"
+                                        target["user_edited"] = True
+                                        target["qwen_component_type_status"] = "USER_CONFIRMED"
+                                        target["qwen_review_status"] = "USER_CONFIRMED"
+                                        st.session_state[records_key] = rows
+                                        invalidate_component_review_state(st.session_state, scope=review_scope,
+                                            project_id=project.project_id, board_id=project.board_id)
+                                        st.rerun()
+                            elif candidate_type in {"other_component", "board_feature"}:
+                                if st.button("확장 종류 제안 사용자 확인", key=f"cc_compact_qwen_confirm_extension_{review_scope}_{component_id}"):
+                                    rows = list(st.session_state.get(records_key, []))
+                                    target = next((row for row in rows if row.get("component_id") == component_id), None)
+                                    if target is not None:
+                                        target["qwen_component_type_status"] = "USER_CONFIRMED_EXTENSION"
+                                        target["qwen_review_status"] = "USER_CONFIRMED"
+                                        target["qwen_user_confirmed_extension"] = True
+                                        if candidate_type == "other_component":
+                                            target["상태"] = "확인"
+                                            target["user_edited"] = True
+                                        st.session_state[records_key] = rows
+                                        invalidate_component_review_state(st.session_state, scope=review_scope,
+                                            project_id=project.project_id, board_id=project.board_id)
+                                        st.rerun()
                         if (selected_source and selected_source.get("qwen_component_type_candidate") == "not_component"
                                 and selected_source.get("qwen_component_type_decision") == "suggest"
                                 and review_scope and records_key):

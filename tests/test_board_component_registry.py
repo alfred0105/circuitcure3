@@ -251,3 +251,35 @@ def test_qwen_type_suggestion_stays_unverified_in_diagnosis_dto():
     assert diagnosis_row.component_type == "unknown"
     assert diagnosis_row.candidate_component_types == ("capacitor",)
     assert diagnosis_row.ai_review_evidence == ("visual suggestion",)
+
+
+def test_qwen_extension_suggestion_and_subtype_survive_registry_without_becoming_diagnosis_facts():
+    snapshots = _snapshots()
+    snapshots["front"]["components"] = (_component("J1", status="UNCONFIRMED"),)
+    source = snapshots["front"]["components"][0]
+    source.qwen_component_type_candidate = "other_component"
+    source.qwen_component_subtype_candidate = "ic_socket"
+    source.qwen_component_type_evidence = "Open socket cavity and contacts."
+    source.qwen_component_type_status = "AI_PROPOSED_UNVERIFIED"
+    source.qwen_review_status = "AI_CONFLICTED"
+    registry = build_board_component_registry({}, project_id="p-ext", board_id="b-ext",
+        photo_snapshots={"front": snapshots["front"]})
+    row = diagnosis_components(registry)[0]
+    assert row.component_type == "unknown"
+    assert row.candidate_component_types == ("other_component",)
+    assert row.candidate_component_subtypes == ("ic_socket",)
+    assert row.ai_review_statuses == ("AI_CONFLICTED",)
+
+
+def test_board_feature_qwen_proposal_is_not_exposed_as_a_component_type():
+    snapshots = _snapshots()
+    snapshots["front"]["components"] = (_component("TP1", status="UNCONFIRMED"),)
+    source = snapshots["front"]["components"][0]
+    source.qwen_component_type_candidate = "board_feature"
+    source.qwen_component_type_status = "AI_PROPOSED_UNVERIFIED"
+    registry = build_board_component_registry({}, project_id="p-feature", board_id="b-feature",
+        photo_snapshots={"front": snapshots["front"]})
+    row = diagnosis_components(registry)[0]
+    assert row.component_type == "unknown"
+    assert row.candidate_component_types == ()
+    assert row.candidate_board_features == ("TP1",)

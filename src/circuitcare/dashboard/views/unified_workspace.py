@@ -357,15 +357,43 @@ def _prepare_photo_component_snapshot(
                     "component_type_status": "USER_CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED",
                     "ocr_marking": row.get("body_marking"),
                     "ocr_candidates": row.get("ocr_candidates", []),
+                    "marking_candidates": row.get("marking_candidates", []),
+                    "possible_part_number": row.get("possible_part_number"),
+                    "part_identity_status": row.get("part_identity_status", "UNCONFIRMED"),
+                    "ic_identity_candidate": row.get("ic_identity_candidate"),
                     "ocr_class_hints": row.get("ocr_class_hints", []),
                     "ocr_inferred_value": row.get("ocr_inferred_value"),
                     "ocr_inference_method": row.get("ocr_inference_method"),
-                    "qwen_component_type_candidate": qwen_types.get(str(row.get("component_id")), {}).get("proposed_class"),
-                    "qwen_component_type_evidence": qwen_types.get(str(row.get("component_id")), {}).get("evidence"),
-                    "qwen_component_type_confidence": qwen_types.get(str(row.get("component_id")), {}).get("confidence"),
-                    "qwen_component_type_decision": qwen_types.get(str(row.get("component_id")), {}).get("decision"),
-                    "qwen_component_type_status": ("AI_PROPOSED_UNVERIFIED"
-                        if str(row.get("component_id")) in qwen_types else "NOT_REVIEWED"),
+                    "qwen_component_type_candidate": (row.get("qwen_component_type_candidate")
+                        or qwen_types.get(str(row.get("component_id")), {}).get("proposed_base_class",
+                            qwen_types.get(str(row.get("component_id")), {}).get("proposed_class"))),
+                    "qwen_component_subtype_candidate": (row.get("qwen_component_subtype_candidate")
+                        or qwen_types.get(str(row.get("component_id")), {}).get("proposed_subtype")),
+                    "qwen_component_type_alternatives": (row.get("qwen_component_type_alternatives")
+                        or qwen_types.get(str(row.get("component_id")), {}).get("alternative_classes", [])),
+                    "qwen_component_type_evidence": (row.get("qwen_component_type_evidence")
+                        or qwen_types.get(str(row.get("component_id")), {}).get("visual_evidence")
+                        or qwen_types.get(str(row.get("component_id")), {}).get("evidence")),
+                    "qwen_component_type_confidence": row.get("qwen_component_type_confidence")
+                        or qwen_types.get(str(row.get("component_id")), {}).get("confidence"),
+                    "qwen_component_type_decision": row.get("qwen_component_type_decision")
+                        or qwen_types.get(str(row.get("component_id")), {}).get("decision"),
+                    "qwen_component_type_status": (row.get("qwen_component_type_status") or ("AI_PROPOSED_UNVERIFIED"
+                        if str(row.get("component_id")) in qwen_types else "NOT_REVIEWED")),
+                    "qwen_review_status": row.get("qwen_review_status") or qwen_types.get(
+                        str(row.get("component_id")), {}).get("review_status"),
+                    "qwen_visual_evidence": row.get("qwen_visual_evidence") or qwen_types.get(
+                        str(row.get("component_id")), {}).get("visual_evidence"),
+                    "qwen_ocr_evidence": row.get("qwen_ocr_evidence") or qwen_types.get(
+                        str(row.get("component_id")), {}).get("ocr_evidence"),
+                    "qwen_conflicting_evidence": row.get("qwen_conflicting_evidence") or qwen_types.get(
+                        str(row.get("component_id")), {}).get("conflicting_evidence", []),
+                    "qwen_marking_candidates": row.get("qwen_marking_candidates") or qwen_types.get(
+                        str(row.get("component_id")), {}).get("marking_candidates", []),
+                    "qwen_part_number_candidates": row.get("qwen_part_number_candidates") or qwen_types.get(
+                        str(row.get("component_id")), {}).get("part_number_candidates", []),
+                    "qwen_functional_role_candidates": row.get("qwen_functional_role_candidates") or qwen_types.get(
+                        str(row.get("component_id")), {}).get("functional_role_candidates", []),
                     "possible_part_number": None,
                     "confirmed_functional_roles": inventory.get(str(row.get("component_id")), {}).get(
                         "confirmed_functional_roles", []),
