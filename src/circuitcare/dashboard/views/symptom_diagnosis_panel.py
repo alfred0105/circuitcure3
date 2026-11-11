@@ -316,6 +316,7 @@ def _render_simple_followup_question(
 def _render_simple_diagnosis_result(
     st: Any, project: ProjectContext, result: dict[str, Any], *, state: dict[str, Any],
     knowledge: dict[str, Any], preview: bool, board_registry: dict[str, Any] | None,
+    show_questions: bool = True, show_candidates: bool = True,
 ) -> None:
     if state.get("ollama_error"):
         st.caption("로컬 AI에 연결할 수 없어 규칙 기반 기본 진단으로 진행합니다.")
@@ -329,8 +330,11 @@ def _render_simple_diagnosis_result(
     if result.get("status") == "NEEDS_SYMPTOMS":
         st.info("증상 정보가 더 필요합니다. 모르는 항목은 ‘모르겠음’을 선택할 수 있습니다.")
     candidates = _simple_candidate_rows(result)
-    _render_simple_followup_question(st, project, result, state=state, knowledge=knowledge,
-                                     preview=preview, candidates=candidates)
+    if show_questions:
+        _render_simple_followup_question(st, project, result, state=state, knowledge=knowledge,
+                                         preview=preview, candidates=candidates)
+    if not show_candidates:
+        return
     if candidates:
         st.markdown("#### AI 추천 검사 후보")
         for index, candidate in enumerate(candidates, start=1):
@@ -870,6 +874,8 @@ def render_symptom_diagnosis_panel(
     board_registry: dict[str, Any] | None = None,
     suspected_components: list[dict[str, Any]] | None = None,
     simple_ui: bool = False,
+    workflow_stage: str | None = None,
+    left_progress_slot: Any = None,
 ) -> None:
     """Collect symptoms, run local rules, and render candidates and safe next questions."""
     kb = load_knowledge()
@@ -881,24 +887,34 @@ def render_symptom_diagnosis_panel(
         st.info("측정 기록이 변경되어 기존 결과를 무효화하고 새 입력으로 원인 후보를 다시 계산했습니다. 측정 근거와 판정 상태를 확인하세요.")
     if state.get("invalidated_reason"):
         st.warning(f"입력이 변경되어 이전 분석 결과를 무효화했습니다 · {state['invalidated_reason']} · 다시 분석해 주세요.")
+    reassessment_view = simple_ui and workflow_stage == "REASSESSMENT"
     if simple_ui:
         st.markdown("#### AI 진단")
-        st.caption("증상을 고르거나 짧게 적어 주세요. 소자를 선택하지 않아도 시작할 수 있습니다.")
         initial_key = f"{key}_simple_initial_symptom"
         initial_options = tuple(INITIAL_SYMPTOM_OPTIONS)
         previous_answer = state.get("initial_symptom_answer")
         if st.session_state.get(initial_key) not in initial_options:
             st.session_state[initial_key] = previous_answer if previous_answer in initial_options else initial_options[-1]
-        simple_choice = st.radio("어떤 문제가 발생하나요?", initial_options, key=initial_key,
-                                 horizontal=True)
+        if reassessment_view:
+            simple_choice = previous_answer if previous_answer in initial_options else initial_options[-1]
+            st.caption(f"기록된 증상 · {simple_choice}")
+        else:
+            st.caption("증상을 고르거나 짧게 적어 주세요. 소자를 선택하지 않아도 시작할 수 있습니다.")
+            simple_choice = st.radio("어떤 문제가 발생하나요?", initial_options, key=initial_key,
+                                     horizontal=True)
     else:
         st.markdown("#### 증상 입력 및 원인 분석")
         st.caption("자연어로 증상을 설명하세요. 원인 후보는 검사 전 가설이며 실제 고장 확률로 해석하지 않습니다.")
     description_key = f"{key}_description"
     if description_key not in st.session_state:
         st.session_state[description_key] = project.symptom_description or ""
-    symptom_text = st.text_area("증상 설명", key=description_key,
-                                 placeholder="예: 전원은 켜지지만 LED가 들어오지 않고 버저가 울리지 않음", height=82)
+    if reassessment_view:
+        symptom_text = str(st.session_state.get(description_key, project.symptom_description or ""))
+        if symptom_text.strip():
+            st.caption(f"증상 설명 · {symptom_text}")
+    else:
+        symptom_text = st.text_area("증상 설명", key=description_key,
+                                     placeholder="예: 전원은 켜지지만 LED가 들어오지 않고 버저가 울리지 않음", height=82)
     code_to_label = {code: item["label"] for code, item in symptom_items.items()}
     symptom_widget_key = f"{key}_symptoms"
     _apply_pending_initial_symptom_widget(st.session_state, state, symptom_widget_key)
@@ -908,7 +924,9 @@ def render_symptom_diagnosis_panel(
         ]
     selected_labels = st.session_state.get(symptom_widget_key, [])
     selected_codes = [code for code, label in code_to_label.items() if label in selected_labels]
-    if simple_ui:
+    if reassessment_view:
+        selected_codes = list(state.get("symptoms", []))
+    elif simple_ui:
         selected_code = INITIAL_SYMPTOM_OPTIONS.get(simple_choice)
         selected_codes = [selected_code] if selected_code else []
     component_inventory = component_inventory or {}
@@ -993,6 +1011,10 @@ def render_symptom_diagnosis_panel(
         else:
             qwen_pcb_strategy = False
             st.caption("Ollama를 사용할 수 없어 규칙 기반 분석으로 실행합니다.")
+    elif reassessment_view:
+        observations = dict(state.get("manual_observations", {}))
+        inventory_complete = bool(state.get("inventory_complete", False))
+        qwen_pcb_strategy = bool(state.get("qwen_pcb_strategy", True))
     else:
         observations = dict(state.get("manual_observations", {}))
         inventory_complete = bool(state.get("inventory_complete", False))
@@ -1094,13 +1116,21 @@ def render_symptom_diagnosis_panel(
     else:
         state["result"] = None
         state["analysis_status"] = central_state.get("status", "NOT_RUN")
-    run_clicked = st.button("AI 진단 시작" if not current_result else "다시 분석",
-                            type="primary", disabled=preview, key=f"{key}_run")
+    run_clicked = False
+    if not reassessment_view:
+        run_clicked = st.button("AI 진단 시작" if not current_result else "다시 분석",
+                                type="primary", disabled=preview, key=f"{key}_run")
+    elif current_result is None:
+        st.info("현재 증상과 측정으로 재판정 결과를 준비하고 있습니다.")
     run_after_measurement_change = _consume_measurement_change_rerun(state, measurement_fingerprint)
     run_after_initial_answer = bool(state.pop("run_after_initial_answer", False))
     run_requested = bool(run_clicked or run_after_initial_answer or run_after_measurement_change)
     if run_requested:
-        analysis_progress = st.status("고장 후보 분석 중", expanded=True)
+        if left_progress_slot is not None:
+            progress_container = left_progress_slot.container()
+            analysis_progress = progress_container.status("고장 후보 분석 중", expanded=True)
+        else:
+            analysis_progress = st.status("고장 후보 분석 중", expanded=True)
         analysis_progress.write("증상·검수·현재 측정 Fingerprint · 확인 완료")
         if simple_ui:
             _save_initial_symptom_answer(state, simple_choice)
@@ -1262,6 +1292,8 @@ def render_symptom_diagnosis_panel(
         _render_simple_diagnosis_result(
             st, project, result, state=state, knowledge=kb, preview=preview,
             board_registry=board_registry,
+            show_questions=workflow_stage != "REASSESSMENT",
+            show_candidates=workflow_stage != "QUESTIONS",
         )
         return
     if result.get("evidence_conflicts"):

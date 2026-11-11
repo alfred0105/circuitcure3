@@ -8,12 +8,17 @@ from circuitcare.dashboard.views import symptom_diagnosis_panel as symptoms
 from circuitcare.dashboard.views import inspection_panel as inspection
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
-from circuitcare.frontend.workbench_state import SELECTION_KEY, enter_workbench
+from circuitcare.frontend.workbench_state import (
+    SELECTION_KEY, WORKFLOW_REVIEW, WORKFLOW_QUESTIONS, WORKFLOW_INSPECTION,
+    get_workflow_state, transition_workflow, enter_workbench,
+)
 from circuitcare.dashboard.views.symptom_diagnosis_panel import candidate_focus_widget_key
 from circuitcare.dashboard.views.symptom_diagnosis_panel import (
     _queue_measurement_change_rerun, _consume_measurement_change_rerun,
 )
 from circuitcare.analysis.models import AnalysisStatus
+from circuitcare.frontend.board_component_registry import build_board_component_registry, source_component_key
+from test_board_component_registry import _snapshots
 
 
 class _Context:
@@ -26,6 +31,12 @@ class _Context:
     def __exit__(self, *_args):
         return False
 
+    def markdown(self, *_args, **_kwargs):
+        pass
+
+    def caption(self, *_args, **_kwargs):
+        pass
+
 
 class _StreamlitStub:
     def __init__(self, *, state=None, clicked=()):
@@ -37,7 +48,8 @@ class _StreamlitStub:
         return _Context()
 
     def columns(self, specs, **_kwargs):
-        return [_Context() for _ in specs]
+        count = specs if isinstance(specs, int) else len(specs)
+        return [_Context() for _ in range(count)]
 
     def expander(self, *_args, **_kwargs):
         return _Context()
@@ -63,6 +75,55 @@ def test_analysis_workspace_only_renders_selected_panel_instead_of_hidden_tabs(m
     workspace._render_fault_analysis_workspace(st, project, preview=False, mode="증상")
 
     assert calls == ["symptom"]
+
+
+def test_workflow_state_is_board_scoped_and_only_accepts_explicit_valid_transitions():
+    first = ProjectContext("wf-project", "front-board")
+    second = ProjectContext("wf-project", "other-board")
+    state = {}
+    workflow = get_workflow_state(state, first)
+    assert workflow["stage"] == WORKFLOW_REVIEW
+    with pytest.raises(ValueError, match="허용되지 않은"):
+        transition_workflow(state, first, WORKFLOW_INSPECTION)
+    transition_workflow(state, first, WORKFLOW_QUESTIONS, event="review_complete")
+    assert get_workflow_state(state, first)["stage"] == WORKFLOW_QUESTIONS
+    assert get_workflow_state(state, second)["stage"] == WORKFLOW_REVIEW
+    assert workflow["stage_history"][-1]["event"] == "review_complete"
+
+
+def test_inspection_targets_use_real_registry_ids_order_evidence_and_never_invent_boxes():
+    project = ProjectContext("workflow-targets", "workflow-target-board")
+    registry = build_board_component_registry(
+        {}, project_id=project.project_id, board_id=project.board_id,
+        photo_snapshots=_snapshots(),
+    )
+    front_id = registry["source_to_board_id"][source_component_key("front", "local-1")]
+    close_id = registry["source_to_board_id"][source_component_key("close", "close-1")]
+    suspects = [{"board_component_id": close_id}]
+    selected = workspace._inspection_targets(
+        registry,
+        [{"board_component_id": front_id, "component_type": "resistor",
+          "fault_hypotheses": [{"fault_id": "RESISTOR_OPEN"}]}],
+        suspects,
+    )
+    assert [row["board_component_id"] for row in selected[:2]] == [
+        front_id, close_id,
+    ]
+    assert len(selected) <= 3
+    assert all(row["board_component_id"] in {item["board_component_id"] for item in registry["components"]}
+               for row in selected)
+
+    excluded_only = build_board_component_registry(
+        {}, project_id=project.project_id, board_id=project.board_id,
+        photo_snapshots={"front": {"components": (
+            SimpleNamespace(component_id="X1", component_type="resistor", bbox_xyxy=(1, 2, 8, 9),
+                            coordinate_frame="SOURCE_PHOTO_PIXEL", identification_status="EXCLUDED",
+                            presence_status="EXCLUDED", component_type_status="UNCONFIRMED",
+                            ocr_marking=None, possible_part_number=None, confirmed_functional_roles=(),
+                            evidence=(), overlay_source="test"),),
+            "image_fingerprint": "excluded", "review_version": "excluded"}},
+    )
+    assert workspace._inspection_targets(excluded_only, [], []) == []
 
 
 def test_cause_candidate_selection_opens_same_pcb_viewer_and_updates_shared_selection():
@@ -121,7 +182,7 @@ def test_measurement_target_changes_shared_selection_only_when_callback_runs():
     assert state[SELECTION_KEY].selected_component is None
 
 
-def test_fixed_viewer_shell_keeps_pcb_visible_and_renders_single_diagnosis_flow(monkeypatch):
+def test_fixed_viewer_shell_starts_at_component_review_with_one_current_stage(monkeypatch):
     project = ProjectContext("project-shell", "board-shell")
     registry = {"project_id": project.project_id, "board_id": project.board_id,
                 "version": "board-registry:v1", "components": []}
@@ -133,14 +194,12 @@ def test_fixed_viewer_shell_keeps_pcb_visible_and_renders_single_diagnosis_flow(
     calls = []
     monkeypatch.setattr(workspace, "_render_pcb", lambda *_args, **_kwargs: calls.append("viewer"))
     monkeypatch.setattr(workspace, "_render_component_inspector", lambda *_args, **_kwargs: calls.append("review"))
-    monkeypatch.setattr(workspace, "_render_fault_analysis_workspace",
-                        lambda _st, _project, _preview, **kwargs: calls.append(kwargs["mode"]))
 
     state = {}
     enter_workbench(state, project)
     state[f"cc_workbench_panel_{project.project_id}"] = "원인"  # ignored legacy navigation state
     workspace.render_workbench_shell(_StreamlitStub(state=state), project)
-    assert calls == ["viewer", "review", "통합"]
+    assert calls == ["viewer", "review"]
 
 
 def test_simple_candidate_list_aggregates_faults_by_physical_component():
@@ -387,7 +446,126 @@ def test_real_streamlit_app_test_renders_workbench_without_runtime_errors():
     app.run()
 
     assert not app.exception
-    assert len(app.radio) == 1  # symptom prompt only; no workbench-mode selector
+    assert len(app.radio) == 0  # first workflow stage is component review
     assert not any(item.label == "작업 패널" for item in app.radio)
     assert not any(item.label == "후보 표시 전략" for item in app.selectbox)
     assert "진단 미실행" in " ".join(item.value for item in app.caption)
+
+
+def test_apptest_review_next_button_transitions_only_right_panel_to_questions(monkeypatch):
+    app_testing = pytest.importorskip("streamlit.testing.v1")
+    from circuitcare.frontend.state import INTAKE_IMAGES_KEY, INTAKE_PROJECT_KEY
+    from circuitcare.frontend.workbench_state import SCREEN_KEY, WORKFLOW_STATES_KEY
+
+    project = ProjectContext("workflow-apptest", "workflow-board")
+    component = SimpleNamespace(component_id="R1", board_component_id="BC-R1",
+                                component_type="resistor", presence_status="UNCONFIRMED")
+    registry = {"project_id": project.project_id, "board_id": project.board_id,
+                "version": "registry-test", "components": [{
+                    "board_component_id": "BC-R1", "component_type": "resistor",
+                    "presence_status": "UNCONFIRMED", "source_components": [
+                        {"photo_id": "photo-1", "component_id": "R1", "review_status": "UNCONFIRMED"},
+                    ],
+                }]}
+    monkeypatch.setattr(workspace, "_prepare_board_registry_snapshot",
+                        lambda *_args, **_kwargs: (registry, {"components": (component,)}))
+    monkeypatch.setattr(workspace, "diagnosis_components", lambda _registry: (component,))
+    monkeypatch.setattr(workspace, "_render_pcb", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "_render_component_inspector", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "_diagnosis_status_label", lambda *_args, **_kwargs: "진단 전")
+    monkeypatch.setattr(workspace, "current_analysis_snapshot", lambda *_args, **_kwargs: {
+        "result": None, "record": {"status": "NOT_RUN"}, "input_fingerprint": "mock-fp",
+    })
+    monkeypatch.setattr(workspace, "render_symptom_diagnosis_panel",
+                        lambda st, *_args, **_kwargs: st.markdown("질문 단계 AppTest 확인"))
+    app = app_testing.AppTest.from_file(str(Path(__file__).parents[1] / "src/circuitcare/ui.py"),
+                                        default_timeout=30)
+    app.session_state[INTAKE_PROJECT_KEY] = project
+    app.session_state[INTAKE_IMAGES_KEY] = []
+    app.session_state[SCREEN_KEY] = "workbench"
+    app.run()
+    assert not app.exception
+    assert any(button.label == "검수 완료 · 고장 질문으로 진행" for button in app.button)
+
+    next(button for button in app.button if button.label == "검수 완료 · 고장 질문으로 진행").click().run()
+
+    assert not app.exception
+    assert any("질문 단계 AppTest 확인" in item.value for item in app.markdown)
+    workflow_store = app.session_state[WORKFLOW_STATES_KEY]
+    assert workflow_store[f"{project.project_id}|{project.board_id}"]["stage"] == WORKFLOW_QUESTIONS
+
+
+def test_apptest_questions_next_uses_current_result_and_real_registry_targets(monkeypatch):
+    app_testing = pytest.importorskip("streamlit.testing.v1")
+    from circuitcare.frontend.state import INTAKE_IMAGES_KEY, INTAKE_PROJECT_KEY
+    from circuitcare.frontend.workbench_state import (
+        SCREEN_KEY, WORKFLOW_STATES_KEY, transition_workflow,
+    )
+
+    project = ProjectContext("workflow-inspection-apptest", "workflow-inspection-board")
+    registry = build_board_component_registry(
+        {}, project_id=project.project_id, board_id=project.board_id,
+        photo_snapshots=_snapshots(),
+    )
+    components = workspace.diagnosis_components(registry)
+    snapshot = {"components": components}
+    calls = {"analysis": 0}
+    monkeypatch.setattr(workspace, "_prepare_board_registry_snapshot",
+                        lambda *_args, **_kwargs: (registry, snapshot))
+    monkeypatch.setattr(workspace, "diagnosis_components", lambda _registry: components)
+    monkeypatch.setattr(workspace, "_render_pcb", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "_render_component_inspector", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "_diagnosis_status_label", lambda *_args, **_kwargs: "현재 분석")
+
+    def current_snapshot(*_args, **_kwargs):
+        calls["analysis"] += 1
+        return {
+            "result": {"candidate_fusion": {"candidates": [{
+                "board_component_id": registry["components"][0]["board_component_id"],
+                "component_type": registry["components"][0]["component_type"],
+                "fault_hypotheses": [{"fault_id": "RESISTOR_OPEN"}],
+            }]}},
+            "record": {"status": AnalysisStatus.CURRENT.value},
+            "input_fingerprint": "current-workflow-fingerprint",
+        }
+
+    monkeypatch.setattr(workspace, "current_analysis_snapshot", current_snapshot)
+    monkeypatch.setattr(workspace, "render_symptom_diagnosis_panel",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "render_measurement_panel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "load_knowledge", lambda: {"component_test_profiles": {"profiles": {}}})
+    measurement = SimpleNamespace(measurement_id="measurement-1",
+                                  board_component_id=registry["components"][0]["board_component_id"],
+                                  fault_hypothesis=None)
+    monkeypatch.setattr(workspace, "get_measurements", lambda *_args, **_kwargs: [measurement])
+
+    app = app_testing.AppTest.from_file(str(Path(__file__).parents[1] / "src/circuitcare/ui.py"),
+                                        default_timeout=30)
+    app.session_state[INTAKE_PROJECT_KEY] = project
+    app.session_state[INTAKE_IMAGES_KEY] = []
+    app.session_state[SCREEN_KEY] = "workbench"
+    workflow_store: dict = {}
+    transition_workflow(workflow_store, project, WORKFLOW_QUESTIONS, event="review_complete")
+    app.session_state[WORKFLOW_STATES_KEY] = workflow_store[WORKFLOW_STATES_KEY]
+    app.run()
+    assert not app.exception
+    assert any(button.label == "검사 후보 선정" for button in app.button)
+
+    next(button for button in app.button if button.label == "검사 후보 선정").click().run()
+
+    assert not app.exception
+    workflow_state = app.session_state[WORKFLOW_STATES_KEY][f"{project.project_id}|{project.board_id}"]
+    assert workflow_state["stage"] == WORKFLOW_INSPECTION
+    valid_ids = {row["board_component_id"] for row in registry["components"]
+                 if row.get("presence_status") != "EXCLUDED"}
+    assert workflow_state["inspection_targets"]
+    assert {row["board_component_id"] for row in workflow_state["inspection_targets"]} <= valid_ids
+    assert any(item.label == "검사할 소자" for item in app.selectbox)
+    assert calls["analysis"] == 6  # three current-state reads per render; no detector is invoked by the transition
+
+    next(button for button in app.button if button.label == "측정 결과 분석").click().run()
+
+    assert not app.exception
+    workflow_state = app.session_state[WORKFLOW_STATES_KEY][f"{project.project_id}|{project.board_id}"]
+    assert workflow_state["stage"] == "REASSESSMENT"
+    assert workflow_state["reassessment_history"][-1]["measurement_ids"] == ["measurement-1"]

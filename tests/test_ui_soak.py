@@ -36,7 +36,7 @@ def test_photo_upload_enters_current_pcb_workbench():
     assert not app.exception
     assert app.session_state[INTAKE_PROJECT_KEY].image_records
     assert app.session_state["circuitcare_v2_screen"] == "workbench"
-    assert any("AI 진단" in item.value for item in app.markdown)
+    assert any("소자 검수" in item.value for item in app.markdown)
     assert not any(widget.label in {"작업 패널", "후보 표시 전략"} for widget in app.radio)
 
 
