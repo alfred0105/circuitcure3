@@ -10,6 +10,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from circuitcare.symptom_diagnosis.component_fault_ranker import rank_joint_candidates
+
 
 STRATEGIES = {"baseline", "evidence_v1"}
 
@@ -64,7 +66,7 @@ def rank_by_verified_evidence(
         row["rank"] = index
 
     components_ranked = []
-    for row in result.get("component_candidates", []):
+    for row in result.get("all_component_candidates", result.get("component_candidates", [])):
         fault_id = str(row.get("fault_hypothesis") or row.get("fault_id") or "")
         component_id = str(row.get("board_component_id") or row.get("component_id") or "")
         evidence = by_pair.get((fault_id, component_id), [])
@@ -86,8 +88,23 @@ def rank_by_verified_evidence(
     for index, row in enumerate(components_ranked, start=1):
         row["rank"] = index
 
+    display_candidates = []
+    display_component_ids: set[str] = set()
+    for row in components_ranked:
+        component_id = str(row.get("board_component_id") or row.get("component_id") or "")
+        if not component_id or component_id in display_component_ids:
+            continue
+        display_component_ids.add(component_id)
+        display_candidates.append(row)
+        if len(display_candidates) >= top_k:
+            break
     result["hypotheses"] = hypotheses
-    result["component_candidates"] = components_ranked[:top_k]
+    result["all_component_candidates"] = components_ranked
+    result["component_candidates"] = display_candidates
+    result["joint_candidates"] = rank_joint_candidates(
+        hypotheses=hypotheses, component_candidates=components_ranked,
+        observations=baseline.get("observations", {}) if isinstance(baseline.get("observations"), dict) else {},
+    )
     result["functional_block_hypotheses"] = summarize_board_roles(
         components, baseline.get("functional_blocks", []))
     result["ranking_strategy"] = "evidence_v1"

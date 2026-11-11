@@ -48,6 +48,8 @@ from circuitcare.dashboard.views.symptom_diagnosis_panel import (
 )
 from circuitcare.dashboard.views.measurement_panel import render_measurement_panel
 from circuitcare.dashboard.views.diagnosis_panel import render_diagnosis_panel
+from circuitcare.dashboard.views.report_panel import render_report_panel
+from circuitcare.reporting.report_builder import build_pcb_diagnostic_snapshot
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
     ensure_component_detection, render_component_recognition_panel,
@@ -80,7 +82,7 @@ def _style(st: Any) -> None:
     .cc-analysis-copy { color:#aab8c7; font-size:.9rem; }
     .cc-analysis-section { border-top:1px solid #334252; margin-top:1.1rem; padding-top:.75rem; }
     [data-testid="stVerticalBlockBorderWrapper"]:has(.cc-inspection-marker) { position:sticky; top:1.25rem; align-self:start; }
-    [class*="st-key-cc_viewer_canvas"] { overflow:auto; max-height:calc(100vh - 15rem); background:#101820; border:1px solid #334252; border-radius:8px; padding:.5rem; }
+    [class*="st-key-cc_viewer_canvas"] { overflow:auto; max-height:calc(100vh - 13rem); background:#101820; border:1px solid #334252; border-radius:8px; padding:.5rem; }
     div[role="radiogroup"] label { border:1px solid #334252; border-radius:6px; padding:.35rem .8rem; }
     @media (max-width:900px) { [data-testid="stMainBlockContainer"] { padding:.8rem; } }
     @media (max-width:900px) {
@@ -849,8 +851,9 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         else:
             st.session_state.pop(BOARD_COMPONENT_SELECTION_KEY, None)
     if candidate_state:
-        st.caption("진단 색상 · 노랑: 검사 후보 · 빨강: 해당 가설 측정 이상 · 초록: 해당 검사 정상 · 회색: 판정 불가. "
-                   "초록은 소자 전체의 정상 판정을 뜻하지 않습니다.")
+        st.caption("진단 표시 · 노랑 SUSPECTED: 미확정 후보 · 빨강 FAULT_SUPPORTED: 측정이 특정 가설을 지지 · "
+                   "초록 FAULT_REFUTED: 특정 가설 반박 · 회색 INCONCLUSIVE: 판정 불가 · "
+                   "충돌 CONFLICTED: 증거 상충. 소자 전체의 고장·정상을 확정하지 않습니다.")
     if not interactive:
         with st.container(key="cc_viewer_canvas"):
             st.image(image, width=720)
@@ -881,7 +884,7 @@ def _photo_label(record: Any, number: int) -> str:
 
 
 def render_workbench_shell(st: Any, project: ProjectContext) -> None:
-    """Render separate component-review and fault-analysis workspaces."""
+    """Keep the PCB Viewer fixed while rendering one selected task panel."""
     _style(st)
     selection = st.session_state.get(SELECTION_KEY)
     if getattr(selection, "project_id", None) != project.project_id:
@@ -907,6 +910,8 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
         st.markdown('<div class="cc-wb-header">CircuitCare AI</div>', unsafe_allow_html=True)
         st.caption(f"{project.project_id[:8]} · 사진 {len(project.image_records)}장 · "
                    f"{_diagnosis_status_label(st, project, analysis_snapshot=live_analysis_snapshot)}")
+        confirmed_count = sum(item.presence_status == "CONFIRMED" for item in snapshot_components)
+        st.markdown(f'<div class="cc-wb-subtle">보드 확인 소자 {confirmed_count}개 · Registry {board_registry.get("version", "미구성")[-12:]}</div>', unsafe_allow_html=True)
     if add_photo.button("사진 추가", use_container_width=True, key="cc_v2_workbench_add_photo"):
         st.session_state["circuitcare_v2_edit_project_id"] = project.project_id
         st.session_state["circuitcare_v2_edit_board_id"] = project.board_id
@@ -932,26 +937,32 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
 
     preview = st.session_state.get(MODE_KEY) == "PREVIEW_ONLY"
     with st.container(key="cc_workbench_body"):
-        nav_key = f"cc_workbench_view_{project.project_id}"
-        if st.session_state.get(nav_key) not in {"PCB 소자 검수", "고장 분석"}:
-            st.session_state[nav_key] = "PCB 소자 검수"
-        st.radio("작업 영역", ("PCB 소자 검수", "고장 분석"), horizontal=True,
-                 key=nav_key, label_visibility="collapsed")
-        current_view = st.session_state[nav_key]
-        if current_view == "PCB 소자 검수":
-            left, right = st.columns([3.2, 1.15], gap="large")
-            with left:
-                _render_pcb(st, project, st.session_state.get(INTAKE_IMAGES_KEY, []))
-            with right:
+        panel_key = f"cc_workbench_panel_{project.project_id}"
+        modes = ("검수", "증상", "원인", "측정")
+        if panel_key not in st.session_state:
+            legacy_view = st.session_state.get(f"cc_workbench_view_{project.project_id}")
+            st.session_state[panel_key] = "증상" if legacy_view == "고장 분석" else "검수"
+        if st.session_state.get(panel_key) not in modes:
+            st.session_state[panel_key] = "검수"
+        left, right = st.columns([1.85, 1], gap="large")
+        with left:
+            _render_pcb(st, project, st.session_state.get(INTAKE_IMAGES_KEY, []))
+        with right:
+            st.radio("작업 패널", modes, horizontal=True, key=panel_key,
+                     label_visibility="collapsed")
+            selected_mode = st.session_state[panel_key]
+            if selected_mode == "검수":
                 _render_component_inspector(st, project, preview)
-        else:
-            _render_fault_analysis_workspace(st, project, preview,
-                                             analysis_snapshot=live_analysis_snapshot,
-                                             photo_snapshot=photo_snapshot,
-                                             board_registry=board_registry,
-                                             board_components=snapshot_components,
-                                             component_id_aliases=measurement_aliases,
-                                             analysis_target_id=analysis_target_id)
+            else:
+                _render_fault_analysis_workspace(
+                    st, project, preview, mode=selected_mode,
+                    analysis_snapshot=live_analysis_snapshot,
+                    photo_snapshot=photo_snapshot,
+                    board_registry=board_registry,
+                    board_components=snapshot_components,
+                    component_id_aliases=measurement_aliases,
+                    analysis_target_id=analysis_target_id,
+                )
 
 
 def _selected_component(st: Any) -> ComponentOverlayViewModel | None:
@@ -996,12 +1007,6 @@ def _handle_measurement_target_change(
     state["circuitcare_v2_photo_choice"] = source.get("photo_id")
     update_selection(state, project=project, active_photo_id=source.get("photo_id"),
                      selected_component=source.get("component_id"))
-    state[f"cc_analysis_viewer_open_{project.project_id}"] = True
-
-
-def _set_workbench_view(state: Any, *, project_id: str, view: str) -> None:
-    """Update the radio selection from a pre-render callback, before widget creation."""
-    state[f"cc_workbench_view_{project_id}"] = view
 
 
 def _render_component_inspector(st: Any, project: ProjectContext, preview: bool) -> None:
@@ -1102,29 +1107,9 @@ def _render_board_identity_controls(st: Any, project: ProjectContext) -> None:
                        f"{reason_labels.get(reason, reason)} · 다시 선택해 확인하세요.")
 
 
-def _render_selected_component_summary(st: Any, project: ProjectContext) -> None:
-    item = _selected_component(st)
-    with st.container(border=True):
-        st.markdown("**선택 소자**")
-        if item is None:
-            st.caption("PCB 박스 또는 원인 후보를 선택하세요.")
-            return
-        st.markdown(f"`{item.board_component_id or item.component_id}` · **{item.component_type}**")
-        if item.board_component_id and item.board_component_id != item.component_id:
-            st.caption(f"현재 사진 탐지 ID · {item.component_id}")
-        st.caption(f"신뢰도 {item.detection_confidence:.2f} · {item.identification_status}")
-        if item.ocr_marking:
-            st.caption(f"각인 후보 · {item.ocr_marking}")
-        st.button(
-            "소자 검수에서 편집", key=f"cc_open_component_review_{project.project_id}",
-            use_container_width=True, on_click=_set_workbench_view,
-            kwargs={"state": st.session_state, "project_id": project.project_id,
-                    "view": "PCB 소자 검수"},
-        )
-
-
 def _render_fault_analysis_workspace(
     st: Any, project: ProjectContext, preview: bool, *,
+    mode: str = "증상",
     analysis_snapshot: dict[str, Any] | None = None,
     photo_snapshot: dict[str, Any] | None = None,
     board_registry: dict[str, Any] | None = None,
@@ -1162,12 +1147,18 @@ def _render_fault_analysis_workspace(
     inventories = st.session_state.get(COMPONENT_INVENTORY_KEY, {})
     inventory = inventories.get(owner, {}) if isinstance(inventories, dict) else {}
     result = analysis_snapshot.get("result")
+    labels = {"증상": "증상 입력", "원인": "원인 분석", "측정": "측정 검증"}
     with st.container(border=True):
-        st.markdown('<div class="cc-analysis-step">PCB FAULT WORKSPACE</div>', unsafe_allow_html=True)
-        st.markdown('<div class="cc-analysis-title">증상 입력 → 원인 분석 → 측정 검증</div>', unsafe_allow_html=True)
-        st.markdown('<div class="cc-analysis-copy">규칙 기반 분석, 로컬 LLM 보조, 측정 판정을 같은 프로젝트 상태에서 확인합니다. 후보는 측정으로 검증되기 전까지 미확정 가설입니다.</div>', unsafe_allow_html=True)
-    symptom_tab, cause_tab, measurement_tab = st.tabs(("1 · 증상 입력", "2 · 원인 분석", "3 · 측정 검증"))
-    with symptom_tab:
+        st.markdown(f'<div class="cc-analysis-step">{labels.get(mode, "분석")}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="cc-analysis-copy">규칙 기반 결과를 기준으로 표시합니다. 후보는 측정으로 검증되기 전까지 미확정 가설입니다.</div>', unsafe_allow_html=True)
+    record = (analysis_snapshot or {}).get("record", {})
+    state_status = str(record.get("status", "NOT_RUN"))
+    state_labels = {"NOT_RUN": "분석 전", "RUNNING": "분석 중", "CURRENT": "현재 입력 기준 최신",
+                    "STALE": "입력 변경 · 재분석 필요", "FAILED": "분석 실패"}
+    st.caption(f"분석 상태 · {state_labels.get(state_status, state_status)}")
+    if state_status == "STALE" and record.get("reason"):
+        st.warning(f"기존 결과는 현재 입력과 달라 사용하지 않습니다 · {record['reason']}")
+    if mode == "증상":
         render_symptom_diagnosis_panel(
             st, project, components=components, preview=preview,
             component_inventory=({"__board_registry__": {"registry_version": board_registry.get("version")}}
@@ -1175,10 +1166,10 @@ def _render_fault_analysis_workspace(
             analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
             board_registry=board_registry,
         )
-    with cause_tab:
+    elif mode == "원인":
         _render_cause_dashboard(st, project, result, analysis_snapshot=analysis_snapshot,
                                 board_registry=board_registry)
-    with measurement_tab:
+    elif mode == "측정":
         st.markdown("#### 측정 기록과 가설 검증")
         if components:
             component_ids = [item.component_id for item in components]
@@ -1218,11 +1209,7 @@ def _render_fault_analysis_workspace(
                 component_map_version=st.session_state.get(MAP_VERSION_KEY),
             )
 
-    viewer_key = f"cc_analysis_viewer_open_{project.project_id}"
-    with st.expander("PCB Viewer · 선택 후보 위치 확인", expanded=bool(st.session_state.get(viewer_key, False))):
-        st.caption("후보를 선택하면 동일한 소자 ID가 Viewer와 검수 화면에 강조됩니다.")
-        _render_pcb(st, project, st.session_state.get(INTAKE_IMAGES_KEY, []))
-        _render_selected_component_summary(st, project)
+        st.caption("PCB Viewer는 왼쪽에 고정되어 있으며, 측정 대상 변경은 같은 보드 소자 선택에 반영됩니다.")
 
 
 def _render_cause_dashboard(
@@ -1245,39 +1232,43 @@ def _render_cause_dashboard(
     if next_action is None:
         next_action = next(iter(next_tests), None)
     with st.container(border=True):
-        st.markdown("**우선 확인할 원인**")
+        st.markdown("**소자 고장 의심 후보 · Top 3**")
         if candidates:
-            top = candidates[0]
-            st.markdown(f"### {top.get('fault_title', '원인 후보')}")
-            st.markdown(f"`{top.get('component_id', '소자 미특정')}` · {top.get('component_type', '종류 미확정')} · {top.get('candidate_rank', 1)}순위")
-            st.caption("검사 전 가설 · 점수는 상대 우선도이며 고장 확률이 아닙니다.")
-            evidence = top.get("supporting_evidence") or top.get("evidence", [])
-            if evidence:
-                st.write("**지지 근거** · " + " · ".join(evidence[:3]))
-            opposing = top.get("opposing_evidence", [])
-            if opposing:
-                st.write("**반대 근거** · " + " · ".join(opposing[:3]))
-            available_in_registry = any(
-                item.get("board_component_id") == top.get("component_id")
-                for item in (board_registry or {}).get("components", [])
-            )
-            available_in_legacy_photo = any(
-                item.component_id == top.get("component_id")
-                for item in st.session_state.get("circuitcare_v4_current_components", ())
-            )
-            if available_in_registry or (board_registry is None and available_in_legacy_photo):
-                if st.button("PCB에서 이 후보 보기", key=f"cc_analysis_dashboard_focus_{project.project_id}_{top.get('component_id')}", type="primary"):
-                    focused = (_focus_board_registry_component(st, project, board_registry,
-                               str(top.get("component_id"))) if board_registry else False)
-                    if not focused:
-                        update_selection(st.session_state, project=project,
-                                         selected_component=top.get("component_id"))
-                    st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
-                    st.rerun()
+            status_labels = {"SUSPECTED": "검사 전 의심", "FAULT_SUPPORTED": "특정 가설 지지",
+                             "FAULT_REFUTED": "특정 가설 반박", "CONFLICTED": "근거 충돌",
+                             "INCONCLUSIVE": "판정 불가"}
+            for index, candidate in enumerate(candidates[:3], start=1):
+                component_id = str(candidate.get("board_component_id") or candidate.get("component_id") or "")
+                fault_id = str(candidate.get("fault_hypothesis") or candidate.get("fault_id") or "")
+                status = str(candidate.get("visual_status") or candidate.get("status") or "SUSPECTED")
+                st.markdown(f"**{index}. `{component_id or '소자 미특정'}` · {candidate.get('component_type', '종류 미확정')}**")
+                st.caption(f"{candidate.get('fault_title', fault_id or '원인 후보')} · {status_labels.get(status, '미확정')} · 상대 점수는 확률이 아닙니다.")
+                supporting = candidate.get("supporting_evidence") or candidate.get("evidence", [])
+                if supporting:
+                    st.caption("지지 · " + " · ".join(supporting[:3]))
+                opposing = candidate.get("opposing_evidence", [])
+                if opposing:
+                    st.caption("반대 · " + " · ".join(opposing[:3]))
+                if component_id and board_registry and any(
+                    item.get("board_component_id") == component_id
+                    for item in board_registry.get("components", [])
+                ):
+                    if st.button("PCB에서 위치 보기", key=f"cc_analysis_dashboard_focus_{project.project_id}_{component_id}",
+                                 type="primary" if index == 1 else "secondary", use_container_width=True):
+                        _focus_board_registry_component(st, project, board_registry, component_id)
+                        st.rerun()
+                elif component_id and board_registry is None and any(
+                    item.component_id == component_id
+                    for item in st.session_state.get("circuitcare_v4_current_components", ())
+                ):
+                    if st.button("PCB에서 위치 보기", key=f"cc_analysis_dashboard_focus_{project.project_id}_{component_id}",
+                                 type="primary" if index == 1 else "secondary", use_container_width=True):
+                        update_selection(st.session_state, project=project, selected_component=component_id)
+                        st.rerun()
         else:
-            st.info("현재 입력으로 특정 소자 후보를 좁히지 못했습니다. 기판·납땜 또는 외부 시스템 후보를 확인하세요.")
+            st.info("확인된 소자 후보가 없습니다. 증상·검수 결과를 확인하고 기판·납땜 또는 외부 시스템 원인을 살펴보세요.")
         if next_action:
-            st.info("다음 권장 작업 · " + str(next_action.get("label") or next_action.get("name") or next_action.get("question") or next_action.get("test_id") or "추가 확인"))
+            st.info("다음 검사 · " + str(next_action.get("label") or next_action.get("name") or next_action.get("question") or next_action.get("test_id") or "추가 확인"))
 
     category_labels = (("component", "소자 내부·기능 블록"), ("board", "기판·납땜"), ("system", "외부 시스템"))
     for group_key, label in category_labels:
@@ -1322,6 +1313,18 @@ def _render_cause_dashboard(
         st.caption("질문 답변과 검사 추천은 증상 분석 패널에서 입력·반영합니다.")
         for row in questions[:3]:
             st.caption("· " + row.get("question", "추가 정보 확인"))
+    if analysis_snapshot is not None and isinstance(board_registry, dict):
+        with st.expander("진단 보고서 · JSON / Markdown / HTML / Evidence Bundle", expanded=False):
+            snapshot = build_pcb_diagnostic_snapshot(
+                root=Path(__file__).resolve().parents[4], project=project,
+                registry=board_registry, analysis_snapshot=analysis_snapshot,
+                photos=st.session_state.get(INTAKE_IMAGES_KEY, []),
+                selected_board_component_id=st.session_state.get(BOARD_COMPONENT_SELECTION_KEY),
+            )
+            render_report_panel(st, snapshot=snapshot,
+                                root=Path(__file__).resolve().parents[4],
+                                workspace_id=project.project_id,
+                                expected_circuit_hash=None)
 def _render_top_cause(st: Any, project: ProjectContext, result: Any) -> None:
     candidates = result.get("component_candidates", []) if isinstance(result, dict) else []
     next_tests = result.get("next_tests", []) if isinstance(result, dict) else []
@@ -1343,7 +1346,6 @@ def _render_top_cause(st: Any, project: ProjectContext, result: Any) -> None:
             st.caption("다음 검사 · " + str(next_test.get("label") or next_test.get("name") or next_test.get("question") or next_test.get("test_id") or "추가 확인"))
         if st.button("PCB에서 후보 위치 보기", key=f"cc_analysis_focus_{project.project_id}_{top.get('component_id')}", use_container_width=True):
             update_selection(st.session_state, project=project, selected_component=top.get("component_id"))
-            st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
             st.rerun()
 
 

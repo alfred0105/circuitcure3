@@ -577,6 +577,10 @@ def diagnose(
         confirmed_component_ids=confirmed_ids, profiles=kb.get("component_test_profiles", {}),
         current_context=current_context, knowledge=kb, limit=3, include_refuted=False,
     )
+    # Keep the full fault/component-pair ranking internally. The baseline UI
+    # still shows its historical three distinct components, while opt-in
+    # strategies and evaluators can inspect every eligible pair before slicing.
+    all_component_candidates = ranked_component_evidence
     joint_candidates = rank_joint_candidates(
         hypotheses=ranked, component_candidates=component_candidates, observations=facts,
     )
@@ -698,6 +702,7 @@ def diagnose(
             "hypotheses": ranked, "functional_blocks": functional_blocks,
             "hypothesis_groups": hypothesis_groups,
             "component_candidates": component_candidates,
+            "all_component_candidates": all_component_candidates,
             "verified_component_history": verified_component_history,
             "joint_candidates": joint_candidates,
             "measurement_evidence": measurement_evidence,

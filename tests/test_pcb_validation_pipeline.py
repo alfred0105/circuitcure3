@@ -180,6 +180,47 @@ def test_non_component_fault_does_not_score_component_location():
     assert score["component_top1_hit"] is None
 
 
+def test_topk_evaluation_uses_full_rankings_before_display_top3_slice():
+    case = _case()
+    case["case_kind"] = "REAL_CONFIRMED"
+    case["photo_paths"] = ["unused-in-test.png"]
+    case["reference"] = {"adjudication_status": "CONFIRMED", "fault_type_ids": ["F4"],
+        "faulty_board_component_ids": ["bc4"],
+        "fault_pairs": [{"fault_type_id": "F4", "board_component_id": "bc4"}],
+        "evidence_sources": ["repair_record"]}
+    pairs = [{"fault_hypothesis": f"F{i}", "component_id": f"local{i}",
+              "board_component_id": f"bc{i}", "score": score}
+             for i, score in enumerate((5, 4, 3, 3), start=1)]
+    run = {"execution_mode": "REAL_MODEL", "hypotheses": [{"fault_id": f"F{i}", "score": score}
+                                                               for i, score in enumerate((5, 4, 3), start=1)],
+        "all_hypotheses": [{"fault_id": f"F{i}", "score": score}
+                           for i, score in enumerate((5, 4, 3, 3), start=1)],
+        "top_candidates": pairs[:3], "all_component_candidates": pairs, "detections": []}
+    score = score_run(case, run)
+    assert score["fault_type_top3_hit"] is True
+    assert score["component_top3_hit"] is True
+    assert score["joint_top3_hit"] is True
+
+
+def test_evidence_strategy_reranks_full_pairs_before_selecting_unique_display_top3():
+    baseline_candidates = [
+        {"component_id": f"bc{i}", "fault_hypothesis": "F1", "score": float(7-i),
+         "score_breakdown": {"validated_measurement": 0.0}, "measurement_verdict": "non_diagnostic"}
+        for i in range(1, 5)
+    ]
+    baseline = {"hypotheses": [{"fault_id": "F1", "score": 4, "evidence_details": []}],
+        "component_candidates": baseline_candidates[:3], "all_component_candidates": baseline_candidates,
+        "measurement_evidence": [
+            {"measurement_id": f"m{i}", "component_id": f"bc{i}", "fault_hypothesis": "F1",
+             "verdict": "refutes" if i < 4 else "supports", "assessment": "SUPPORTED",
+             "source": "user_measurement"}
+            for i in range(1, 5)], "functional_blocks": [], "observations": {}}
+    result = rank_by_verified_evidence(baseline, components=[], measurements=[], observations=None)
+    assert len(result["all_component_candidates"]) == 4
+    assert result["component_candidates"][0]["component_id"] == "bc4"
+    assert len(result["component_candidates"]) == 3
+
+
 def test_real_cases_are_not_scored_from_mock_or_synthetic_execution():
     case = _case()
     case["case_kind"] = "REAL_CONFIRMED"

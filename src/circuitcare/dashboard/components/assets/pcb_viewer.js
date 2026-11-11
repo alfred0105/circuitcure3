@@ -160,6 +160,11 @@ export default function(component) {
         "aria-label":`${item.display_label || item.component_type} 부품 선택` });
       shape.classList.toggle("cc-fault-conflicted", item.fault_candidate_status === "CONFLICTED");
       fragment.appendChild(shape);
+      if (item.fault_candidate_status === "CONFLICTED") {
+        const conflict = svgElement("text", { x:x1+4, y:y1+14, class:"cc-pcb-conflict-icon" });
+        conflict.textContent = "⚠";
+        fragment.appendChild(conflict);
+      }
       if (item.display_label) {
         const label = svgElement("text", { x:(x1+x2)/2, y:Math.max(12,y1-4), class:"cc-pcb-label" });
         label.textContent = item.display_label; fragment.appendChild(label);

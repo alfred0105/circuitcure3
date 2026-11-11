@@ -446,7 +446,11 @@ def run_case(case: dict[str, Any], *, detector: Callable[[dict[str, Any]], dict[
         "review_errors": [row.get("review_error") for _photo, row in review_results if row.get("review_error")],
         "registry_component_count": len(registry.get("components", [])),
         "status": result.get("status"), "top_candidates": result.get("component_candidates", [])[:3],
-        "hypotheses": result.get("hypotheses", [])[:3], "next_tests": result.get("next_tests", []),
+        "all_component_candidates": result.get("all_component_candidates", result.get("component_candidates", [])),
+        "hypotheses": result.get("hypotheses", [])[:3],
+        "all_hypotheses": result.get("hypotheses", []),
+        "joint_candidates": result.get("joint_candidates", []),
+        "next_tests": result.get("next_tests", []),
         "measurement_evidence": result.get("measurement_evidence", []), "llm": llm_result,
         "strategy": strategy, "baseline_result": baseline_result,
         "strategy_comparison": strategy_comparison,
@@ -600,10 +604,12 @@ def score_run(case: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
     pair_truth.discard(("", ""))
     fault_truth.update(fault for fault, _component in pair_truth if fault)
     component_truth.update(component for _fault, component in pair_truth if component)
-    fault_top1, fault_top3 = _topk_ranked_ids(run.get("hypotheses", []), "fault_id", 1), _topk_ranked_ids(run.get("hypotheses", []), "fault_id", 3)
-    comp_top1, comp_top3 = _topk_ranked_ids(run.get("top_candidates", []), "component_id", 1), _topk_ranked_ids(run.get("top_candidates", []), "component_id", 3)
-    joint_top1 = _topk_pairs(run.get("top_candidates", []), 1)
-    joint_top3 = _topk_pairs(run.get("top_candidates", []), 3)
+    evaluation_hypotheses = run.get("all_hypotheses", run.get("hypotheses", []))
+    evaluation_components = run.get("all_component_candidates", run.get("top_candidates", []))
+    fault_top1, fault_top3 = _topk_ranked_ids(evaluation_hypotheses, "fault_id", 1), _topk_ranked_ids(evaluation_hypotheses, "fault_id", 3)
+    comp_top1, comp_top3 = _topk_ranked_ids(evaluation_components, "component_id", 1), _topk_ranked_ids(evaluation_components, "component_id", 3)
+    joint_top1 = _topk_pairs(evaluation_components, 1)
+    joint_top3 = _topk_pairs(evaluation_components, 3)
     if case.get("case_kind") == "REAL_HEALTHY" and truth.get("adjudication_status") == "CONFIRMED":
         predicted_fault = bool(run.get("hypotheses"))
         return {"case_id": case["case_id"], "status": "SCORED", "healthy_case": True,
@@ -654,6 +660,8 @@ def _ranked_unique(rows: list[dict[str, Any]], id_key: str) -> list[tuple[str, f
     best: dict[str, float] = {}
     for index, row in enumerate(rows):
         identifier = str(row.get(id_key) or "").strip()
+        if id_key == "component_id":
+            identifier = str(row.get("board_component_id") or identifier).strip()
         if id_key in {"fault_id", "fault_type_id"}:
             identifier = identifier or str(row.get("fault_hypothesis") or "").strip()
         if not identifier:
@@ -840,7 +848,10 @@ def evaluate_runs(cases: list[dict[str, Any]], runs: list[dict[str, Any]]) -> di
         if not isinstance(baseline, dict):
             continue
         baseline_run = {**run, "hypotheses": baseline.get("hypotheses", []),
+                        "all_hypotheses": baseline.get("hypotheses", []),
                         "top_candidates": baseline.get("component_candidates", []),
+                        "all_component_candidates": baseline.get("all_component_candidates",
+                                                                  baseline.get("component_candidates", [])),
                         "next_tests": baseline.get("next_tests", []),
                         "measurement_evidence": baseline.get("measurement_evidence", [])}
         paired_baseline_scores.append(score_run(case, baseline_run))
@@ -914,8 +925,8 @@ def compare_before_after_measurement(case: dict[str, Any], **kwargs: Any) -> dic
     baseline_case["inference_input"]["measurements"] = []
     before = run_case(baseline_case, **kwargs)
     after = run_case(case, **kwargs)
-    before_rank = [row.get("fault_id") for row in before.get("hypotheses", [])]
-    after_rank = [row.get("fault_id") for row in after.get("hypotheses", [])]
+    before_rank = [row.get("fault_id") for row in before.get("all_hypotheses", before.get("hypotheses", []))]
+    after_rank = [row.get("fault_id") for row in after.get("all_hypotheses", after.get("hypotheses", []))]
     return {"before": before, "after": after, "before_rank": before_rank, "after_rank": after_rank,
             "rank_changed": before_rank != after_rank}
 

@@ -19,6 +19,7 @@ from circuitcare.reporting.exporters import (
 )
 from circuitcare.reporting.report_builder import (
     _git_sha,
+    build_pcb_diagnostic_snapshot,
     build_diagnostic_snapshot,
     classify_parameter_grid_coverage,
 )
@@ -41,6 +42,7 @@ from circuitcare.workspace.simulation_context import (
 )
 from circuitcare.workspace.state_validator import stale_analysis_records
 from circuitcare.workspace.workflow import workflow_steps
+from circuitcare.frontend.models import ImageRecord, ProjectContext
 
 
 def _report(tmp_path: Path) -> dict:
@@ -151,6 +153,33 @@ def test_report_snapshot_portable_paths_and_simulated_observation_are_labelled(t
     serialized = export_json(report)
     assert "operator private memo" not in serialized
     assert "/Users/alice/private" not in serialized
+
+
+def test_pcb_report_exports_current_board_snapshot_and_validates_bundle(tmp_path: Path) -> None:
+    project = ProjectContext("pcb-project", "board-1",
+                              image_records=(ImageRecord("front-1", side="front", filename="front.png"),))
+    image = b"pcb-image-bytes"
+    result = {"component_candidates": [{"board_component_id": "bc-1", "fault_id": "open_circuit",
+                                        "visual_status": "SUSPECTED"}]}
+    snapshot = build_pcb_diagnostic_snapshot(
+        root=tmp_path, project=project,
+        registry={"version": "registry:v3", "components": [{"board_component_id": "bc-1"}]},
+        analysis_snapshot={"record": {"status": "CURRENT"}, "result": result,
+                           "symptoms": ["NO_OUTPUT"], "symptom_text": "출력이 없음",
+                           "measurements": []},
+        photos=[{"image_id": "front-1", "data": image}],
+        selected_board_component_id="bc-1",
+    )
+    assert validate_report(snapshot) == []
+    assert snapshot["pcb_context"]["photos"][0]["sha256"] == __import__("hashlib").sha256(image).hexdigest()
+    assert snapshot["pcb_context"]["top3_candidates"][0]["board_component_id"] == "bc-1"
+    assert "PCB 진단 Snapshot" in export_markdown(snapshot)
+    assert "registry:v3" in export_html(snapshot)
+    assert "photo_artifacts" not in export_json(snapshot)
+    bundle = export_bundle(snapshot, root=tmp_path)
+    manifest = verify_bundle(bundle)
+    assert "diagnosis.json" in manifest["artifacts"]
+    assert any(name.startswith("photos/") for name in manifest["artifacts"])
 
 
 def test_report_snapshot_uses_verified_source_file_digest_not_reserialized_object(tmp_path: Path) -> None:
