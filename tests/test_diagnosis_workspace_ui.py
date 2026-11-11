@@ -15,7 +15,7 @@ from circuitcare.frontend.workbench_state import (
 from circuitcare.dashboard.views.symptom_diagnosis_panel import candidate_focus_widget_key
 from circuitcare.dashboard.views.symptom_diagnosis_panel import (
     _queue_measurement_change_rerun, _consume_measurement_change_rerun,
-    _ensure_question_plan,
+    _ensure_question_plan, _question_plan_fingerprint, _save_follow_up_answer,
 )
 from circuitcare.analysis.models import AnalysisStatus
 from circuitcare.frontend.board_component_registry import build_board_component_registry, source_component_key
@@ -160,14 +160,65 @@ def test_question_plan_is_catalog_bounded_unique_and_stable_across_reruns():
                         *[{"test_id": f"Q{index}", "type": "question"} for index in range(2, 8)]]),
     }
     knowledge = {"test_catalog": {"tests": catalog}, "fault_modes": {"fault_modes": {}}}
-    plan = _ensure_question_plan(state, diagnosis, knowledge=knowledge, input_fingerprint="fp-1")
+    plan = _ensure_question_plan(state, diagnosis, knowledge=knowledge, plan_fingerprint="fp-1")
     ids = [row["test_id"] for row in plan["questions"]]
     assert len(ids) <= 5
     assert len(ids) == len(set(ids))
     assert set(ids) <= set(catalog)
     assert ids[0] == "Q7"
+    question = plan["questions"][0]["question"]
+    _save_follow_up_answer(state, question, "예")
     assert _ensure_question_plan(state, diagnosis, knowledge=knowledge,
-                                 input_fingerprint="fp-1") is plan
+                                 plan_fingerprint="fp-1") is plan
+    assert plan["questions"][0]["status"] == "ANSWERED"
+
+
+def test_question_plan_fingerprint_ignores_answers_and_view_state_but_tracks_symptom_and_registry():
+    state = {"initial_symptom_answer": "전원 안 켜짐", "answered_test_ids": []}
+    result = {"hypotheses": [{"fault_id": "F1"}]}
+    knowledge = {"test_catalog": {"tests": {"Q1": {
+        "type": "question", "question": "출력이 있나요?", "risk_level": "none",
+    }}}}
+    registry = {"components": [{"board_component_id": "BC1", "component_type": "resistor",
+                                "presence_status": "CONFIRMED"}]}
+    before = _question_plan_fingerprint(
+        state, knowledge=knowledge, selected_codes=["NO_POWER"],
+        symptom_text="전원이 안 켜짐", board_registry=registry, suspected_components=[],
+    )
+    state["answered_test_ids"] = ["Q1"]
+    state["question_number"] = 4
+    state["zoom"] = 2.0
+    after = _question_plan_fingerprint(
+        state, knowledge=knowledge, selected_codes=["NO_POWER"],
+        symptom_text="전원이 안 켜짐", board_registry=registry, suspected_components=[],
+    )
+    assert before == after
+    changed_symptom = _question_plan_fingerprint(
+        state, knowledge=knowledge, selected_codes=["OUTPUT_FAILURE"],
+        symptom_text="전원이 안 켜짐", board_registry=registry, suspected_components=[],
+    )
+    assert changed_symptom != before
+    changed_registry = {"components": [{"board_component_id": "BC1", "component_type": "capacitor",
+                                       "presence_status": "CONFIRMED"}]}
+    assert _question_plan_fingerprint(
+        state, knowledge=knowledge, selected_codes=["NO_POWER"],
+        symptom_text="전원이 안 켜짐", board_registry=changed_registry, suspected_components=[],
+    ) != before
+
+
+def test_question_plan_does_not_pad_unrelated_catalog_questions_and_avoids_answered_on_replan():
+    state = {"answered_test_ids": ["Q1"]}
+    knowledge = {"test_catalog": {"tests": {
+        "Q1": {"type": "question", "risk_level": "none", "question": "기존 질문"},
+        "Q2": {"type": "question", "risk_level": "none", "question": "관련 질문"},
+        "Q3": {"type": "question", "risk_level": "none", "question": "무관 질문"},
+    }}}
+    result = {"next_tests": [{"test_id": "Q2", "type": "question"}],
+              "llm_follow_up_question": {"test_id": "Q3", "type": "question"}}
+    plan = _ensure_question_plan(state, result, knowledge=knowledge, plan_fingerprint="v1")
+    assert [row["test_id"] for row in plan["questions"]] == ["Q2"]
+    changed = _ensure_question_plan(state, result, knowledge=knowledge, plan_fingerprint="v2")
+    assert [row["test_id"] for row in changed["questions"]] == ["Q2"]
 
 
 def test_inspection_targets_use_real_registry_ids_order_evidence_and_never_invent_boxes():
@@ -370,6 +421,162 @@ def test_inspection_targets_prioritize_measurable_components_and_skip_completed_
                                          allow_retest=True)
     retry_resistor = next(row for row in retry if row["board_component_id"] == resistor_id)
     assert any(item["test_id"] == "isolated_resistance" for item in retry_resistor["available_tests"])
+
+
+def test_visual_inspection_is_scoped_to_compatible_component_fault_and_symptom():
+    catalog = symptoms.load_knowledge()["test_catalog"]["tests"]
+    resistor_checks = workspace._compatible_visual_checks(
+        catalog, target_scope="component", component_type="resistor",
+        fault_ids=["RESISTOR_FAILURE"], symptoms={"OVERHEATING"},
+    )
+    assert {row["test_id"] for row in resistor_checks} == {"INSPECT_LOCAL_HEATING"}
+    connector_checks = workspace._compatible_visual_checks(
+        catalog, target_scope="component", component_type="connector",
+        fault_ids=["CONNECTOR_CONTACT_FAILURE"], symptoms={"NO_POWER"},
+    )
+    assert {row["test_id"] for row in connector_checks} == {"INSPECT_POWER_CONNECTOR"}
+    board_checks = workspace._compatible_visual_checks(
+        catalog, target_scope="board", symptoms={"INTERMITTENT_OPERATION"},
+        fault_ids=["SOLDER_JOINT_FAILURE"],
+    )
+    assert {row["test_id"] for row in board_checks} == {"INSPECT_VISIBLE_SOLDER_AND_TRACES"}
+    assert not workspace._compatible_visual_checks(
+        catalog, target_scope="component", component_type="resistor",
+        fault_ids=["CONNECTOR_CONTACT_FAILURE"], symptoms=set(),
+    )
+
+
+def test_visual_inspection_cannot_save_without_safety_confirmation_and_result_is_unselected():
+    class VisualStub(_StreamlitStub):
+        def __init__(self, *, state=None, clicked=()):
+            super().__init__(state=state, clicked=clicked)
+            self.radio_kwargs = []
+            self.button_disabled = []
+
+        def checkbox(self, _label, *, key=None, **_kwargs):
+            return bool(self.session_state.get(key, False))
+
+        def radio(self, _label, options, *, key=None, **kwargs):
+            self.radio_kwargs.append(kwargs)
+            return self.session_state.get(key)
+
+        def button(self, _label, *, key=None, disabled=False, **_kwargs):
+            self.button_disabled.append(disabled)
+            return key in self.clicked and not disabled
+
+        def warning(self, *_args, **_kwargs):
+            pass
+
+    project = ProjectContext("visual-safe", "visual-safe-board")
+    test = symptoms.load_knowledge()["test_catalog"]["tests"]["INSPECT_POWER_CONNECTOR"]
+    state = {"cc_wf_visual_result_visual-safe_BC1_cycle1_INSPECT_POWER_CONNECTOR": None}
+    st = VisualStub(state=state, clicked={"cc_wf_visual_save_visual-safe_BC1_cycle1_INSPECT_POWER_CONNECTOR"})
+    workflow = {"inspection_cycle": {"cycle_id": 1}, "inspection_history": []}
+    workspace._render_visual_inspection(
+        st, project, workflow, test={"test_id": "INSPECT_POWER_CONNECTOR", **test},
+        target_id="BC1", analysis_fingerprint="fp-1", preview=False,
+        widget_suffix="visual-safe_BC1",
+    )
+    assert st.radio_kwargs[0]["index"] is None
+    assert st.button_disabled[-1] is True
+    assert workflow["inspection_history"] == []
+
+
+def test_streamlit_apptest_radio_index_none_starts_unselected():
+    app_testing = pytest.importorskip("streamlit.testing.v1")
+    app = app_testing.AppTest.from_string(
+        "import streamlit as st\nst.radio('결과', ('이상 발견', '정상'), index=None)"
+    ).run()
+    assert not app.exception
+    assert app.radio[0].value is None
+
+
+def test_visual_inspection_unknown_is_history_only_and_not_damage_evidence():
+    class VisualStub(_StreamlitStub):
+        def checkbox(self, _label, *, key=None, **_kwargs):
+            return True
+
+        def radio(self, _label, _options, *, key=None, **_kwargs):
+            return "확인 불가"
+
+        def button(self, _label, *, key=None, disabled=False, **_kwargs):
+            return "_save_" in key and not disabled
+
+        def warning(self, *_args, **_kwargs):
+            pass
+
+        def info(self, *_args, **_kwargs):
+            pass
+
+        def rerun(self):
+            pass
+
+    project = ProjectContext("visual-unknown", "visual-unknown-board")
+    catalog_test = symptoms.load_knowledge()["test_catalog"]["tests"]["INSPECT_POWER_CONNECTOR"]
+    test = {"test_id": "INSPECT_POWER_CONNECTOR", **catalog_test}
+    workflow = {"stage": WORKFLOW_INSPECTION, "inspection_cycle": {"cycle_id": 3},
+                "inspection_history": [], "stage_completion": {}, "stage_history": []}
+    state = {"circuitcare_v8_diagnostic_workflows": {
+        f"{project.project_id}|{project.board_id}": workflow,
+    }}
+    workspace._render_visual_inspection(
+        VisualStub(state=state), project, workflow, test=test, target_id="BC1",
+        analysis_fingerprint="fp-1", preview=False, widget_suffix="visual-unknown_BC1",
+    )
+    assert workflow["inspection_history"][0]["verification_status"] == "INCONCLUSIVE"
+    assert workflow["inspection_history"][0]["observations"] == {}
+    assert state["cc_symptom_diagnosis_visual-unknown"].get("manual_observations", {}) == {}
+
+
+def test_identical_visual_observation_is_not_saved_again_without_explicit_retest():
+    class VisualStub(_StreamlitStub):
+        def __init__(self, *, state=None):
+            super().__init__(state=state)
+            self.button_disabled = []
+
+        def checkbox(self, _label, *, key=None, **_kwargs):
+            default = key.startswith(("cc_wf_visual_power_off_", "cc_wf_visual_energy_safe_"))
+            return bool(self.session_state.get(key, default))
+
+        def radio(self, _label, _options, *, key=None, **_kwargs):
+            return self.session_state.get(key, "이상 발견")
+
+        def button(self, _label, *, disabled=False, **_kwargs):
+            self.button_disabled.append(disabled)
+            return False
+
+        def warning(self, *_args, **_kwargs):
+            pass
+
+        def info(self, *_args, **_kwargs):
+            pass
+
+    project = ProjectContext("visual-duplicate", "visual-duplicate-board")
+    catalog_test = symptoms.load_knowledge()["test_catalog"]["tests"]["INSPECT_POWER_CONNECTOR"]
+    test = {"test_id": "INSPECT_POWER_CONNECTOR", **catalog_test}
+    checks = {"power_disconnected": True, "stored_energy_safe": True}
+    observation = {"VISIBLE_CONNECTOR_DAMAGE": True}
+    fingerprint = workspace._visual_observation_fingerprint(
+        board_id=project.board_id, test_id="INSPECT_POWER_CONNECTOR",
+        target_scope="connector", target_id="BC1", result="이상 발견",
+        observations=observation, safety_checks=checks,
+    )
+    workflow = {
+        "inspection_cycle": {"cycle_id": 4},
+        "inspection_history": [{
+            "history_id": "old-inspection", "observation_fingerprint": fingerprint,
+            "verification_status": "FAULT_SUPPORTED",
+        }],
+    }
+    st = VisualStub(state={
+        "cc_wf_visual_result_visual-duplicate_BC1_cycle4_INSPECT_POWER_CONNECTOR": "이상 발견",
+    })
+    workspace._render_visual_inspection(
+        st, project, workflow, test=test, target_id="BC1", analysis_fingerprint="fp-2",
+        preview=False, widget_suffix="visual-duplicate_BC1", fault_id="CONNECTOR_CONTACT_FAILURE",
+    )
+    assert st.button_disabled[-1] is True
+    assert len(workflow["inspection_history"]) == 1
 
 
 def test_inspection_target_count_tracks_only_real_active_components():
@@ -820,3 +1027,49 @@ def test_apptest_empty_inspection_queue_returns_to_review_without_losing_history
     assert workflow["question_answers"] == [{"test_id": "ASK_POWER_SOURCE", "answer": "예"}]
     assert workflow["measurement_ids"] == ["archived-measurement"]
     assert workflow["transition_reason"] == "현재 Registry에서 측정·검사 대상으로 해석 가능한 소자가 없습니다."
+
+
+def test_apptest_current_reassessment_can_finish_to_report_stage(monkeypatch):
+    app_testing = pytest.importorskip("streamlit.testing.v1")
+    from circuitcare.frontend.state import INTAKE_IMAGES_KEY, INTAKE_PROJECT_KEY
+    from circuitcare.frontend.workbench_state import (
+        SCREEN_KEY, WORKFLOW_STATES_KEY, WORKFLOW_QUESTIONS, WORKFLOW_INSPECTION,
+        WORKFLOW_REASSESSMENT, transition_workflow,
+    )
+
+    project = ProjectContext("workflow-finish-apptest", "workflow-finish-board")
+    registry = {"project_id": project.project_id, "board_id": project.board_id,
+                "version": "finish-registry", "components": []}
+    monkeypatch.setattr(workspace, "_prepare_board_registry_snapshot",
+                        lambda *_args, **_kwargs: (registry, {"components": ()}))
+    monkeypatch.setattr(workspace, "diagnosis_components", lambda _registry: ())
+    monkeypatch.setattr(workspace, "_render_pcb", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "_render_component_inspector", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "_diagnosis_status_label", lambda *_args, **_kwargs: "현재 결과")
+    monkeypatch.setattr(workspace, "render_symptom_diagnosis_panel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "get_measurements", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(workspace, "current_analysis_snapshot", lambda *_args, **_kwargs: {
+        "result": {"hypotheses": [], "component_candidates": []},
+        "record": {"status": AnalysisStatus.CURRENT.value},
+        "input_fingerprint": "finish-current-fingerprint",
+    })
+    monkeypatch.setattr(workspace, "_render_workflow_report", lambda *_args, **_kwargs: None)
+
+    state: dict = {}
+    transition_workflow(state, project, WORKFLOW_QUESTIONS, event="review_complete")
+    transition_workflow(state, project, WORKFLOW_INSPECTION, event="questions_complete")
+    transition_workflow(state, project, WORKFLOW_REASSESSMENT, event="measurement_saved")
+    app = app_testing.AppTest.from_file(str(Path(__file__).parents[1] / "src/circuitcare/ui.py"),
+                                        default_timeout=30)
+    app.session_state[INTAKE_PROJECT_KEY] = project
+    app.session_state[INTAKE_IMAGES_KEY] = []
+    app.session_state[SCREEN_KEY] = "workbench"
+    app.session_state[WORKFLOW_STATES_KEY] = state[WORKFLOW_STATES_KEY]
+    app.run()
+    assert not app.exception
+    finish = next(button for button in app.button if button.label == "검사 종료 및 결과 보고서")
+    assert not finish.disabled
+    finish.click().run()
+    assert not app.exception
+    owner = f"{project.project_id}|{project.board_id}"
+    assert app.session_state[WORKFLOW_STATES_KEY][owner]["stage"] == "COMPLETE"

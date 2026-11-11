@@ -1005,6 +1005,7 @@ def _inspection_targets(
     suspected_components: list[dict[str, Any]] | None, *, knowledge: dict[str, Any] | None = None,
     inspection_history: list[dict[str, Any]] | None = None,
     measurements: list[Any] | None = None, allow_retest: bool = False,
+    symptoms: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Choose real targets, preferring compatible and not-yet-completed test profiles."""
     rows = registry.get("components", []) if isinstance(registry, dict) else []
@@ -1017,9 +1018,7 @@ def _inspection_targets(
     knowledge = knowledge or load_knowledge()
     profiles_by_type = knowledge.get("component_test_profiles", {}).get("profiles", {})
     catalog = knowledge.get("test_catalog", {}).get("tests", {})
-    visual_checks = [{"test_id": str(test_id), **test} for test_id, test in catalog.items()
-                     if isinstance(test, dict) and test.get("type") == "visual_inspection"] \
-        if isinstance(catalog, dict) else []
+    current_symptoms = set(str(value) for value in symptoms or [])
     completed: set[tuple[str, str, str]] = set()
     if not allow_retest:
         for item in inspection_history or []:
@@ -1051,6 +1050,11 @@ def _inspection_targets(
                      for item in hypotheses if isinstance(item, dict)]
         if not fault_ids:
             fault_ids = [str(details.get("fault_id") or details.get("fault_hypothesis") or "")]
+        component_subtype = str(row.get("subtype") or row.get("component_subtype") or "").casefold()
+        component_visual_checks = _compatible_visual_checks(
+            catalog, target_scope="component", component_type=component_type,
+            subtype=component_subtype, fault_ids=fault_ids, symptoms=current_symptoms,
+        )
         allowed_tests = []
         completed_test_count = 0
         for test_id, profile in tests.items() if isinstance(tests, dict) else []:
@@ -1068,8 +1072,9 @@ def _inspection_targets(
         ordinal = len(ordered)
         annotated = {**details, "component_type": component_type,
                      "available_tests": allowed_tests,
-                     "visual_checks": visual_checks,
+                     "visual_checks": component_visual_checks,
                      "inspection_kind": "MEASUREMENT" if allowed_tests else "VISUAL_ONLY",
+                     "component_subtype": component_subtype,
                      "completed_test_count": completed_test_count}
         ordered.append((str(board_id), annotated, reason, ordinal))
         used.add(str(board_id))
@@ -1103,6 +1108,186 @@ def _inspection_targets(
              "presence_status": by_id[board_id].get("presence_status"),
              "source_components": list(by_id[board_id].get("source_components", []))}
             for board_id, details, reason, _ordinal in ordered[:3]]
+
+
+def _measurement_record_dict(row: Any) -> dict[str, Any]:
+    if isinstance(row, dict):
+        return dict(row)
+    if hasattr(row, "to_dict"):
+        value = row.to_dict()
+        if isinstance(value, dict):
+            return value
+    if hasattr(row, "__dict__"):
+        return dict(vars(row))
+    return {}
+
+
+def _measurement_record_id(row: Any) -> str:
+    values = _measurement_record_dict(row)
+    identifier = values.get("measurement_id") or values.get("id") or getattr(row, "measurement_id", None)
+    if identifier is not None:
+        return str(identifier)
+    return "record:" + hashlib.sha256(json.dumps(
+        values, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()[:20]
+
+
+def _measurement_row_fingerprint(row: Any) -> str:
+    try:
+        return build_measurement_fingerprint([row])
+    except (TypeError, ValueError):
+        return build_measurement_fingerprint([_measurement_record_dict(row)])
+
+
+def _compatible_visual_checks(
+    catalog: dict[str, Any], *, target_scope: str, component_type: str = "",
+    subtype: str = "", fault_ids: list[str] | set[str] | tuple[str, ...] = (),
+    symptoms: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return only catalog visual checks whose target and evidence scope match."""
+    matched: list[dict[str, Any]] = []
+    fault_set = {str(value) for value in fault_ids if value}
+    symptom_set = symptoms or set()
+    for test_id, raw in catalog.items() if isinstance(catalog, dict) else []:
+        if not isinstance(raw, dict) or raw.get("type") != "visual_inspection":
+            continue
+        configured_scope = str(raw.get("target_scope") or "component")
+        scope_matches = configured_scope == target_scope or (
+            target_scope == "component" and configured_scope == "connector"
+            and component_type.casefold() == "connector"
+        )
+        if not scope_matches:
+            continue
+        applicable_types = {str(value).casefold() for value in raw.get("component_types", [])}
+        if target_scope != "board" and (not applicable_types or component_type.casefold() not in applicable_types):
+            continue
+        applicable_subtypes = {str(value).casefold() for value in raw.get("subtypes", [])}
+        if applicable_subtypes and subtype not in applicable_subtypes:
+            continue
+        relevant_faults = {str(value) for value in raw.get("fault_ids", [])}
+        relevant_symptoms = {str(value) for value in raw.get("symptom_codes", [])}
+        if relevant_faults or relevant_symptoms:
+            if not (fault_set & relevant_faults or symptom_set & relevant_symptoms):
+                continue
+        matched.append({"test_id": str(test_id), **raw})
+    return matched
+
+
+def _visual_observation_fingerprint(
+    *, board_id: str, test_id: str, target_scope: str, target_id: str | None,
+    result: str, observations: dict[str, Any], safety_checks: dict[str, bool],
+) -> str:
+    payload = {"board_id": board_id, "test_id": test_id, "target_scope": target_scope,
+               "target_id": target_id, "result": result, "observations": observations,
+               "safety_checks": safety_checks}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _render_visual_inspection(
+    st: Any, project: ProjectContext, workflow: dict[str, Any], *, test: dict[str, Any],
+    target_id: str | None, analysis_fingerprint: str | None, preview: bool,
+    widget_suffix: str, fault_id: str | None = None,
+    related_fault_ids: list[str] | None = None,
+) -> None:
+    test_id = str(test.get("test_id") or "")
+    scope = str(test.get("target_scope") or ("component" if target_id else "board"))
+    cycle_id = int((workflow.get("inspection_cycle") or {}).get("cycle_id", 0))
+    widget_instance = f"{widget_suffix}_cycle{cycle_id}"
+    st.caption(str(test.get("question") or test.get("name") or test_id))
+    safety_checks: dict[str, bool] = {}
+    if test.get("requires_power_off"):
+        safety_checks["power_disconnected"] = bool(st.checkbox(
+            "전원 입력을 분리했고 잔류 전압 위험을 확인했습니다",
+            key=f"cc_wf_visual_power_off_{widget_instance}_{test_id}",
+            help="전원 분리만으로 대용량 커패시터의 잔류 에너지가 안전하다고 판단할 수 없습니다.",
+        ))
+    if test.get("requires_stored_energy_safe"):
+        safety_checks["stored_energy_safe"] = bool(st.checkbox(
+            "저장 에너지가 안전하게 제거된 것을 확인했습니다",
+            key=f"cc_wf_visual_energy_safe_{widget_instance}_{test_id}",
+            help="확인할 수 없으면 기판이나 부품에 접촉하지 말고 검사를 중단하거나 전문가에게 맡기세요.",
+        ))
+    for condition in test.get("safety_conditions", []):
+        st.warning(str(condition))
+    result_key = f"cc_wf_visual_result_{widget_instance}_{test_id}"
+    visual_result = st.radio(
+        "외관 확인 결과", ("이상 발견", "눈에 띄는 이상 없음", "확인 불가"),
+        index=None, horizontal=True, key=result_key,
+        help="결과는 기본 선택되지 않습니다. 관찰한 결과를 직접 선택하세요.",
+    )
+    outcome_key = {"이상 발견": "damage_found", "눈에 띄는 이상 없음": "no_visible_damage"}.get(visual_result)
+    outcome = test.get("results", {}).get(outcome_key, {}) if outcome_key else {}
+    observations = (outcome.get("observations", {}) if isinstance(outcome, dict) else {})
+    if visual_result == "확인 불가":
+        observations = {}
+    safety_ok = (not test.get("requires_power_off") or safety_checks.get("power_disconnected", False)) \
+        and (not test.get("requires_stored_energy_safe") or safety_checks.get("stored_energy_safe", False))
+    observation_fingerprint = _visual_observation_fingerprint(
+        board_id=project.board_id or "", test_id=test_id, target_scope=scope,
+        target_id=target_id if scope != "board" else None,
+        result=str(visual_result or "UNSELECTED"), observations=observations,
+        safety_checks=safety_checks,
+    )
+    previous = [row for row in workflow.get("inspection_history", [])
+                if isinstance(row, dict) and row.get("observation_fingerprint") == observation_fingerprint
+                and row.get("verification_status") != "STALE"]
+    retest = st.checkbox("같은 외관 검사를 명시적으로 다시 기록", key=f"cc_wf_visual_retest_{widget_instance}_{test_id}")
+    if previous and not retest:
+        st.info("동일 대상·검사·결과의 기록이 이미 있습니다. 새로운 관측이 있거나 재검사를 선택한 경우에만 다시 기록할 수 있습니다.")
+    can_save = bool(visual_result) and safety_ok and not preview and (not previous or retest)
+    if st.button("외관 검사 기록", type="primary", disabled=not can_save,
+                 key=f"cc_wf_visual_save_{widget_instance}_{test_id}"):
+        cycle = workflow.get("inspection_cycle") or {}
+        cycle_id = int(cycle.get("cycle_id", 0))
+        history_id = hashlib.sha256(
+            f"visual|{cycle_id}|{observation_fingerprint}|{len(workflow.get('inspection_history', []))}".encode()
+        ).hexdigest()[:24]
+        row = {
+            "history_id": history_id, "board_component_id": target_id if scope != "board" else None,
+            "fault_id": fault_id, "test_id": test_id, "target_scope": scope,
+            "related_fault_ids": list(dict.fromkeys(related_fault_ids or ([fault_id] if fault_id else []))),
+            "result": visual_result, "safety_checks": safety_checks,
+            "observation_codes": sorted(observations),
+            "observations": observations,
+            "observation_fingerprint": observation_fingerprint,
+            "inspection_cycle_id": cycle_id,
+            "source_analysis_fingerprint": analysis_fingerprint,
+            "analysis_fingerprint": None,
+            "verification_status": (
+                "PENDING" if visual_result != "확인 불가"
+                and (fault_id or related_fault_ids) else "INCONCLUSIVE"
+            ),
+            "source": "user_visual_inspection",
+        }
+        diagnosis_key = f"cc_symptom_diagnosis_{project.project_id}"
+        diagnosis_state = st.session_state.setdefault(diagnosis_key, {})
+        manual = dict(diagnosis_state.get("manual_observations", {}))
+        has_new_observation = any(manual.get(code) != value for code, value in observations.items())
+        if observations and not has_new_observation:
+            row["verification_status"] = "INCONCLUSIVE"
+            row["verification_note"] = "기존과 같은 관측값으로 새 판별 정보가 없습니다."
+        if has_new_observation:
+            for old in workflow.get("inspection_history", []):
+                if (isinstance(old, dict) and old.get("source") == "user_visual_inspection"
+                        and old.get("board_component_id") == row["board_component_id"]
+                        and old.get("test_id") == test_id
+                        and old.get("verification_status") in {"FAULT_SUPPORTED", "FAULT_REFUTED", "CONFLICTED", "INCONCLUSIVE"}):
+                    old["verification_status"] = "STALE"
+        workflow.setdefault("inspection_history", []).append(row)
+        workflow["inspection_history"] = workflow["inspection_history"][-100:]
+        workflow.setdefault("inspection_observations", []).append(row.copy())
+        workflow["inspection_observations"] = workflow["inspection_observations"][-100:]
+        if observations and has_new_observation:
+            manual.update(observations)
+            diagnosis_state["manual_observations"] = manual
+            diagnosis_state["run_after_initial_answer"] = True
+            st.session_state[diagnosis_key] = diagnosis_state
+            _advance_workflow(st, project, WORKFLOW_REASSESSMENT,
+                              "외관 확인 결과를 기존 규칙 엔진으로 재평가 중",
+                              "visual_observation_saved")
+        else:
+            st.info("확인 불가 기록은 이력에만 저장했고 손상 근거로 사용하지 않았습니다.")
 
 
 def _render_workflow_stepper(st: Any, workflow: dict[str, Any]) -> None:
@@ -1146,7 +1331,8 @@ def _advance_workflow(st: Any, project: ProjectContext, stage: str, label: str, 
                              str(getattr(row, "fault_hypothesis", None) or ""),
                              str(getattr(row, "test_id", None) or "")))
             grouped.setdefault(pair, []).append(row)
-            grouped_ids.setdefault(pair, {})[str(row.measurement_id)] = build_measurement_fingerprint([row])
+            measurement_id = _measurement_record_id(row)
+            grouped_ids.setdefault(pair, {})[measurement_id] = _measurement_row_fingerprint(row)
         previous_cycle = workflow.get("inspection_cycle")
         cycle_id = int(previous_cycle.get("cycle_id", 0)) + 1 if isinstance(previous_cycle, dict) else 1
         workflow["inspection_cycle"] = {
@@ -1204,6 +1390,7 @@ def _render_workflow_candidates(
     targets = _inspection_targets(
         registry, candidates, suspects, inspection_history=workflow.get("inspection_history", []),
         measurements=all_measurements, allow_retest=allow_retest,
+        symptoms=(current_result.get("symptom_codes", []) if isinstance(current_result, dict) else []),
     )
     workflow["candidate_ids"] = [str(row.get("board_component_id") or row.get("component_id"))
                                   for row in candidates]
@@ -1304,50 +1491,52 @@ def _render_workflow_candidates(
             component_map_version=registry.get("version"), board_registry=registry,
             compact=True, fault_hypothesis=fault_id, recommended_test_id=test_id,
         )
-    else:
-        visual_checks = target.get("visual_checks", [])
-        if visual_checks:
-            visual_key = f"cc_wf_visual_{project.project_id}_{selected_id}"
-            visual_ids = [str(row["test_id"]) for row in visual_checks]
-            visual_id = st.selectbox(
-                "안전한 추가 확인", visual_ids, key=visual_key,
-                format_func=lambda value: next((row.get("name", value) for row in visual_checks
-                                                if row["test_id"] == value), value),
-            )
-            visual_test = next(row for row in visual_checks if row["test_id"] == visual_id)
-            st.caption(str(visual_test.get("question") or "카탈로그에 등록된 외관 확인을 진행하세요."))
-            visual_result = st.radio(
-                "외관 확인 결과", ("이상 발견", "눈에 띄는 이상 없음", "확인 불가"),
-                horizontal=True, key=f"{visual_key}_result",
-            )
-            if st.button("외관 확인 기록 및 재판정", type="primary", disabled=preview,
-                         key=f"{visual_key}_save"):
-                outcome_key = {"이상 발견": "damage_found", "눈에 띄는 이상 없음": "no_visible_damage"}.get(visual_result)
-                outcome = (visual_test.get("results", {}).get(outcome_key, {})
-                           if outcome_key else {})
-                observations = outcome.get("observations", {}) if isinstance(outcome, dict) else {}
-                diagnosis_state_key = f"cc_symptom_diagnosis_{project.project_id}"
-                diagnosis_state = st.session_state.setdefault(diagnosis_state_key, {})
-                manual_observations = dict(diagnosis_state.get("manual_observations", {}))
-                manual_observations.update(observations)
-                diagnosis_state["manual_observations"] = manual_observations
-                diagnosis_state["run_after_initial_answer"] = True
-                st.session_state[diagnosis_state_key] = diagnosis_state
-                workflow["inspection_observations"] = [
-                    *workflow.get("inspection_observations", []),
-                    {"board_component_id": selected_id, "test_id": visual_id,
-                     "result": visual_result, "observations": dict(observations),
-                     "source": "user_visual_inspection",
-                     "analysis_fingerprint": analysis_snapshot.get("input_fingerprint")},
-                ][-100:]
-                _advance_workflow(st, project, WORKFLOW_REASSESSMENT,
-                                  "외관 확인 결과를 기존 규칙 엔진으로 재평가 중",
-                                  "visual_observation_saved")
+    visual_checks = _compatible_visual_checks(
+        load_knowledge().get("test_catalog", {}).get("tests", {}),
+        target_scope="component", component_type=str(target.get("component_type") or ""),
+        subtype=str(target.get("component_subtype") or ""),
+        fault_ids=[fault_id] if fault_id else [],
+        symptoms=(set(current_result.get("symptom_codes", [])) if isinstance(current_result, dict) else set()),
+    )
+    if visual_checks:
+        st.markdown("##### 소자별 육안 검사")
+    for visual_test in visual_checks:
+        _render_visual_inspection(
+            st, project, workflow, test=visual_test, target_id=selected_id,
+            analysis_fingerprint=analysis_snapshot.get("input_fingerprint"), preview=preview,
+            widget_suffix=f"{project.project_id}_{selected_id}", fault_id=fault_id,
+        )
+    # Board-wide checks are never attached to an arbitrary component candidate.
+    board_symptoms = set(current_result.get("symptom_codes", [])) if isinstance(current_result, dict) else set()
+    catalog = load_knowledge().get("test_catalog", {}).get("tests", {})
+    possible_board_faults = {
+        str(fault_id) for test_row in catalog.values() if isinstance(test_row, dict)
+        and test_row.get("type") == "visual_inspection" and test_row.get("target_scope") == "board"
+        for fault_id in test_row.get("fault_ids", [])
+    } if isinstance(catalog, dict) else set()
+    board_fault_ids = [str(row.get("fault_id") or "") for row in (
+        current_result.get("hypotheses", []) if isinstance(current_result, dict) else [])
+        if isinstance(row, dict) and str(row.get("fault_id") or "") in possible_board_faults]
+    board_visual_checks = _compatible_visual_checks(
+        catalog,
+        target_scope="board", symptoms=board_symptoms,
+        fault_ids=board_fault_ids,
+    )
+    if board_visual_checks:
+        with st.expander("기판 전체 외관 검사", expanded=False):
+            for visual_test in board_visual_checks:
+                _render_visual_inspection(
+                    st, project, workflow, test=visual_test, target_id=None,
+                    analysis_fingerprint=analysis_snapshot.get("input_fingerprint"), preview=preview,
+                    widget_suffix=f"{project.project_id}_board",
+                    related_fault_ids=[fault_id for fault_id in board_fault_ids
+                                       if fault_id in visual_test.get("fault_ids", [])],
+                )
     connected = [row for row in all_measurements
                  if str(getattr(row, "board_component_id", None) or "") == selected_id
                  and str(getattr(row, "test_id", None) or "") == str(test_id or "")
                  and (not fault_id or getattr(row, "fault_hypothesis", None) in {None, fault_id})]
-    workflow["measurement_ids"] = [row.measurement_id for row in all_measurements]
+    workflow["measurement_ids"] = [_measurement_record_id(row) for row in all_measurements]
     cycle = workflow.get("inspection_cycle")
     if not isinstance(cycle, dict):
         cycle = {"cycle_id": 1, "baseline_by_pair": {}}
@@ -1360,13 +1549,13 @@ def _render_workflow_candidates(
         cycle.setdefault("baseline_by_pair", {})[pair_key] = baseline_fingerprint
     has_new_measurement = bool(connected) and current_measurement_fingerprint != baseline_fingerprint
     baseline_records = cycle.get("baseline_record_fingerprints", {}).get(pair_key, {})
-    changed_measurement_ids = [str(row.measurement_id) for row in connected
-                               if baseline_records.get(str(row.measurement_id))
-                               != build_measurement_fingerprint([row])]
+    changed_measurement_ids = [_measurement_record_id(row) for row in connected
+                               if baseline_records.get(_measurement_record_id(row))
+                               != _measurement_row_fingerprint(row)]
     cycle["active_pair_key"] = pair_key
     cycle["current_pair_fingerprint"] = current_measurement_fingerprint
     cycle["baseline_pair_fingerprint"] = baseline_fingerprint
-    cycle["connected_measurement_ids"] = [row.measurement_id for row in connected]
+    cycle["connected_measurement_ids"] = [_measurement_record_id(row) for row in connected]
     cycle["changed_measurement_ids"] = changed_measurement_ids
     if connected and has_new_measurement:
         st.success(f"새 검사 주기의 기록 {len(connected)}개 · 재판단 가능")
@@ -1378,7 +1567,7 @@ def _render_workflow_candidates(
             *workflow.get("reassessment_history", []),
             {"target_id": selected_id, "board_component_id": selected_id,
              "fault_id": fault_id, "test_id": test_id,
-             "measurement_ids": [row.measurement_id for row in connected],
+             "measurement_ids": [_measurement_record_id(row) for row in connected],
              "changed_measurement_ids": changed_measurement_ids,
              "measurement_fingerprint": current_measurement_fingerprint,
              "verification_status": "PENDING",
@@ -1409,7 +1598,8 @@ def _render_workflow_reassessment(
     result = latest["result"]
     fingerprint = latest.get("input_fingerprint")
     if fingerprint and (not workflow.get("reassessment_history")
-                        or workflow["reassessment_history"][-1].get("analysis_fingerprint") != fingerprint):
+                        or (workflow["reassessment_history"][-1].get("analysis_fingerprint") != fingerprint
+                            and workflow["reassessment_history"][-1].get("verification_status") != "PENDING")):
         if workflow.get("reassessment_history"):
             workflow["reassessment_history"][-1]["analysis_fingerprint"] = fingerprint
         else:
@@ -1439,7 +1629,38 @@ def _render_workflow_reassessment(
             st.caption("반대 근거 · " + (" · ".join(map(str, opposing)) or "없음"))
     measurements = get_measurements(st.session_state, project_id=project.project_id,
                                     board_id=project.board_id or "")
-    by_id = {str(row.measurement_id): row for row in measurements}
+    by_id = {_measurement_record_id(row): row for row in measurements}
+    manual_observations = st.session_state.get(
+        f"cc_symptom_diagnosis_{project.project_id}", {}
+    ).get("manual_observations", {})
+    for entry in workflow.get("inspection_history", []):
+        if not isinstance(entry, dict) or entry.get("source") != "user_visual_inspection":
+            continue
+        observations = entry.get("observations", {})
+        if any(manual_observations.get(code) != value for code, value in observations.items()):
+            if entry.get("verification_status") != "STALE":
+                entry["verification_status"] = "STALE"
+        elif (entry.get("analysis_fingerprint") and fingerprint
+              and entry.get("analysis_fingerprint") != fingerprint
+              and entry.get("verification_status") not in {"PENDING", "STALE"}):
+            entry["verification_status"] = "STALE"
+    for event in workflow.get("reassessment_history", []):
+        if not isinstance(event, dict) or not event.get("measurement_ids"):
+            continue
+        current_rows = [by_id[str(mid)] for mid in event.get("measurement_ids", []) if str(mid) in by_id]
+        current_fp = build_measurement_fingerprint(current_rows)
+        if len(current_rows) != len(event.get("measurement_ids", [])) or (
+                event.get("measurement_fingerprint") and current_fp != event.get("measurement_fingerprint")):
+            event["verification_status"] = "STALE"
+    for entry in workflow.get("inspection_history", []):
+        if (not isinstance(entry, dict) or entry.get("source") != "measurement_reassessment"
+                or not entry.get("measurement_ids")):
+            continue
+        current_rows = [by_id[str(mid)] for mid in entry.get("measurement_ids", []) if str(mid) in by_id]
+        current_fp = build_measurement_fingerprint(current_rows)
+        if len(current_rows) != len(entry.get("measurement_ids", [])) or (
+                entry.get("measurement_fingerprint") and current_fp != entry.get("measurement_fingerprint")):
+            entry["verification_status"] = "STALE"
     if workflow.get("reassessment_history"):
         active_cycle = workflow["reassessment_history"][-1]
         changed_ids = set(str(value) for value in active_cycle.get("changed_measurement_ids", []))
@@ -1455,37 +1676,102 @@ def _render_workflow_reassessment(
                 f"검증 {getattr(measured, 'verification_status', '미확인')} · "
                 f"기준 {getattr(measured, 'reference_source', None) or '출처 미확인'}"
             )
-    if workflow.get("reassessment_history"):
-        latest_cycle = workflow["reassessment_history"][-1]
-        if latest_cycle.get("verification_status") == "PENDING":
-            hypotheses_by_key = {}
-            for candidate in candidates:
-                for hypothesis in candidate.get("fault_hypotheses", []):
-                    hypotheses_by_key[(str(candidate.get("board_component_id") or candidate.get("component_id")),
-                                       str(hypothesis.get("fault_id") or hypothesis.get("fault_hypothesis") or ""))] = hypothesis
-            verified_hypothesis = hypotheses_by_key.get((
-                str(latest_cycle.get("board_component_id") or latest_cycle.get("target_id") or ""),
-                str(latest_cycle.get("fault_id") or ""),
-            ), {})
-            status = str(verified_hypothesis.get("visual_status") or verified_hypothesis.get("measurement_verdict") or "INCONCLUSIVE").upper()
-            latest_cycle["verification_status"] = {
-                "SUPPORTS": "FAULT_SUPPORTED", "REFUTES": "FAULT_REFUTED",
-                "CONFLICTED": "CONFLICTED", "INCONCLUSIVE": "INCONCLUSIVE",
-                "NON_DIAGNOSTIC": "INCONCLUSIVE", "FAULT_SUPPORTED": "FAULT_SUPPORTED",
-                "FAULT_REFUTED": "FAULT_REFUTED",
-            }.get(status, "INCONCLUSIVE")
-            latest_cycle["measurement_fingerprint"] = build_measurement_fingerprint(
-                [by_id[mid] for mid in latest_cycle.get("measurement_ids", []) if mid in by_id]
-            )
+    def _hypothesis_status(target_id: str | None, fault_id: str | None) -> str | None:
+        if not fault_id:
+            return None
+        hypothesis = None
+        if target_id:
+            hypothesis = next((row for candidate in candidates
+                               if str(candidate.get("board_component_id") or candidate.get("component_id")) == target_id
+                               for row in candidate.get("fault_hypotheses", [])
+                               if str(row.get("fault_id") or row.get("fault_hypothesis") or "") == fault_id), None)
+        else:
+            hypothesis = next((row for row in result.get("hypotheses", [])
+                               if isinstance(row, dict)
+                               and str(row.get("fault_id") or row.get("fault_hypothesis") or "") == fault_id), None)
+        if not isinstance(hypothesis, dict):
+            return None
+        raw = str(hypothesis.get("measurement_verdict") or hypothesis.get("visual_status") or "").casefold()
+        return {"fault_supported": "FAULT_SUPPORTED", "supports": "FAULT_SUPPORTED",
+                "supported": "FAULT_SUPPORTED", "fault_refuted": "FAULT_REFUTED", "refutes": "FAULT_REFUTED",
+                "refuted": "FAULT_REFUTED",
+                "conflicted": "CONFLICTED", "inconclusive": "INCONCLUSIVE",
+                "non_diagnostic": "INCONCLUSIVE", "suspected": "INCONCLUSIVE"}.get(raw)
+
+    confirmed_ids = {str(row.get("history_id")) for row in workflow.get("inspection_history", [])
+                     if isinstance(row, dict) and row.get("history_id")}
+    for visual in workflow.get("inspection_history", []):
+        if (not isinstance(visual, dict) or visual.get("source") != "user_visual_inspection"
+                or visual.get("verification_status") != "PENDING"):
+            continue
+        if not fingerprint or fingerprint == visual.get("source_analysis_fingerprint"):
+            continue
+        current_facts = result.get("observations", {})
+        if any(current_facts.get(code) != value
+               for code, value in visual.get("observations", {}).items()):
+            continue
+        target_fault_ids = visual.get("related_fault_ids") or (
+            [visual.get("fault_id")] if visual.get("fault_id") else [])
+        resolved = [_hypothesis_status(visual.get("board_component_id"), fault_id)
+                    for fault_id in target_fault_ids]
+        resolved = [value for value in resolved if value]
+        status = ("CONFLICTED" if {"FAULT_SUPPORTED", "FAULT_REFUTED"} <= set(resolved)
+                  else resolved[0] if resolved else None)
+        if status is None:
+            continue
+        visual["verification_status"] = status
+        visual["analysis_fingerprint"] = fingerprint
+        if visual.get("history_id") not in confirmed_ids:
+            workflow.setdefault("inspection_history", []).append(visual.copy())
+            confirmed_ids.add(str(visual.get("history_id")))
+
+    for event in workflow.get("reassessment_history", []):
+        if (not isinstance(event, dict) or event.get("verification_status") != "PENDING"
+                or not fingerprint or fingerprint == event.get("analysis_fingerprint")):
+            continue
+        if not event.get("measurement_ids") or len(
+                [mid for mid in event["measurement_ids"] if str(mid) in by_id]
+        ) != len(event["measurement_ids"]):
+            event["verification_status"] = "STALE"
+            continue
+        evidence_rows = [row for row in result.get("measurement_evidence", [])
+                         if isinstance(row, dict)]
+        evidenced_ids = {
+            str(row.get("measurement_id")) for row in evidence_rows
+            if str(row.get("test_id") or "") == str(event.get("test_id") or "")
+            and str(row.get("fault_hypothesis") or "") == str(event.get("fault_id") or "")
+            and str(row.get("component_id") or "") in {
+                str(event.get("board_component_id") or ""), str(event.get("target_id") or ""),
+            }
+        }
+        if not set(str(mid) for mid in event["measurement_ids"]) <= evidenced_ids:
+            continue
+        status = _hypothesis_status(
+            str(event.get("board_component_id") or event.get("target_id") or ""),
+            str(event.get("fault_id") or ""),
+        )
+        if status is None:
+            continue
+        event["verification_status"] = status
+        event["analysis_fingerprint"] = fingerprint
+        event["measurement_fingerprint"] = build_measurement_fingerprint(
+            [by_id[str(mid)] for mid in event["measurement_ids"]]
+        )
+        history_id = hashlib.sha256(
+            f"measurement|{event.get('board_component_id')}|{event.get('fault_id')}|"
+            f"{event.get('test_id')}|{event.get('measurement_fingerprint')}|{fingerprint}".encode()
+        ).hexdigest()[:24]
+        if history_id not in confirmed_ids:
             workflow.setdefault("inspection_history", []).append({
-                "board_component_id": latest_cycle.get("board_component_id"),
-                "target_id": latest_cycle.get("board_component_id"),
-                "fault_id": latest_cycle.get("fault_id"), "test_id": latest_cycle.get("test_id"),
-                "measurement_ids": list(latest_cycle.get("measurement_ids", [])),
-                "measurement_fingerprint": latest_cycle.get("measurement_fingerprint"),
-                "verification_status": latest_cycle["verification_status"],
-                "analysis_fingerprint": latest_cycle.get("analysis_fingerprint"),
+                "history_id": history_id, "board_component_id": event.get("board_component_id"),
+                "fault_id": event.get("fault_id"), "test_id": event.get("test_id"),
+                "measurement_ids": list(event.get("measurement_ids", [])),
+                "measurement_fingerprint": event.get("measurement_fingerprint"),
+                "verification_status": status, "analysis_fingerprint": fingerprint,
+                "inspection_cycle_id": (workflow.get("inspection_cycle") or {}).get("cycle_id"),
+                "source": "measurement_reassessment",
             })
+            confirmed_ids.add(history_id)
     st.caption(f"보존된 측정 기록 · {len(measurements)}개")
     return latest
 
@@ -1556,6 +1842,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                     inspection_history=workflow.get("inspection_history", []),
                     measurements=get_measurements(st.session_state, project_id=project.project_id,
                                                   board_id=project.board_id or ""),
+                    symptoms=(live_result.get("symptom_codes", []) if isinstance(live_result, dict) else []),
                 )
                 workflow["candidate_ids"] = [str(row.get("board_component_id") or row.get("component_id"))
                                               for row in live_candidates]

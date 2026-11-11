@@ -75,7 +75,15 @@ tests:
     name: 전원 커넥터 외관 확인
     type: visual_inspection
     risk_level: low
+    component_types: [connector]
+    target_scope: connector
+    fault_ids: [CONNECTOR_CONTACT_FAILURE]
+    symptom_codes: [CONNECTOR_MOVEMENT_AFFECTS, INTERMITTENT_OPERATION, NO_POWER]
     requires_power_off: true
+    requires_stored_energy_safe: true
+    safety_conditions:
+      - "전원을 분리하고 잔류 전하가 안전하게 제거되었음을 확인하세요. 확인할 수 없으면 검사하지 마세요."
+    observation_codes: [VISIBLE_CONNECTOR_DAMAGE]
     question: 전원을 안전하게 차단한 뒤 전원 커넥터의 헐거움·변형·오염을 눈으로 확인하세요.
     results:
       damage_found: {observations: {VISIBLE_CONNECTOR_DAMAGE: true}}
@@ -84,7 +92,15 @@ tests:
     name: 발열 부위 외관 확인
     type: visual_inspection
     risk_level: low
+    component_types: [capacitor, diode, heatsink, ic, inductor, led, resistor, relay, transformer, transistor]
+    target_scope: component
+    fault_ids: [CAPACITOR_OPEN_OR_DEGRADED, DIODE_LEAKAGE_FAILURE, DIODE_SHORT_FAILURE, HEATSINK_THERMAL_CONTACT, IC_INTERNAL_FAILURE, INDUCTOR_FAILURE, RESISTOR_FAILURE, TRANSFORMER_FAILURE, TRANSISTOR_FAILURE]
+    symptom_codes: [DELAYED_FAILURE, LOCALIZED_HEATING, OVERHEATING]
     requires_power_off: true
+    requires_stored_energy_safe: true
+    safety_conditions:
+      - "전원을 분리하고 보드가 식었는지 확인하세요. 대용량 커패시터 등 잔류 에너지를 안전하게 확인할 수 없으면 접촉하지 말고 전문가에게 맡기세요."
+    observation_codes: [VISIBLE_HEAT_DAMAGE]
     question: 전원을 차단하고 식힌 뒤 변색·그을림·부품 손상을 확인하세요.
     results:
       damage_found: {observations: {VISIBLE_HEAT_DAMAGE: true}}
@@ -93,7 +109,15 @@ tests:
     name: 납땜·패턴 외관 확인
     type: visual_inspection
     risk_level: low
+    component_types: []
+    target_scope: board
+    fault_ids: [PCB_TRACE_OPEN, PCB_TRACE_SHORT, SOLDER_JOINT_FAILURE, UNKNOWN_CONNECTION_FAILURE]
+    symptom_codes: [CONNECTOR_MOVEMENT_AFFECTS, INTERMITTENT_OPERATION, NO_POWER, PARTIAL_FUNCTION_FAILURE, SUPPLY_VOLTAGE_DROOP]
     requires_power_off: true
+    requires_stored_energy_safe: true
+    safety_conditions:
+      - "전원을 분리하고 저장 에너지가 안전하게 제거되었는지 확인하세요. 확인할 수 없으면 기판에 접촉하지 말고 검사를 중단하세요."
+    observation_codes: [VISIBLE_SOLDER_DAMAGE]
     question: 전원을 차단하고 저장 에너지가 안전하게 제거된 뒤 납땜 균열·패턴 손상을 육안으로 확인하세요.
     results:
       damage_found: {observations: {VISIBLE_SOLDER_DAMAGE: true}}
