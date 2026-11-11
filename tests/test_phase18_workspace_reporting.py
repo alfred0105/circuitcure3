@@ -486,9 +486,9 @@ def test_streamlit_app_uses_photo_diagnosis_entry_only() -> None:
     script = Path(__file__).resolve().parents[1] / "src/circuitcare/ui.py"
     app = AppTest.from_file(str(script), default_timeout=30).run()
     assert not app.exception
-    assert any("새 PCB 진단" in item.value for item in app.markdown)
-    assert len(app.file_uploader) == 2
-    assert any(item.label == "진단 시작" and item.disabled for item in app.button)
+    assert any("PCB 사진으로 고장 원인 찾기" in item.value for item in app.markdown)
+    assert len(app.file_uploader) == 1
+    assert any(item.label == "분석 시작" and item.disabled for item in app.button)
     assert "active_analysis_view" not in app.session_state
 
 

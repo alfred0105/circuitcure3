@@ -683,6 +683,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         analysis_target_id=analysis_scope.target_id,
         component_id_aliases=aliases,
         board_registry=board_registry if board_mode else None,
+        auto_qwen=True,
     )
     analysis_state = analysis_snapshot["record"]
     # Legacy photo analyses and Component Map verdicts do not paint the board.
@@ -930,6 +931,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
         st, project, components=snapshot_components, component_inventory=component_inventory,
         analysis_target_id=analysis_target_id, component_id_aliases=measurement_aliases,
         board_registry=board_registry, suspected_components=suspected_components,
+        auto_qwen=True,
     )
 
     title, add_photo, edit, new = st.columns([5, 1, 1, 1])
@@ -963,34 +965,28 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
         st.rerun()
 
     preview = st.session_state.get(MODE_KEY) == "PREVIEW_ONLY"
+    # The general-user workspace is one continuous flow: persistent PCB on the
+    # left, and component → symptom → candidate → measurement → report on right.
+    st.session_state[f"cc_candidate_strategy_{project.project_id}"] = (
+        "candidate_fusion_v1" if isinstance(live_analysis_snapshot.get("result"), dict)
+        and isinstance(live_analysis_snapshot["result"].get("candidate_fusion"), dict) else "baseline"
+    )
     with st.container(key="cc_workbench_body"):
-        panel_key = f"cc_workbench_panel_{project.project_id}"
-        modes = ("검수", "증상", "원인", "측정")
-        if panel_key not in st.session_state:
-            legacy_view = st.session_state.get(f"cc_workbench_view_{project.project_id}")
-            st.session_state[panel_key] = "증상" if legacy_view == "고장 분석" else "검수"
-        if st.session_state.get(panel_key) not in modes:
-            st.session_state[panel_key] = "검수"
         left, right = st.columns([1.85, 1], gap="large")
         with left:
             _render_pcb(st, project, st.session_state.get(INTAKE_IMAGES_KEY, []))
         with right:
-            st.radio("작업 패널", modes, horizontal=True, key=panel_key,
-                     label_visibility="collapsed")
-            selected_mode = st.session_state[panel_key]
-            if selected_mode == "검수":
-                _render_component_inspector(st, project, preview)
-            else:
-                _render_fault_analysis_workspace(
-                    st, project, preview, mode=selected_mode,
-                    analysis_snapshot=live_analysis_snapshot,
-                    photo_snapshot=photo_snapshot,
-                    board_registry=board_registry,
-                    board_components=snapshot_components,
-                    component_id_aliases=measurement_aliases,
-                    analysis_target_id=analysis_target_id,
-                    suspected_components=suspected_components,
-                )
+            _render_component_inspector(st, project, preview, compact=True)
+            _render_fault_analysis_workspace(
+                st, project, preview, mode="통합",
+                analysis_snapshot=live_analysis_snapshot,
+                photo_snapshot=photo_snapshot,
+                board_registry=board_registry,
+                board_components=snapshot_components,
+                component_id_aliases=measurement_aliases,
+                analysis_target_id=analysis_target_id,
+                suspected_components=suspected_components,
+            )
 
 
 def _selected_component(st: Any) -> ComponentOverlayViewModel | None:
@@ -1037,7 +1033,7 @@ def _handle_measurement_target_change(
                      selected_component=source.get("component_id"))
 
 
-def _render_component_inspector(st: Any, project: ProjectContext, preview: bool) -> None:
+def _render_component_inspector(st: Any, project: ProjectContext, preview: bool, *, compact: bool = False) -> None:
     current_components = tuple(st.session_state.get("circuitcare_v4_current_components", ()))
     render_inspection_panel(
         st, project, preview=preview, components=current_components,
@@ -1049,7 +1045,10 @@ def _render_component_inspector(st: Any, project: ProjectContext, preview: bool)
         review_image_bytes=st.session_state.get("cc_active_component_review_image"),
         review_scope=st.session_state.get("cc_active_component_review_scope"),
         board_registry=st.session_state.get("circuitcare_v7_active_board_registry"),
+        compact=compact,
     )
+    if compact:
+        return
     review_image = st.session_state.get("cc_active_component_review_image")
     review_scope = st.session_state.get("cc_active_component_review_scope")
     summary = st.session_state.get("circuitcare_v4_detection_summary", {})
@@ -1169,6 +1168,7 @@ def _render_fault_analysis_workspace(
             component_inventory=inventory,
             analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
             board_registry=board_registry, suspected_components=suspected_components,
+            auto_qwen=True,
         )
     selection = st.session_state.get(SELECTION_KEY)
     selected = _selected_component(st)
@@ -1177,7 +1177,58 @@ def _render_fault_analysis_workspace(
     inventories = st.session_state.get(COMPONENT_INVENTORY_KEY, {})
     inventory = inventories.get(owner, {}) if isinstance(inventories, dict) else {}
     result = analysis_snapshot.get("result")
-    labels = {"증상": "증상 입력", "원인": "원인 분석", "측정": "측정 검증"}
+    labels = {"증상": "AI 진단", "원인": "AI 진단", "측정": "측정 확인", "통합": "AI 진단"}
+    if mode == "통합":
+        render_symptom_diagnosis_panel(
+            st, project, components=components, preview=preview,
+            component_inventory=({"__board_registry__": {"registry_version": board_registry.get("version")}}
+                                 if isinstance(board_registry, dict) else inventory),
+            analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
+            board_registry=board_registry, suspected_components=suspected_components,
+            simple_ui=True,
+        )
+        current = current_analysis_snapshot(
+            st, project, components=components,
+            component_inventory=({"__board_registry__": {"registry_version": board_registry.get("version")}}
+                                 if isinstance(board_registry, dict) else inventory),
+            analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
+            board_registry=board_registry, suspected_components=suspected_components,
+            auto_qwen=True,
+        )
+        current_result = current.get("result") if current.get("record", {}).get("status") == AnalysisStatus.CURRENT.value else None
+        if not isinstance(current_result, dict):
+            return
+        strategy = "candidate_fusion_v1" if isinstance(current_result.get("candidate_fusion"), dict) else "baseline"
+        candidates = _simple_candidate_rows(current_result)
+        candidate_id = str(candidates[0].get("board_component_id") or candidates[0].get("component_id")) if candidates else None
+        measurement_component = next((item for item in components
+                                      if candidate_id and (item.board_component_id == candidate_id
+                                                           or item.component_id == candidate_id)), None)
+        if measurement_component is None and selected is not None:
+            measurement_component = selected
+        if candidates or get_measurements(st.session_state, project_id=project.project_id,
+                                          board_id=project.board_id or ""):
+            st.markdown("#### 다음 확인 · 측정")
+            render_measurement_panel(
+                st, project, selected_component=measurement_component, preview=preview,
+                component_map_version=(board_registry.get("version") if isinstance(board_registry, dict)
+                                       else st.session_state.get(MAP_VERSION_KEY)),
+                board_registry=board_registry, compact=True,
+            )
+        if isinstance(board_registry, dict):
+            with st.popover("진단 보고서 다운로드"):
+                report_snapshot = build_pcb_diagnostic_snapshot(
+                    root=Path(__file__).resolve().parents[4], project=project,
+                    registry=board_registry, analysis_snapshot=current,
+                    photos=st.session_state.get(INTAKE_IMAGES_KEY, []),
+                    selected_board_component_id=st.session_state.get(BOARD_COMPONENT_SELECTION_KEY),
+                    candidate_strategy=strategy,
+                )
+                render_report_panel(
+                    st, snapshot=report_snapshot, root=Path(__file__).resolve().parents[4],
+                    workspace_id=project.project_id, expected_circuit_hash=None,
+                )
+        return
     with st.container(border=True):
         st.markdown(f'<div class="cc-analysis-step">{labels.get(mode, "분석")}</div>', unsafe_allow_html=True)
         st.markdown('<div class="cc-analysis-copy">규칙 기반 결과를 기준으로 표시합니다. 후보는 측정으로 검증되기 전까지 미확정 가설입니다.</div>', unsafe_allow_html=True)

@@ -22,13 +22,13 @@ def test_photo_upload_enters_current_pcb_workbench():
     root = Path(__file__).resolve().parents[1]
     app = AppTest.from_file(str(root / "src/circuitcare/ui.py"), default_timeout=30).run()
     app.file_uploader[0].set_value(("board.png", _photo((20, 90, 140)), "image/png")).run()
-    next(widget for widget in app.button if widget.label == "진단 시작").click().run()
+    next(widget for widget in app.button if widget.label == "분석 시작").click().run()
 
     assert not app.exception
     assert app.session_state[INTAKE_PROJECT_KEY].image_records
     assert app.session_state["circuitcare_v2_screen"] == "workbench"
-    assert any("소자 탐지" in item.label for item in app.expander)
-    assert not any(widget.label == "PCB 사진 인식" for widget in app.button)
+    assert any("AI 진단" in item.value for item in app.markdown)
+    assert not any(widget.label in {"작업 패널", "후보 표시 전략"} for widget in app.radio)
 
 
 @pytest.mark.stress
@@ -43,7 +43,7 @@ def test_twenty_photo_project_transitions_keep_app_live():
             next(widget for widget in app.button if widget.label == "새 프로젝트").click().run()
         photo = _photo((index * 9 % 255, 60, 120))
         app.file_uploader[0].set_value((f"board-{index}.png", photo, "image/png")).run()
-        next(widget for widget in app.button if widget.label == "진단 시작").click().run()
+        next(widget for widget in app.button if widget.label == "분석 시작").click().run()
         assert not app.exception
         assert app.session_state[INTAKE_PROJECT_KEY].image_records
         assert app.session_state["circuitcare_v2_screen"] == "workbench"

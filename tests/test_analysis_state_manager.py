@@ -7,6 +7,7 @@ from circuitcare.analysis.state_manager import (
     get_current_state, invalidate_analysis,
 )
 from circuitcare.dashboard.views.symptom_diagnosis_panel import current_analysis_snapshot
+from circuitcare.dashboard.views import symptom_diagnosis_panel as symptoms
 from circuitcare.frontend.models import ImageRecord, ProjectContext, SelectionState
 from circuitcare.frontend.board_component_registry import (
     build_board_component_registry, current_source_observation_fingerprint,
@@ -147,6 +148,22 @@ def test_live_snapshot_ignores_viewer_controls_and_isolates_photo_scope():
     other_photo = current_analysis_snapshot(st, project)
     assert other_photo["scope"].target_id == "photo-2"
     assert other_photo["result"] is None
+
+
+def test_simple_symptom_prompt_and_text_invalidate_current_analysis(monkeypatch):
+    project = ProjectContext("simple-p", "simple-b")
+    state = {f"{symptoms._project_key(project)}_simple_initial_symptom": "기타·모르겠음"}
+    st = type("FakeStreamlit", (), {"session_state": state})()
+    monkeypatch.setattr(symptoms, "_auto_qwen_model", lambda _state: "qwen3.5:9b")
+    first = current_analysis_snapshot(st, project, auto_qwen=True)
+    run_id = begin_analysis(state, scope=first["scope"], fingerprints=first["fingerprints"])
+    assert commit_analysis_result(state, scope=first["scope"], run_id=run_id,
+                                  fingerprints=first["fingerprints"], result={"status": "OK"})
+
+    state[f"{symptoms._project_key(project)}_simple_initial_symptom"] = "전원 안 켜짐"
+    changed = current_analysis_snapshot(st, project, auto_qwen=True)
+    assert changed["result"] is None
+    assert changed["record"]["status"] == AnalysisStatus.STALE
 
 
 def test_board_analysis_scope_survives_photo_switch_and_stales_on_registry_change():

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from circuitcare.dashboard.views import unified_workspace as workspace
+from circuitcare.dashboard.views import symptom_diagnosis_panel as symptoms
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.frontend.workbench_state import SELECTION_KEY, enter_workbench
 from circuitcare.dashboard.views.symptom_diagnosis_panel import candidate_focus_widget_key
@@ -110,7 +111,7 @@ def test_measurement_target_changes_shared_selection_only_when_callback_runs():
     assert state[SELECTION_KEY].selected_component == "R8"
 
 
-def test_fixed_viewer_shell_keeps_pcb_visible_and_only_renders_selected_task(monkeypatch):
+def test_fixed_viewer_shell_keeps_pcb_visible_and_renders_single_diagnosis_flow(monkeypatch):
     project = ProjectContext("project-shell", "board-shell")
     registry = {"project_id": project.project_id, "board_id": project.board_id,
                 "version": "board-registry:v1", "components": []}
@@ -125,13 +126,45 @@ def test_fixed_viewer_shell_keeps_pcb_visible_and_only_renders_selected_task(mon
     monkeypatch.setattr(workspace, "_render_fault_analysis_workspace",
                         lambda _st, _project, _preview, **kwargs: calls.append(kwargs["mode"]))
 
-    for mode, expected in (("검수", "review"), ("증상", "증상"), ("원인", "원인"), ("측정", "측정")):
-        state = {}
-        enter_workbench(state, project)
-        state[f"cc_workbench_panel_{project.project_id}"] = mode
-        calls.clear()
-        workspace.render_workbench_shell(_StreamlitStub(state=state), project)
-        assert calls == ["viewer", expected]
+    state = {}
+    enter_workbench(state, project)
+    state[f"cc_workbench_panel_{project.project_id}"] = "원인"  # ignored legacy navigation state
+    workspace.render_workbench_shell(_StreamlitStub(state=state), project)
+    assert calls == ["viewer", "review", "통합"]
+
+
+def test_simple_candidate_list_aggregates_faults_by_physical_component():
+    result = {"candidate_fusion": {"top_candidates": [
+        {"board_component_id": "BC-1", "fault_id": "F-A", "score": 8},
+        {"board_component_id": "BC-1", "fault_id": "F-B", "score": 7},
+        {"board_component_id": "BC-2", "fault_id": "F-C", "score": 6},
+        {"board_component_id": "BC-3", "fault_id": "F-D", "score": 5},
+        {"board_component_id": "BC-4", "fault_id": "F-E", "score": 4},
+    ]}}
+
+    candidates = symptoms._simple_candidate_rows(result)
+
+    assert [row["board_component_id"] for row in candidates] == ["BC-1", "BC-2", "BC-3"]
+    assert [row["fault_id"] for row in candidates[0]["fault_hypotheses"]] == ["F-A", "F-B"]
+
+
+def test_auto_qwen_prefers_installed_qwen35_9b_and_caches_lookup(monkeypatch):
+    class OllamaStub:
+        calls = 0
+
+        def __init__(self, *, timeout_seconds):
+            assert timeout_seconds == 2
+
+        def list_models(self):
+            OllamaStub.calls += 1
+            return [{"name": "qwen2.5:14b"}, {"name": "qwen3.5:9b"}, {"name": "gemma4:12b"}]
+
+    monkeypatch.setattr(symptoms, "OllamaClient", OllamaStub)
+    state = {}
+
+    assert symptoms._auto_qwen_model(state) == "qwen3.5:9b"
+    assert symptoms._auto_qwen_model(state) == "qwen3.5:9b"
+    assert OllamaStub.calls == 1
 
 
 def test_real_streamlit_app_test_renders_workbench_without_runtime_errors():
@@ -149,5 +182,7 @@ def test_real_streamlit_app_test_renders_workbench_without_runtime_errors():
     app.run()
 
     assert not app.exception
-    assert len(app.radio) == 1
+    assert len(app.radio) == 1  # symptom prompt only; no workbench-mode selector
+    assert not any(item.label == "작업 패널" for item in app.radio)
+    assert not any(item.label == "후보 표시 전략" for item in app.selectbox)
     assert "진단 미실행" in " ".join(item.value for item in app.caption)

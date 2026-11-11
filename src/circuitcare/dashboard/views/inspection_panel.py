@@ -19,6 +19,7 @@ from circuitcare.vision.component_recognition_panel import (
 from circuitcare.frontend.workbench_state import (
     ACTIVE_PHOTO_KEY, SELECTION_KEY, update_component_selection, update_selection,
 )
+from circuitcare.symptom_diagnosis import load_knowledge
 
 MAP_VERSION_KEY = "circuitcare_v4_selection_map_key"
 COMPONENT_EDIT_KEY = "circuitcare_v4_component_edits"
@@ -61,6 +62,7 @@ def render_inspection_panel(
     review_image_bytes: bytes | None = None,
     review_scope: str | None = None,
     board_registry: dict[str, Any] | None = None,
+    compact: bool = False,
 ) -> None:
     owner = f"{project.project_id}|{project.board_id or ''}|{inventory_scope or component_map_version or ''}"
     suspect_owner = f"{project.project_id}|{project.board_id or ''}"
@@ -118,6 +120,7 @@ def render_inspection_panel(
             st.markdown(f"**인식된 부품** · {len(components)}개")
         active_scope = st.session_state.get("cc_active_component_review_scope") or review_scope
         active_records_key = review_keys(active_scope)[1] if active_scope else None
+        records_key = review_keys(review_scope)[1] if review_scope else None
         active_rows = list(st.session_state.get(active_records_key, [])) if active_records_key else []
         if active_scope:
             undo_key = f"{LAST_EXCLUDED_KEY}_{active_scope}"
@@ -152,6 +155,83 @@ def render_inspection_panel(
                                              selected_component=str(row.get("component_id")))
                             st.rerun()
         st.markdown("### 선택 부품")
+        if compact:
+            if selected_component is None:
+                st.caption("PCB에서 박스를 누르면 소자 정보가 여기에 표시됩니다. 소자를 선택하지 않아도 진단할 수 있습니다.")
+            else:
+                component_id = selected_component.component_id
+                board_component_id = str(selected_component.board_component_id or component_id)
+                st.markdown(f"**{selected_component.reference_designators[0] if selected_component.reference_designators else component_id}** · {selected_component.component_type}")
+                if selected_component.ocr_marking:
+                    st.caption(f"각인 후보 · {selected_component.ocr_marking}")
+                edits = st.session_state.setdefault(COMPONENT_EDIT_KEY, {})
+                current_type = str(edits.get(component_id, {}).get("component_type") or selected_component.component_type)
+                if review_scope and review_image_bytes is not None:
+                    edit_key = f"cc_compact_type_{review_scope}_{component_id}"
+                    if st.session_state.get(edit_key) not in CLASS_OPTIONS:
+                        st.session_state[edit_key] = current_type if current_type in CLASS_OPTIONS else "unknown"
+                    new_type = st.selectbox("소자 종류", CLASS_OPTIONS, key=edit_key,
+                                            format_func=lambda value: "종류 미확정" if value == "unknown" else value)
+                    if new_type != current_type and st.button("종류 변경 저장", key=f"cc_compact_type_save_{review_scope}_{component_id}"):
+                        rows = list(st.session_state.get(records_key, []))
+                        row = ensure_review_row_for_component(rows, selected_component)
+                        row["소자 종류"] = new_type
+                        row["user_edited"] = True
+                        st.session_state[records_key] = rows
+                        invalidate_component_review_state(st.session_state, scope=review_scope,
+                            project_id=project.project_id, board_id=project.board_id)
+                        st.rerun()
+                modes = load_knowledge().get("fault_modes", {}).get("fault_modes", {})
+                normalized_type = current_type.casefold()
+                normalized_type = {"integrated_circuit": "ic"}.get(normalized_type, normalized_type)
+                eligible = [fault_id for fault_id, mode in modes.items()
+                            if normalized_type in {str(value).casefold() for value in mode.get("candidate_component_types", [])}]
+                suspect_owner = f"{project.project_id}|{project.board_id or ''}"
+                suspects = st.session_state.setdefault(USER_SUSPECTS_KEY, {}).setdefault(suspect_owner, {})
+                saved = suspects.get(board_component_id, {})
+                options = ["__AI__", *eligible]
+                suspect_key = f"cc_compact_suspect_{project.project_id}_{board_component_id}"
+                if st.session_state.get(suspect_key) not in options:
+                    current_fault = saved.get("suspected_fault_mode") or "__AI__"
+                    st.session_state[suspect_key] = current_fault if current_fault in options else "__AI__"
+                fault = st.selectbox("의심 고장 유형", options, key=suspect_key,
+                                     format_func=lambda value: "AI가 판단" if value == "__AI__" else modes[value].get("title", value))
+                if st.button("의심 해제" if saved else "의심 소자로 지정", key=f"cc_compact_suspect_toggle_{project.project_id}_{board_component_id}"):
+                    if saved:
+                        suspects.pop(board_component_id, None)
+                    else:
+                        source_photo = selected_component.source_backend_photo_ids[0] if len(selected_component.source_backend_photo_ids) == 1 else None
+                        photo_record = next((row for row in project.image_records if row.image_id == source_photo), None)
+                        suspects[board_component_id] = {
+                            "component_id": component_id, "board_component_id": board_component_id,
+                            "component_type": selected_component.component_type,
+                            "suspected_fault_mode": None if fault == "__AI__" else fault,
+                            "selection_source": "USER", "evidence_status": "UNVERIFIED",
+                            "photo_id": source_photo,
+                            "photo_sha256": getattr(photo_record, "content_sha256", None),
+                            "bbox_xyxy": list(selected_component.bbox_xyxy),
+                        }
+                    st.session_state[USER_SUSPECTS_KEY][suspect_owner] = suspects
+                    st.rerun()
+                elif saved and saved.get("suspected_fault_mode") != (None if fault == "__AI__" else fault):
+                    saved["suspected_fault_mode"] = None if fault == "__AI__" else fault
+                    saved["evidence_status"] = "UNVERIFIED"
+                    st.session_state[USER_SUSPECTS_KEY][suspect_owner] = suspects
+                    st.rerun()
+                if review_scope and records_key:
+                    review_row = next((row for row in active_rows if row.get("component_id") == component_id), None)
+                    if review_row and review_row.get("상태") == "제외":
+                        st.caption("이 박스는 제외 상태입니다.")
+                    elif st.button("박스 제외", key=f"cc_compact_exclude_{review_scope}_{component_id}"):
+                        rows = list(st.session_state.get(records_key, []))
+                        row = ensure_review_row_for_component(rows, selected_component)
+                        record_box_exclusion(st.session_state, scope=review_scope, row=row)
+                        st.session_state[records_key] = rows
+                        invalidate_component_review_state(st.session_state, scope=review_scope,
+                            project_id=project.project_id, board_id=project.board_id)
+                        update_component_selection(st.session_state, project=project, selected_component=None)
+                        st.rerun()
+            return
         if selected_component is None:
             st.caption("PCB에서 박스를 누르면 이곳에 인식 정보가 표시됩니다.")
         else:

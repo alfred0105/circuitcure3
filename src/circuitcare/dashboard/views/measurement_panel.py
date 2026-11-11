@@ -48,6 +48,7 @@ def render_measurement_panel(
     st: Any, project: ProjectContext, *, selected_component: ComponentOverlayViewModel | None,
     preview: bool = False, component_map_version: str | None = None,
     board_registry: dict[str, Any] | None = None,
+    compact: bool = False,
 ) -> None:
     if selected_component is None:
         st.info("PCB Viewer에서 소자를 선택하면 해당 소자의 측정값을 기록할 수 있습니다.")
@@ -109,6 +110,11 @@ def render_measurement_panel(
             stale_records.append(row)
     st.caption(f"측정 대상 · {board_component_id or selected_component.component_id} · {selected_component.component_type}")
     st.caption("측정값을 먼저 기록하세요. 검증 조건이 부족한 기록은 보존되지만 검증 결과로 판정하지 않습니다.")
+    if compact:
+        suggested = list(selected_component.recommended_tests or ())
+        if suggested:
+            st.info("확인할 내용 · " + " · ".join(str(item) for item in suggested[:2]))
+        st.caption("저항·도통은 전원을 차단한 뒤 측정하세요. 통전 전압 측정은 안전한 측정 조건과 숙련이 확인되지 않으면 진행하지 마세요.")
     if stale_records:
         st.warning(f"이전 Component Map의 측정 기록 {len(stale_records)}개는 현재 부품에 자동 연결하지 않았습니다. 부품 연결을 확인해 주세요.")
     if preview:
@@ -134,7 +140,17 @@ def render_measurement_panel(
         value = st.text_input("측정값", key=f"cc_v5_value_{owner}", placeholder="예: 0, -0.25, 3.3")
         unit = st.selectbox("단위", units, key=unit_key)
         target = st.text_input("측정 대상/단자", placeholder="예: BZ1 양단 전압, U1 VCC-GND")
-        with st.expander("검증 정보 · 정상 범위 · 출처", expanded=False):
+        uncertainty = uncertainty_source = test_id = fault_hypothesis = ""
+        reference_min = reference_max = reference_source = reference_source_id = ""
+        reference_status = "UNVERIFIED"
+        operating_conditions = reference_conditions = ""
+        location_verified = False
+        source_label = SOURCE_OPTIONS[0]
+        if compact:
+            location_verified = st.checkbox("측정 지점과 단자를 직접 확인함", key=f"cc_v5_compact_location_{owner}")
+            operating_conditions = st.text_input("측정 조건 (선택)", key=f"cc_v5_compact_condition_{owner}",
+                                                 placeholder="예: 전원 차단, 주변 온도")
+        with st.expander("가설 검증 정보 추가" if compact else "검증 정보 · 정상 범위 · 출처", expanded=False):
             uncertainty = st.text_input(
                 f"측정 불확실도 σ ({BASE_UNITS[measurement_type]})",
                 key=f"cc_v5_sigma_{owner}", placeholder="계측기 정확도 사양에 따른 양수",
@@ -166,8 +182,11 @@ def render_measurement_panel(
                                             }[value])
             operating_conditions = st.text_input("측정 조건", placeholder="예: 전원 5 V, 무부하")
             reference_conditions = st.text_input("기준 조건", placeholder="실제 측정 조건과 동일하게")
-            location_verified = st.checkbox("측정 지점이 지정 단자임을 확인함")
-            source_label = st.selectbox("측정 출처", SOURCE_OPTIONS, key=f"cc_v5_source_{owner}")
+            if not compact:
+                location_verified = st.checkbox("측정 지점이 지정 단자임을 확인함")
+                source_label = st.selectbox("측정 출처", SOURCE_OPTIONS, key=f"cc_v5_source_{owner}")
+            else:
+                st.caption("검사 기준·출처 등 검증 정보가 부족하면 기록은 남지만 판정은 보류됩니다.")
         submitted = st.form_submit_button("측정 기록 저장", type="primary")
     if submitted:
         try:

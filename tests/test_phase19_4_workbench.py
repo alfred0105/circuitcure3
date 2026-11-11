@@ -12,9 +12,9 @@ def test_streamlit_entry_exposes_only_current_pcb_diagnosis_flow():
     script = Path(__file__).resolve().parents[1] / "src/circuitcare/ui.py"
     app = AppTest.from_file(str(script), default_timeout=30).run()
     assert not app.exception
-    assert any("새 PCB 진단" in item.value for item in app.markdown)
-    assert any(item.label == "진단 시작" and item.disabled for item in app.button)
-    assert len(app.file_uploader) == 2  # PCB photos and optional KiCad design input
+    assert any("PCB 사진으로 고장 원인 찾기" in item.value for item in app.markdown)
+    assert any(item.label == "분석 시작" and item.disabled for item in app.button)
+    assert len(app.file_uploader) == 1  # PCB photos only
     assert not any("회로 데이터셋" in item.label for item in app.selectbox)
     assert "active_analysis_view" not in app.session_state
 

@@ -85,20 +85,20 @@ def _normalize_photo_state(images: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def render_diagnosis_entry(st: Any) -> None:
-    """Render photo and symptom intake for the PCB diagnosis workbench."""
+    """Render a photo-first intake with symptoms deferred to the AI flow."""
     _style(st)
     state = st.session_state
     images = _normalize_photo_state(state.setdefault(INTAKE_IMAGES_KEY, []))
     state[INTAKE_IMAGES_KEY] = images
     state.setdefault(INTAKE_UPLOAD_BATCH_KEY, 0)
+    project = state.get(INTAKE_PROJECT_KEY)
     category = state.get("circuitcare_v2_symptom_category", "unknown")
-    description_raw = state.get("circuitcare_v2_symptom_description", "")
+    description = state.get("circuitcare_v2_symptom_description", "")
     try:
-        description = normalize_symptom_description(description_raw)
+        description = normalize_symptom_description(description)
     except ValueError:
         description = None
     fingerprint = _current_fingerprint(state, category, description)
-    project = state.get(INTAKE_PROJECT_KEY)
     if project and draft_is_current(state, fingerprint or ""):
         enter_workbench(state, project)
         st.rerun()
@@ -108,15 +108,13 @@ def render_diagnosis_entry(st: Any) -> None:
     _, center, _ = st.columns([1, 2.2, 1])
     with center:
         st.markdown('<div class="cc-entry-brand">CircuitCare AI</div>', unsafe_allow_html=True)
-        st.markdown('<div class="cc-entry-title">새 PCB 진단</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="cc-entry-section">PCB 사진 추가</div>', unsafe_allow_html=True)
-        st.caption(f"앞면 · 뒷면 · 확대 사진 · 최대 {MAX_PHOTOS}장, 사진당 20 MB")
+        st.markdown('<div class="cc-entry-title">PCB 사진으로 고장 원인 찾기</div>', unsafe_allow_html=True)
+        st.caption("사진을 올리면 소자를 찾고, 몇 가지 질문을 통해 확인할 검사를 안내합니다.")
         batch_key = f"cc_v2_photo_upload_{state[INTAKE_UPLOAD_BATCH_KEY]}"
         uploaded = st.file_uploader(
-            "PNG · JPG · JPEG · WebP", type=["png", "jpg", "jpeg", "webp"],
+            "PCB 사진 업로드", type=["png", "jpg", "jpeg", "webp"],
             accept_multiple_files=True, key=batch_key,
-            help="사진은 이 Streamlit 세션에서만 보관합니다.",
+            help=f"앞면·뒷면·확대 사진을 최대 {MAX_PHOTOS}장까지 추가할 수 있습니다.",
             **_upload_limit_kwargs(st),
         )
         if uploaded:
@@ -124,121 +122,72 @@ def render_diagnosis_entry(st: Any) -> None:
                 images, ((item.name, item.getvalue()) for item in uploaded),
             )
             state[INTAKE_IMAGES_KEY] = new_images
-            if new_images != images:
-                clear_component_map_state(state)
             state["circuitcare_v2_photo_messages"] = messages
             state[INTAKE_UPLOAD_BATCH_KEY] += 1
             state.pop(INTAKE_PROJECT_KEY, None)
+            if new_images != images:
+                clear_component_map_state(state)
             st.rerun()
 
         for message in state.pop("circuitcare_v2_photo_messages", []):
             st.warning(message)
-
         images = state.get(INTAKE_IMAGES_KEY, [])
         if images:
-            for start in range(0, len(images), 4):
-                row = images[start:start + 4]
-                cols = st.columns(len(row))
+            for start_index in range(0, len(images), 3):
+                row = images[start_index:start_index + 3]
+                columns = st.columns(len(row))
                 for offset, image_record in enumerate(row):
-                    index = start + offset
-                    with cols[offset]:
-                        preview = load_board_image(image_record["data"], max_edge=640).image
-                        st.image(preview, use_container_width=True)
-                        st.caption(image_record["filename"][:36])
-                        side = st.selectbox(
-                            "촬영면", list(PHOTO_SIDES),
-                            index=list(PHOTO_SIDES).index(image_record["side"]),
-                            format_func=lambda value: PHOTO_SIDES[value],
-                            key=f"cc_v2_photo_side_{image_record['image_id']}",
-                            label_visibility="collapsed",
-                        )
-                        capture_type = st.selectbox(
-                            "촬영 유형", list(CAPTURE_TYPES),
-                            index=list(CAPTURE_TYPES).index(image_record["capture_type"]),
-                            format_func=lambda value: CAPTURE_TYPES[value],
-                            key=f"cc_v2_photo_capture_{image_record['image_id']}",
-                            label_visibility="collapsed",
-                        )
-                        if side != image_record["side"] or capture_type != image_record["capture_type"]:
-                            clear_component_map_state(state)
-                            image_record["side"] = side
-                            image_record["capture_type"] = capture_type
-                            state.pop(INTAKE_PROJECT_KEY, None)
-                            state.pop("circuitcare_v2_analysis_status", None)
-                        if st.button("사진 제거", key=f"cc_v2_remove_{image_record['sha256']}", use_container_width=True):
-                            clear_component_map_state(state)
-                            state[INTAKE_IMAGES_KEY] = [item for item in images if item["sha256"] != image_record["sha256"]]
-                            state.pop(INTAKE_PROJECT_KEY, None)
-                            state.pop("circuitcare_v2_analysis_status", None)
-                            st.rerun()
+                    index = start_index + offset
+                    with columns[offset]:
+                        try:
+                            preview = load_board_image(image_record["data"], max_edge=720).image
+                            st.image(preview, use_container_width=True)
+                        except Exception as exc:
+                            st.error(f"사진을 읽지 못했습니다 · {exc}")
+                        st.caption(image_record["filename"][:40])
+                        with st.popover("사진 옵션"):
+                            side = st.selectbox(
+                                "촬영면", list(PHOTO_SIDES),
+                                index=list(PHOTO_SIDES).index(image_record["side"]),
+                                format_func=lambda value: PHOTO_SIDES[value],
+                                key=f"cc_v2_photo_side_{image_record['image_id']}",
+                            )
+                            capture = st.selectbox(
+                                "사진 종류", list(CAPTURE_TYPES),
+                                index=list(CAPTURE_TYPES).index(image_record["capture_type"]),
+                                format_func=lambda value: CAPTURE_TYPES[value],
+                                key=f"cc_v2_photo_capture_{image_record['image_id']}",
+                            )
+                            if side != image_record["side"] or capture != image_record["capture_type"]:
+                                clear_component_map_state(state)
+                                image_record["side"], image_record["capture_type"] = side, capture
+                                state.pop(INTAKE_PROJECT_KEY, None)
+                                state.pop("circuitcare_v2_analysis_status", None)
+                                st.rerun()
+                            if st.button("사진 제거", key=f"cc_v2_remove_{image_record['image_id']}"):
+                                clear_component_map_state(state)
+                                state[INTAKE_IMAGES_KEY] = [item for item in images
+                                                            if item["image_id"] != image_record["image_id"]]
+                                state.pop(INTAKE_PROJECT_KEY, None)
+                                state.pop("circuitcare_v2_analysis_status", None)
+                                st.rerun()
         else:
-            st.info("PCB 사진을 한 장 이상 추가하세요.")
+            st.info("PCB 사진을 한 장 이상 추가하세요. 증상 입력과 분석은 다음 화면에서 진행합니다.")
 
-        st.markdown('<div class="cc-entry-section">고장 증상</div>', unsafe_allow_html=True)
-        category_code = st.radio(
-            "고장 증상", list(SYMPTOM_CATEGORIES),
-            index=list(SYMPTOM_CATEGORIES).index(category),
-            format_func=lambda value: SYMPTOM_CATEGORIES[value],
-            key="circuitcare_v2_symptom_category", horizontal=True,
-        )
-        description_text = st.text_area(
-            "상세 증상", placeholder="증상을 입력하세요", max_chars=MAX_SYMPTOM_CHARS,
-            key="circuitcare_v2_symptom_description", height=86,
-        )
-        try:
-            description = normalize_symptom_description(description_text)
-            description_error = None
-        except ValueError as exc:
-            description = None
-            description_error = str(exc)
-
-        st.markdown('<div class="cc-entry-section">추가 자료 (선택)</div>', unsafe_allow_html=True)
-        st.caption("지원 형식 · KiCad XML Netlist, KiCad 회로도")
-        circuit_upload = st.file_uploader(
-            ".xml 또는 .kicad_sch", type=["xml", "kicad_sch"], key="cc_v2_circuit_upload",
-            **_upload_limit_kwargs(st),
-        )
-        if circuit_upload:
-            raw_circuit = circuit_upload.getvalue()
-            digest = hashlib.sha256(raw_circuit).hexdigest()
-            if state.get("circuitcare_v2_ignored_circuit_digest") == digest:
-                pass
-            elif state.get("circuitcare_v2_circuit_source", {}).get("content_sha256") != digest:
-                try:
-                    source = validate_circuit_upload(circuit_upload.name, raw_circuit)
-                    state["circuitcare_v2_circuit_source"] = source
-                    state["circuitcare_v2_circuit_bytes"] = raw_circuit
-                    state.pop("circuitcare_v2_ignored_circuit_digest", None)
-                    state.pop(INTAKE_PROJECT_KEY, None)
-                    state.pop("circuitcare_v2_circuit_error", None)
-                except ValueError as exc:
-                    state["circuitcare_v2_circuit_error"] = str(exc)
-                    state.pop("circuitcare_v2_circuit_source", None)
-                    state.pop("circuitcare_v2_circuit_bytes", None)
-            if state.get("circuitcare_v2_circuit_source"):
-                st.caption(f"자료 확인 · {state['circuitcare_v2_circuit_source']['filename']} · 진단 미실행")
-            elif state.get("circuitcare_v2_circuit_error"):
-                st.error(state["circuitcare_v2_circuit_error"])
-        if state.get("circuitcare_v2_circuit_source"):
-            source = state["circuitcare_v2_circuit_source"]
-            if not circuit_upload:
-                st.caption(f"자료 확인 · {source['filename']} · 진단 미실행")
-            if st.button("설계 자료 제거", key="cc_v2_remove_circuit"):
-                if circuit_upload:
-                    state["circuitcare_v2_ignored_circuit_digest"] = source["content_sha256"]
-                state.pop("circuitcare_v2_circuit_source", None)
-                state.pop("circuitcare_v2_circuit_bytes", None)
-                state.pop(INTAKE_PROJECT_KEY, None)
-                st.rerun()
-
-        if description_error:
-            st.error(description_error)
-        can_start = bool(images) and description_error is None
-        if st.button("진단 시작", type="primary", use_container_width=True, disabled=not can_start):
+        can_start = bool(images)
+        if st.button("분석 시작", type="primary", use_container_width=True, disabled=not can_start):
             try:
+                # Retain symptom values from an existing project when editing a
+                # previously saved intake; new projects collect symptoms later.
+                old_category = state.get("circuitcare_v2_symptom_category", "unknown")
+                old_description = state.get("circuitcare_v2_symptom_description", "")
+                try:
+                    old_description = normalize_symptom_description(old_description)
+                except ValueError:
+                    old_description = None
                 project = create_project_context(
-                    images=state[INTAKE_IMAGES_KEY], symptom_category=category_code,
-                    symptom_description=description,
+                    images=state[INTAKE_IMAGES_KEY], symptom_category=old_category,
+                    symptom_description=old_description,
                     circuit_source=state.get("circuitcare_v2_circuit_source"),
                     project_id=state.get("circuitcare_v2_edit_project_id"),
                     board_id=state.get("circuitcare_v2_edit_board_id"),
@@ -252,5 +201,3 @@ def render_diagnosis_entry(st: Any) -> None:
                 state.pop("circuitcare_v2_edit_board_id", None)
                 enter_workbench(state, project)
                 st.rerun()
-
-        st.caption("사진과 증상은 진단 보조 입력입니다. 이 단계에서는 AI 진단을 실행하지 않습니다.")
