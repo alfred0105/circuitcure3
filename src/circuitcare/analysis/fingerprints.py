@@ -32,6 +32,7 @@ def build_symptom_input_fingerprint(
     observations: dict[str, Any], answers: dict[str, Any], silkscreen_labels: list[dict[str, Any]],
     component_inventory: dict[str, dict[str, Any]] | None, confirmed_component_ids: list[str] | None,
     inventory_complete: bool, target_id: str, target_photo_sha256: str | None = None,
+    additional_inputs: dict[str, Any] | None = None,
 ) -> str:
     """Build the content fingerprint for one selected PCB photo and its diagnosis inputs."""
     rows = [{
@@ -65,6 +66,7 @@ def build_symptom_input_fingerprint(
         "component_inventory_complete": bool(inventory_complete),
         "component_inventory": component_inventory or {},
         "silkscreen_labels": silkscreen_labels,
+        "additional_inputs": additional_inputs or {},
     }
     return build_input_fingerprint(payload)
 

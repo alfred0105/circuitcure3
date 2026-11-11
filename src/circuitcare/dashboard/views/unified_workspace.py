@@ -39,7 +39,8 @@ from circuitcare.dashboard.components.pcb_workspace import (
     render_component_viewer, scale_overlay_to_display,
 )
 from circuitcare.dashboard.views.inspection_panel import (
-    COMPONENT_EDIT_KEY, COMPONENT_INVENTORY_KEY, MAP_VERSION_KEY, render_inspection_panel,
+    COMPONENT_EDIT_KEY, COMPONENT_INVENTORY_KEY, MAP_VERSION_KEY, USER_SUSPECTS_KEY,
+    render_inspection_panel,
     _diagnosis_status_label,
 )
 from circuitcare.dashboard.views.symptom_diagnosis_panel import (
@@ -902,10 +903,16 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
     analysis_target_id = "board:registry:v1"
     st.session_state["circuitcare_v7_analysis_target_id"] = analysis_target_id
     component_inventory = {"__board_registry__": {"registry_version": board_registry.get("version")}}
+    suspect_owner = (
+        f"{project.project_id}|{project.board_id or ''}|"
+        f"{st.session_state.get('circuitcare_v4_component_inventory_scope') or st.session_state.get(MAP_VERSION_KEY) or ''}"
+    )
+    suspect_store = st.session_state.get(USER_SUSPECTS_KEY, {})
+    suspected_components = list(suspect_store.get(suspect_owner, {}).values()) if isinstance(suspect_store, dict) else []
     live_analysis_snapshot = current_analysis_snapshot(
         st, project, components=snapshot_components, component_inventory=component_inventory,
         analysis_target_id=analysis_target_id, component_id_aliases=measurement_aliases,
-        board_registry=board_registry,
+        board_registry=board_registry, suspected_components=suspected_components,
     )
 
     title, add_photo, edit, new = st.columns([5, 1, 1, 1])
@@ -965,6 +972,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                     board_components=snapshot_components,
                     component_id_aliases=measurement_aliases,
                     analysis_target_id=analysis_target_id,
+                    suspected_components=suspected_components,
                 )
 
 
@@ -1119,6 +1127,7 @@ def _render_fault_analysis_workspace(
     board_components: tuple[Any, ...] | None = None,
     component_id_aliases: dict[str, str | None] | None = None,
     analysis_target_id: str | None = None,
+    suspected_components: list[dict[str, Any]] | None = None,
 ) -> None:
     if photo_snapshot is None:
         target_id = str(st.session_state.get(ACTIVE_PHOTO_KEY) or "target:default")
@@ -1141,7 +1150,7 @@ def _render_fault_analysis_workspace(
             st, project, components=components,
             component_inventory=inventory,
             analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
-            board_registry=board_registry,
+            board_registry=board_registry, suspected_components=suspected_components,
         )
     selection = st.session_state.get(SELECTION_KEY)
     selected = _selected_component(st)
@@ -1168,6 +1177,7 @@ def _render_fault_analysis_workspace(
                                  if isinstance(board_registry, dict) else inventory),
             analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
             board_registry=board_registry,
+            suspected_components=suspected_components,
         )
     elif mode == "원인":
         _render_cause_dashboard(st, project, result, analysis_snapshot=analysis_snapshot,

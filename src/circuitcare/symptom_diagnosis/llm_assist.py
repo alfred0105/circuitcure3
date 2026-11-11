@@ -8,6 +8,118 @@ from typing import Any
 from circuitcare.local_llm import LocalLLMError, OllamaClient
 
 
+def suggest_pcb_fault_candidates(
+    client: OllamaClient, model: str, *, pcb_context: dict[str, Any],
+    diagnosis: dict[str, Any], knowledge: dict[str, Any],
+) -> dict[str, Any]:
+    """Return schema-bounded Qwen proposals, separate from deterministic ranks."""
+    components = {str(row.get("component_id")): row for row in pcb_context.get("focus_components", [])
+                  if isinstance(row, dict) and row.get("component_id")}
+    confirmed_ids = sorted(cid for cid, row in components.items() if row.get("review_status") == "CONFIRMED")
+    fault_modes = knowledge.get("fault_modes", {}).get("fault_modes", {})
+    modes = sorted(fault_modes)
+    if not modes or not confirmed_ids:
+        return {"proposals": [], "model": model, "status": "NO_ELIGIBLE_COMPONENTS"}
+    block_values = sorted({"power", "input", "control", "control_input", "control_timing",
+                           "driver", "output", "protection", "thermal", "buzzer", "relay"})
+    evidence_values = {str(key) for key in pcb_context.get("observations", {})}
+    evidence_values.update(str(row.get("id")) for row in diagnosis.get("matched_rules", []) if row.get("id"))
+    evidence_values.update(f"measurement:{row.get('measurement_id')}" for row in diagnosis.get("measurement_evidence", [])
+                           if row.get("measurement_id"))
+    evidence_options = sorted(evidence_values) or ["__none__"]
+    schema = {
+        "type": "object", "additionalProperties": False, "required": ["proposals"],
+        "properties": {"proposals": {"type": "array", "maxItems": 3, "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["component_id", "suspected_fault_id", "functional_block", "reason",
+                         "supporting_evidence_ids", "opposing_evidence_ids", "missing_information",
+                         "recommended_next_action", "uncertainty_status"],
+            "properties": {
+                "component_id": {"type": "string", "enum": confirmed_ids},
+                "suspected_fault_id": {"type": "string", "enum": modes},
+                "functional_block": {"type": "string", "enum": block_values + ["UNKNOWN"]},
+                "reason": {"type": "string", "maxLength": 500},
+                "supporting_evidence_ids": {"type": "array", "maxItems": 6,
+                                             "items": {"type": "string", "enum": evidence_options}},
+                "opposing_evidence_ids": {"type": "array", "maxItems": 6,
+                                           "items": {"type": "string", "enum": evidence_options}},
+                "missing_information": {"type": "array", "maxItems": 5,
+                                        "items": {"type": "string", "maxLength": 160}},
+                "recommended_next_action": {"type": "string", "maxLength": 240},
+                "uncertainty_status": {"type": "string", "enum": ["UNVERIFIED", "INCONCLUSIVE"]},
+            },
+        }}}
+    }
+    payload = {"pcb_context": pcb_context, "rule_hypotheses": pcb_context.get("hypotheses", []),
+               "allowed_component_ids": confirmed_ids, "allowed_fault_ids": modes,
+               "evidence_ids": evidence_options}
+    response = client.chat_json(model, [
+        {"role": "system", "content": (
+            "PCB 진단 보조자다. 입력 JSON의 실제 확인된 소자, 허용 고장 유형, 증거만 사용한다. "
+            "사용자 의심은 미검증 단서다. 존재하지 않는 측정·배선·핀·연결·소자·증거를 만들지 않는다. "
+            "근거가 부족하면 후보를 생략하거나 INCONCLUSIVE로 제안한다. Qwen 제안만으로 고장을 확정하거나 "
+            "FAULT_SUPPORTED 판정을 내리지 않는다. 기능부는 추정 후보일 뿐 연결 사실이 아니다. "
+            "JSON 스키마에 맞는 제안 최대 3개를 반환한다."
+        )},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+    ], output_schema=schema)
+    rows = response.get("content", {}).get("proposals", [])
+    validated = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        cid, fault_id = str(row.get("component_id") or ""), str(row.get("suspected_fault_id") or "")
+        mode = fault_modes.get(fault_id)
+        component = components.get(cid)
+        if not component or component.get("review_status") != "CONFIRMED" or not isinstance(mode, dict):
+            continue
+        accepted_types = {str(value).lower() for value in mode.get("candidate_component_types", [])}
+        actual_type = str(component.get("type") or "unknown").lower()
+        aliases = {"integrated_circuit": "ic", "ic": "integrated_circuit"}
+        if not accepted_types or (actual_type not in accepted_types and aliases.get(actual_type) not in accepted_types):
+            continue
+        supports = [value for value in row.get("supporting_evidence_ids", []) if value in evidence_values]
+        opposes = [value for value in row.get("opposing_evidence_ids", []) if value in evidence_values]
+        validated.append({
+            "component_id": cid, "suspected_fault_id": fault_id,
+            "functional_block": row.get("functional_block") if row.get("functional_block") in block_values else "UNKNOWN",
+            "reason": str(row.get("reason") or "")[:500],
+            "supporting_evidence_ids": supports, "opposing_evidence_ids": opposes,
+            "missing_information": [str(value)[:160] for value in row.get("missing_information", [])[:5]],
+            "recommended_next_action": str(row.get("recommended_next_action") or "")[:240],
+            "uncertainty_status": row.get("uncertainty_status", "UNVERIFIED"),
+            "evidence_status": "UNVERIFIED", "rank_status": "NOT_MERGED",
+        })
+    return {"proposals": validated, "model": response.get("model", model),
+            "status": "LOCAL_LLM_PROPOSED_UNVERIFIED"}
+
+
+def select_follow_up_question(client: OllamaClient, model: str, *, pcb_context: dict[str, Any],
+                              diagnosis: dict[str, Any], answered_test_ids: list[str]) -> dict[str, Any] | None:
+    """Select one unasked, pre-authored diagnostic question; never invent a test."""
+    available = [row for row in diagnosis.get("next_tests", [])
+                 if isinstance(row, dict) and row.get("type") == "question"
+                 and row.get("test_id") and row.get("test_id") not in set(answered_test_ids)]
+    if not available:
+        return None
+    allowed = [str(row["test_id"]) for row in available]
+    schema = {"type": "object", "additionalProperties": False, "required": ["test_id", "reason"],
+              "properties": {"test_id": {"type": "string", "enum": allowed},
+                             "reason": {"type": "string", "maxLength": 220}}}
+    response = client.chat_json(model, [
+        {"role": "system", "content": (
+            "한 개의 다음 질문만 선택한다. 입력의 기존 안전 질문 중 후보를 구분하는 데 가장 유용한 질문을 고른다. "
+            "질문·측정값·조건을 새로 만들지 않는다. 통전/고전압 검사 대신 기존 질문만 고른다. JSON만 반환한다."
+        )},
+        {"role": "user", "content": json.dumps({"pcb_context": pcb_context,
+                                                   "candidates": available[:8]}, ensure_ascii=False, default=str)},
+    ], output_schema=schema)
+    data = response.get("content", {})
+    choice = next((row for row in available if row.get("test_id") == data.get("test_id")), None)
+    return ({**choice, "selection_reason": str(data.get("reason", ""))[:220],
+             "question_source": "QWEN_SELECTED_EXISTING_SAFE_QUESTION"} if choice else None)
+
+
 def explain_candidates(client: OllamaClient, model: str, *, symptom_text: str,
                        diagnosis: dict[str, Any]) -> dict[str, Any]:
     """Ask a local model to explain existing candidates without adding diagnoses."""

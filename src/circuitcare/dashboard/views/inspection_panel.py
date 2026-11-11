@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import json
 import logging
 from dataclasses import replace
 from typing import Any
@@ -22,6 +23,7 @@ from circuitcare.frontend.workbench_state import (
 MAP_VERSION_KEY = "circuitcare_v4_selection_map_key"
 COMPONENT_EDIT_KEY = "circuitcare_v4_component_edits"
 COMPONENT_INVENTORY_KEY = "circuitcare_v4_component_inventory_by_map"
+USER_SUSPECTS_KEY = "circuitcare_v4_user_suspects_by_map"
 ROLE_OPTIONS = ("power", "control", "control_input", "control_timing", "driver", "output",
                 "input", "input_output", "protection", "thermal", "buzzer", "relay")
 LOGGER = logging.getLogger(__name__)
@@ -39,6 +41,8 @@ def render_inspection_panel(
     owner = f"{project.project_id}|{project.board_id or ''}|{inventory_scope or component_map_version or ''}"
     inventories = st.session_state.setdefault(COMPONENT_INVENTORY_KEY, {})
     inventory = inventories.setdefault(owner, {})
+    all_suspects = st.session_state.setdefault(USER_SUSPECTS_KEY, {})
+    suspects = all_suspects.setdefault(owner, {})
     with st.container(border=True):
         st.markdown('<span class="cc-inspection-marker"></span>', unsafe_allow_html=True)
         overlap_key = st.session_state.get("cc_active_component_overlap_key")
@@ -236,6 +240,60 @@ def render_inspection_panel(
                         str(st.session_state.get(ACTIVE_PHOTO_KEY) or "target:default")),
                 )
                 inventory_item["confirmed_functional_roles"] = list(confirmed_roles)
+            from circuitcare.symptom_diagnosis import load_knowledge
+            modes = load_knowledge().get("fault_modes", {}).get("fault_modes", {})
+            component_type = str(selected_component.component_type).casefold()
+            component_type = {"integrated_circuit": "ic"}.get(component_type, component_type)
+            eligible_modes = [fault_id for fault_id, mode in modes.items()
+                              if component_type in {str(value).casefold()
+                                                    for value in mode.get("candidate_component_types", [])}]
+            suspicion_key = f"cc_v4_suspect_fault_{hash(owner)}_{selected_component.component_id}"
+            fault_options = ["__AI__", *eligible_modes]
+            if st.session_state.get(suspicion_key) not in fault_options:
+                saved = suspects.get(selected_component.component_id, {}).get("suspected_fault_mode") or "__AI__"
+                st.session_state[suspicion_key] = saved if saved in fault_options else "__AI__"
+            suspected_fault = st.selectbox(
+                "AI 진단 참고 · 의심 고장 유형", fault_options,
+                format_func=lambda value: "AI가 판단" if value == "__AI__" else modes[value].get("title", value),
+                key=suspicion_key,
+                help="사용자 의심은 미검증 참고 정보입니다. 측정 증거나 고장 확정으로 취급하지 않습니다.",
+            )
+            active_suspect = selected_component.component_id in suspects
+            if st.button("의심 소자 해제" if active_suspect else "의심 소자로 지정",
+                         key=f"cc_v4_toggle_suspect_{hash(owner)}_{selected_component.component_id}"):
+                if active_suspect:
+                    suspects.pop(selected_component.component_id, None)
+                else:
+                    photo_id = (selected_component.source_backend_photo_ids[0]
+                                if len(selected_component.source_backend_photo_ids) == 1 else None)
+                    photo = next((row for row in project.image_records if row.image_id == photo_id), None)
+                    payload = {"component_id": selected_component.component_id,
+                               "component_type": selected_component.component_type,
+                               "bbox_xyxy": list(selected_component.bbox_xyxy), "photo_id": photo_id,
+                               "photo_sha256": getattr(photo, "content_sha256", None),
+                               "inventory_scope": inventory_scope or component_map_version}
+                    observation_fingerprint = hashlib.sha256(json.dumps(
+                        payload, sort_keys=True, ensure_ascii=False, default=str
+                    ).encode("utf-8")).hexdigest()
+                    suspects[selected_component.component_id] = {
+                        "component_id": selected_component.component_id,
+                        "board_component_id": selected_component.board_component_id or selected_component.component_id,
+                        "suspected_fault_mode": None if suspected_fault == "__AI__" else suspected_fault,
+                        "selection_source": "USER", "evidence_status": "UNVERIFIED",
+                        "photo_id": photo_id, "observation_fingerprint": observation_fingerprint,
+                        "component_map_version": inventory_scope or component_map_version,
+                    }
+                all_suspects[owner] = suspects
+                st.session_state[USER_SUSPECTS_KEY] = all_suspects
+                st.rerun()
+            if active_suspect:
+                saved = suspects[selected_component.component_id]
+                new_fault = None if suspected_fault == "__AI__" else suspected_fault
+                if saved.get("suspected_fault_mode") != new_fault:
+                    saved["suspected_fault_mode"] = new_fault
+                    saved["evidence_status"] = "UNVERIFIED"
+                    st.session_state[USER_SUSPECTS_KEY] = all_suspects
+                    st.rerun()
             inventories[owner] = inventory
             st.session_state[COMPONENT_INVENTORY_KEY] = inventories
             selected_component = replace(
