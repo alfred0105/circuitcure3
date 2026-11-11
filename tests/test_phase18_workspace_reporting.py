@@ -182,6 +182,30 @@ def test_pcb_report_exports_current_board_snapshot_and_validates_bundle(tmp_path
     assert any(name.startswith("photos/") for name in manifest["artifacts"])
 
 
+def test_pcb_report_measurement_hash_tracks_current_measurements_and_tampering(tmp_path: Path) -> None:
+    project = ProjectContext("pcb-project", "board-1",
+                              image_records=(ImageRecord("front-1", side="front", filename="front.png"),))
+    measurement = {"measurement_id": "m-1", "component_id": "bc-1", "board_component_id": "bc-1",
+                   "measurement_type": "resistance", "value": 12.0, "unit": "ohm",
+                   "source": "user_measurement", "measurement_target": "R1 terminals"}
+    snapshot = build_pcb_diagnostic_snapshot(
+        root=tmp_path, project=project, registry={"components": []},
+        analysis_snapshot={"record": {"status": "CURRENT"}, "result": {"component_candidates": []},
+                           "measurements": [measurement]}, photos=[],
+    )
+    assert snapshot["fault_or_symptom"]["observations"] == snapshot["pcb_context"]["measurements"]
+    assert validate_report(snapshot) == []
+    modified = __import__("copy").deepcopy(snapshot)
+    modified["fault_or_symptom"]["observations"][0]["value"] = 99.0
+    assert "MEASUREMENT_DIAGNOSIS_MISMATCH" in validate_report(modified)
+    deleted = __import__("copy").deepcopy(snapshot)
+    deleted["fault_or_symptom"]["observations"] = []
+    assert "MEASUREMENT_DIAGNOSIS_MISMATCH" in validate_report(deleted)
+    context_modified = __import__("copy").deepcopy(snapshot)
+    context_modified["pcb_context"]["measurements"][0]["value"] = 77.0
+    assert "MEASUREMENT_PCB_CONTEXT_MISMATCH" in validate_report(context_modified)
+
+
 def test_report_snapshot_uses_verified_source_file_digest_not_reserialized_object(tmp_path: Path) -> None:
     circuit = Circuit(components={}, connections=[])
     workspace = {"workspace_id": "ws", "circuit_id": "demo", "circuit_hash": "a" * 64,
@@ -480,3 +504,18 @@ def test_git_sha_reads_checkout_metadata_without_subprocess(tmp_path, monkeypatc
 
     monkeypatch.setattr("subprocess.run", reject_subprocess)
     assert _git_sha(tmp_path) == sha
+
+
+def test_pcb_report_uses_selected_candidate_strategy_without_mutating_baseline(tmp_path: Path) -> None:
+    project = ProjectContext("pcb-project", "board-1")
+    result = {"component_candidates": [{"component_id": "bc-base", "fault_id": "F1"}],
+              "evidence_v1": {"component_candidates": [{"component_id": "bc-evidence", "fault_id": "F2"}]},
+              "candidate_fusion": {"top_candidates": [{"component_id": "bc-qwen", "fault_id": "F3"}]}}
+    snapshot = build_pcb_diagnostic_snapshot(
+        root=tmp_path, project=project, registry={"components": []},
+        analysis_snapshot={"record": {"status": "CURRENT"}, "result": result, "measurements": []},
+        photos=[], candidate_strategy="candidate_fusion_v1",
+    )
+    assert snapshot["pcb_context"]["candidate_strategy"] == "candidate_fusion_v1"
+    assert [row["component_id"] for row in snapshot["pcb_context"]["top3_candidates"]] == ["bc-qwen"]
+    assert result["component_candidates"][0]["component_id"] == "bc-base"

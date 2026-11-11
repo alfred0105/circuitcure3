@@ -24,6 +24,7 @@ MAP_VERSION_KEY = "circuitcare_v4_selection_map_key"
 COMPONENT_EDIT_KEY = "circuitcare_v4_component_edits"
 COMPONENT_INVENTORY_KEY = "circuitcare_v4_component_inventory_by_map"
 USER_SUSPECTS_KEY = "circuitcare_v4_user_suspects_by_map"
+USER_SUSPECTS_MIGRATION_KEY = "circuitcare_v4_user_suspects_migrated_scopes"
 ROLE_OPTIONS = ("power", "control", "control_input", "control_timing", "driver", "output",
                 "input", "input_output", "protection", "thermal", "buzzer", "relay")
 LOGGER = logging.getLogger(__name__)
@@ -34,12 +35,16 @@ def board_suspects(state: Any, project: ProjectContext) -> list[dict[str, Any]]:
     owner = f"{project.project_id}|{project.board_id or ''}"
     store = state.setdefault(USER_SUSPECTS_KEY, {})
     rows = store.setdefault(owner, {})
-    for old_owner, old_rows in list(store.items()):
-        if old_owner == owner or not str(old_owner).startswith(f"{owner}|") or not isinstance(old_rows, dict):
-            continue
-        for old_id, old_row in old_rows.items():
-            if isinstance(old_row, dict):
-                rows.setdefault(str(old_row.get("board_component_id") or old_id), old_row)
+    migrated = state.setdefault(USER_SUSPECTS_MIGRATION_KEY, {})
+    if not migrated.get(owner):
+        for old_owner, old_rows in list(store.items()):
+            if old_owner == owner or not str(old_owner).startswith(f"{owner}|") or not isinstance(old_rows, dict):
+                continue
+            for old_id, old_row in old_rows.items():
+                if isinstance(old_row, dict):
+                    rows.setdefault(str(old_row.get("board_component_id") or old_id), old_row)
+        migrated[owner] = True
+        state[USER_SUSPECTS_MIGRATION_KEY] = migrated
     store[owner] = rows
     state[USER_SUSPECTS_KEY] = store
     return [row for row in rows.values() if isinstance(row, dict)]

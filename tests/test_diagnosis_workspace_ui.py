@@ -6,6 +6,7 @@ import pytest
 from circuitcare.dashboard.views import unified_workspace as workspace
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.frontend.workbench_state import SELECTION_KEY, enter_workbench
+from circuitcare.dashboard.views.symptom_diagnosis_panel import candidate_focus_widget_key
 
 
 class _Context:
@@ -61,7 +62,8 @@ def test_cause_candidate_selection_opens_same_pcb_viewer_and_updates_shared_sele
     project = ProjectContext(project_id="project-2", board_id="board-2")
     state = {"circuitcare_v4_current_components": (SimpleNamespace(component_id="U3"),)}
     enter_workbench(state, project)
-    st = _StreamlitStub(state=state, clicked={"cc_analysis_dashboard_focus_project-2_U3"})
+    button_key = candidate_focus_widget_key("analysis_dashboard", "project-2", "board-2", "U3", "")
+    st = _StreamlitStub(state=state, clicked={button_key})
     result = {"component_candidates": [{
         "component_id": "U3", "component_type": "ic", "fault_title": "전원 입력 이상",
         "candidate_rank": 1, "supporting_evidence": ["출력이 없음"],

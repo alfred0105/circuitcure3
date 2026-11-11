@@ -9,6 +9,7 @@ from circuitcare.dashboard.views.symptom_diagnosis_panel import (
     INITIAL_SYMPTOM_OPTIONS, INITIAL_SYMPTOM_QUESTION_ID, _combined_observations,
     _registry_valid_suspects, _safe_initial_followup, _save_follow_up_answer,
     _save_initial_symptom_answer, candidate_rows_for_strategy, _apply_qwen_pcb_assist,
+    _apply_pending_initial_symptom_widget, candidate_focus_widget_key,
 )
 
 
@@ -450,3 +451,66 @@ def test_candidate_fusion_does_not_let_qwen_upgrade_registry_review_state():
         allowed_fault_ids={"CAP_OPEN"},
     )
     assert result["candidates"][0]["verification_status"] == "NEEDS_COMPONENT_REVIEW"
+
+
+def test_app_test_initial_symptom_submission_applies_multiselect_value_before_widget():
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from streamlit.testing.v1 import AppTest
+
+    script = """import streamlit as st
+from circuitcare.dashboard.views.symptom_diagnosis_panel import _apply_pending_initial_symptom_widget
+state = st.session_state.setdefault('diagnosis', {})
+_apply_pending_initial_symptom_widget(st.session_state, state, 'symptom_codes')
+choice = st.selectbox('초기 증상', ['전원 안 켜짐', '기타·모르겠음'], key='initial')
+st.multiselect('구조화된 증상', ['NO_POWER'], key='symptom_codes')
+if st.button('답변으로 분석 시작', key='submit'):
+    state['_pending_initial_symptom_widget_value'] = ['NO_POWER'] if choice == '전원 안 켜짐' else []
+    st.session_state['diagnosis'] = state
+    st.rerun()
+"""
+    with TemporaryDirectory() as folder:
+        app_file = Path(folder) / "app.py"
+        app_file.write_text(script, encoding="utf-8")
+        app = AppTest.from_file(str(app_file)).run()
+        assert not app.exception
+        app.selectbox(key="initial").set_value("전원 안 켜짐")
+        app.button(key="submit").click().run()
+        assert not app.exception
+        assert app.multiselect(key="symptom_codes").value == ["NO_POWER"]
+        assert app.session_state["diagnosis"]["run_after_initial_answer"] is True
+
+
+def test_candidate_focus_keys_include_fault_pair_and_scope():
+    first = candidate_focus_widget_key("analysis", "p", "b", "c1", "OPEN")
+    second = candidate_focus_widget_key("analysis", "p", "b", "c1", "SHORT")
+    third = candidate_focus_widget_key("symptom", "p", "b", "c1", "OPEN")
+    assert len({first, second, third}) == 3
+
+
+def test_legacy_suspect_migration_runs_once_and_delete_stays_deleted():
+    from circuitcare.dashboard.views.inspection_panel import (
+        USER_SUSPECTS_KEY, board_suspects,
+    )
+    project = ProjectContext("project", "board")
+    owner = "project|board"
+    state = {USER_SUSPECTS_KEY: {
+        owner: {}, f"{owner}|old-photo-scope": {
+            "local-1": {"board_component_id": "bc-1", "component_id": "bc-1",
+                                  "evidence_status": "UNVERIFIED"},
+        },
+    }}
+    assert [row["board_component_id"] for row in board_suspects(state, project)] == ["bc-1"]
+    state[USER_SUSPECTS_KEY][owner].pop("bc-1")
+    assert board_suspects(state, project) == []
+    assert board_suspects(state, project) == []
+
+
+def test_candidate_fusion_rejects_unknown_fault_even_when_component_is_valid():
+    result = fuse_inspection_candidates(
+        rule_candidates=[],
+        qwen_proposals=[{"component_id": "bc-1", "suspected_fault_id": "MADE_UP"}],
+        components=[{"component_id": "bc-1", "type": "capacitor", "presence_status": "CONFIRMED"}],
+        allowed_fault_ids={"CAP_OPEN"},
+    )
+    assert result["candidates"] == []

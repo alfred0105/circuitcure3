@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Any
 import json
 import time
+import hashlib
 from pathlib import Path
 from uuid import uuid4
 
@@ -38,6 +39,22 @@ from circuitcare.analysis.state_manager import (
 
 def _project_key(project: ProjectContext) -> str:
     return f"cc_symptom_diagnosis_{project.project_id}"
+
+
+def candidate_focus_widget_key(screen_scope: str, project_id: str, board_id: str | None,
+                               component_id: str, fault_id: str | None) -> str:
+    """Stable, scoped key for a physical-component/fault-pair action."""
+    identity = "|".join((screen_scope, project_id, board_id or "", component_id, fault_id or ""))
+    return f"cc_candidate_focus_{hashlib.sha256(identity.encode()).hexdigest()[:20]}"
+
+
+def _apply_pending_initial_symptom_widget(session_state: Any, state: dict[str, Any],
+                                           widget_key: str) -> None:
+    """Apply a queued widget value before the keyed widget is instantiated."""
+    pending = state.pop("_pending_initial_symptom_widget_value", None)
+    if pending is not None:
+        session_state[widget_key] = pending
+        state["run_after_initial_answer"] = True
 
 
 def _diagnosis_fingerprint(
@@ -580,6 +597,7 @@ def render_symptom_diagnosis_panel(
                                  placeholder="예: 전원은 켜지지만 LED가 들어오지 않고 버저가 울리지 않음", height=82)
     code_to_label = {code: item["label"] for code, item in symptom_items.items()}
     symptom_widget_key = f"{key}_symptoms"
+    _apply_pending_initial_symptom_widget(st.session_state, state, symptom_widget_key)
     if symptom_widget_key not in st.session_state:
         st.session_state[symptom_widget_key] = [
             code_to_label[code] for code in state.get("symptoms", []) if code in code_to_label
@@ -769,13 +787,23 @@ def render_symptom_diagnosis_panel(
             st.session_state[key] = state
             st.error(f"규칙 기반 분석을 완료하지 못했습니다: {exc}")
             return
+        # If the user reached the end of the safe catalog without identifying
+        # an ontology symptom, stop the question loop as explicitly inconclusive.
+        answered_followups = set(str(value) for value in state.get("answered_test_ids", [])) - {
+            INITIAL_SYMPTOM_QUESTION_ID,
+        }
+        if (not result.get("symptom_codes") and state.get("initial_symptom_answer") == "기타·모르겠음"
+                and answered_followups
+                and _safe_initial_followup(kb, set(str(value) for value in state.get("answered_test_ids", []))) is None):
+            result["status"] = "INCONCLUSIVE"
+            result["message"] = "안전 질문으로도 증상을 특정하지 못했습니다. 추가 정보나 측정 없이 소자 고장을 추정하지 않습니다."
         result["llm_parser"] = parsed
         result["symptom_text"] = symptom_text
         result["silkscreen_labels"] = silkscreen_labels
         _attach_evidence_v1(result, components=component_rows, measurements=measurements,
                             observations=combined_observations)
-        if (result.get("status") != "NEEDS_SYMPTOMS" and llm_enabled
-                and selected_model and qwen_pcb_strategy):
+        if (result.get("status") != "NEEDS_SYMPTOMS" and result.get("symptom_codes")
+                and llm_enabled and selected_model and qwen_pcb_strategy):
             with st.spinner(f"{selected_model}이 PCB 구조를 참고해 미검증 후보를 검토하는 중…"):
                 _apply_qwen_pcb_assist(
                     result, project=project, components=component_rows,
@@ -862,8 +890,7 @@ def render_symptom_diagnosis_panel(
                          type="primary", disabled=preview):
                 _save_initial_symptom_answer(state, initial_choice)
                 code = INITIAL_SYMPTOM_OPTIONS[initial_choice]
-                st.session_state[symptom_widget_key] = [code_to_label[code]] if code else []
-                state["run_after_initial_answer"] = True
+                state["_pending_initial_symptom_widget_value"] = [code_to_label[code]] if code else []
                 st.session_state[key] = state
                 st.rerun()
         elif initial_answer == "기타·모르겠음":
@@ -934,7 +961,9 @@ def render_symptom_diagnosis_panel(
                 elif not supporting:
                     st.caption("부품 종류와 증상으로 좁힌 미확정 검사 후보입니다.")
             if any(item.component_id == candidate.get("component_id") for item in components):
-                if st.button("PCB에서 위치 보기", key=f"cc_symptom_candidate_focus_{project.project_id}_{candidate.get('component_id')}"):
+                if st.button("PCB에서 위치 보기", key=candidate_focus_widget_key("symptom", project.project_id, project.board_id,
+                                                        str(candidate.get("board_component_id") or candidate.get("component_id") or ""),
+                                                        str(candidate.get("fault_hypothesis") or candidate.get("fault_id") or ""))):
                     focused = (_focus_board_component(st, project, board_registry,
                                str(candidate.get("component_id"))) if board_registry else False)
                     if not focused:
@@ -978,7 +1007,9 @@ def render_symptom_diagnosis_panel(
                 st.caption("부족한 정보 · " + " · ".join(proposal["missing_information"]))
             if proposal.get("recommended_next_action"):
                 st.caption("다음 작업 · " + proposal["recommended_next_action"])
-            if st.button("PCB에서 위치 보기", key=f"cc_qwen_candidate_focus_{project.project_id}_{proposal['component_id']}"):
+            if st.button("PCB에서 위치 보기", key=candidate_focus_widget_key("symptom_qwen", project.project_id, project.board_id,
+                                                            str(proposal.get("board_component_id") or proposal.get("component_id") or ""),
+                                                            str(proposal.get("suspected_fault_id") or proposal.get("fault_id") or ""))):
                 focused = (_focus_board_component(st, project, board_registry, proposal["component_id"])
                            if board_registry else False)
                 if not focused and any(item.component_id == proposal["component_id"] for item in components):

@@ -44,7 +44,7 @@ from circuitcare.dashboard.views.inspection_panel import (
     _diagnosis_status_label,
 )
 from circuitcare.dashboard.views.symptom_diagnosis_panel import (
-    candidate_rows_for_strategy, current_analysis_snapshot, render_symptom_diagnosis_panel,
+    candidate_rows_for_strategy, candidate_focus_widget_key, current_analysis_snapshot, render_symptom_diagnosis_panel,
 )
 from circuitcare.dashboard.views.measurement_panel import render_measurement_panel
 from circuitcare.dashboard.views.diagnosis_panel import render_diagnosis_panel
@@ -697,11 +697,33 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
     scoped_overlay = (candidate_state_by_scope.get(analysis_scope.key)
                      if isinstance(candidate_state_by_scope, dict) else {})
     current_result = analysis_snapshot.get("result")
-    candidate_state = ({str(row.get("component_id")): row
-                        for row in current_result.get("component_candidates", [])[:3]
-                        if isinstance(row, dict) and row.get("component_id")}
-                       if analysis_state.get("status") == AnalysisStatus.CURRENT.value
-                       and isinstance(current_result, dict) else {})
+    selected_candidate_strategy = st.session_state.get(f"cc_candidate_strategy_{project.project_id}", "baseline")
+    overlay_candidates = candidate_rows_for_strategy(current_result, selected_candidate_strategy)         if analysis_state.get("status") == AnalysisStatus.CURRENT.value and isinstance(current_result, dict) else []
+    candidate_state: dict[str, dict[str, Any]] = {}
+    for candidate in overlay_candidates:
+        component_id = str(candidate.get("board_component_id") or candidate.get("component_id") or "")
+        if not component_id:
+            continue
+        existing = candidate_state.get(component_id)
+        if existing is None:
+            candidate_state[component_id] = dict(candidate)
+            candidate_state[component_id]["_fault_hypotheses"] = [str(candidate.get("fault_hypothesis") or candidate.get("fault_id") or "")]
+            continue
+        fault_id = str(candidate.get("fault_hypothesis") or candidate.get("fault_id") or "")
+        if fault_id and fault_id not in existing["_fault_hypotheses"]:
+            existing["_fault_hypotheses"].append(fault_id)
+        current_status = str(existing.get("visual_status") or existing.get("status") or "SUSPECTED")
+        other_status = str(candidate.get("visual_status") or candidate.get("status") or "SUSPECTED")
+        if current_status != other_status and {current_status, other_status} & {"FAULT_SUPPORTED", "FAULT_REFUTED", "CONFLICTED"}:
+            existing["visual_status"] = "CONFLICTED"
+        evidence = list(existing.get("evidence", [])) + list(candidate.get("evidence", []))
+        existing["evidence"] = list(dict.fromkeys(str(item) for item in evidence))
+        existing["recommended_tests"] = list(dict.fromkeys([
+            *existing.get("recommended_tests", []), *candidate.get("recommended_tests", [])
+        ]))
+    for candidate in candidate_state.values():
+        hypotheses = [item for item in candidate.pop("_fault_hypotheses", []) if item]
+        candidate["fault_hypothesis"] = " · ".join(hypotheses) if hypotheses else candidate.get("fault_hypothesis")
     verified_history = (
         [row for row in scoped_overlay.get("verified_component_history", []) if isinstance(row, dict)]
         if isinstance(scoped_overlay, dict)
@@ -1281,7 +1303,8 @@ def _render_cause_dashboard(
                     item.get("board_component_id") == component_id
                     for item in board_registry.get("components", [])
                 ):
-                    if st.button("PCB에서 위치 보기", key=f"cc_analysis_dashboard_focus_{project.project_id}_{component_id}",
+                    if st.button("PCB에서 위치 보기", key=candidate_focus_widget_key("analysis_dashboard", project.project_id, project.board_id,
+                                                                    component_id, fault_id),
                                  type="primary" if index == 1 else "secondary", use_container_width=True):
                         _focus_board_registry_component(st, project, board_registry, component_id)
                         st.rerun()
@@ -1289,7 +1312,8 @@ def _render_cause_dashboard(
                     item.component_id == component_id
                     for item in st.session_state.get("circuitcare_v4_current_components", ())
                 ):
-                    if st.button("PCB에서 위치 보기", key=f"cc_analysis_dashboard_focus_{project.project_id}_{component_id}",
+                    if st.button("PCB에서 위치 보기", key=candidate_focus_widget_key("analysis_dashboard", project.project_id, project.board_id,
+                                                                    component_id, fault_id),
                                  type="primary" if index == 1 else "secondary", use_container_width=True):
                         update_selection(st.session_state, project=project, selected_component=component_id)
                         st.rerun()
@@ -1304,7 +1328,9 @@ def _render_cause_dashboard(
                         st.caption(f"{cid} · {candidate.get('fault_title', candidate.get('fault_id'))} · 미검증")
                         if candidate.get("qwen_reason"):
                             st.caption(candidate["qwen_reason"])
-                        if cid and st.button("PCB 위치 보기", key=f"cc_qwen_extra_{project.project_id}_{cid}"):
+                        if cid and st.button("PCB 위치 보기", key=candidate_focus_widget_key("analysis_dashboard_qwen_extra", project.project_id,
+                                                                project.board_id, cid,
+                                                                str(candidate.get("fault_hypothesis") or candidate.get("fault_id") or ""))):
                             _focus_board_registry_component(st, project, board_registry, cid)
                             st.rerun()
         if next_action:
@@ -1360,13 +1386,15 @@ def _render_cause_dashboard(
                 registry=board_registry, analysis_snapshot=analysis_snapshot,
                 photos=st.session_state.get(INTAKE_IMAGES_KEY, []),
                 selected_board_component_id=st.session_state.get(BOARD_COMPONENT_SELECTION_KEY),
+                candidate_strategy=st.session_state.get(f"cc_candidate_strategy_{project.project_id}", "baseline"),
             )
             render_report_panel(st, snapshot=snapshot,
                                 root=Path(__file__).resolve().parents[4],
                                 workspace_id=project.project_id,
                                 expected_circuit_hash=None)
 def _render_top_cause(st: Any, project: ProjectContext, result: Any) -> None:
-    candidates = result.get("component_candidates", []) if isinstance(result, dict) else []
+    selected_strategy = st.session_state.get(f"cc_candidate_strategy_{project.project_id}", "baseline")
+    candidates = candidate_rows_for_strategy(result, selected_strategy) if isinstance(result, dict) else []
     next_tests = result.get("next_tests", []) if isinstance(result, dict) else []
     top = candidates[0] if candidates else None
     next_test = next((item for item in next_tests if item.get("type") != "question"), None)
@@ -1384,7 +1412,9 @@ def _render_top_cause(st: Any, project: ProjectContext, result: Any) -> None:
             st.caption("근거 · " + " · ".join(top["evidence"][:3]))
         if next_test:
             st.caption("다음 검사 · " + str(next_test.get("label") or next_test.get("name") or next_test.get("question") or next_test.get("test_id") or "추가 확인"))
-        if st.button("PCB에서 후보 위치 보기", key=f"cc_analysis_focus_{project.project_id}_{top.get('component_id')}", use_container_width=True):
+        if st.button("PCB에서 후보 위치 보기", key=candidate_focus_widget_key("analysis_summary", project.project_id, project.board_id,
+                                                        str(top.get("board_component_id") or top.get("component_id") or ""),
+                                                        str(top.get("fault_hypothesis") or top.get("fault_id") or "")), use_container_width=True):
             update_selection(st.session_state, project=project, selected_component=top.get("component_id"))
             st.rerun()
 

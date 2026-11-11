@@ -76,7 +76,8 @@ def fuse_inspection_candidates(
         fault = str(proposal.get("suspected_fault_id") or proposal.get("fault_id") or "")
         component = component_by_id.get(cid)
         presence = _presence(component or {}, proposal.get("component_review_status"))
-        if not cid or not fault or not component or presence in _EXCLUDED_STATES:
+        if (not cid or not fault or fault not in allowed_fault_ids or not component
+                or presence in _EXCLUDED_STATES):
             continue
         key = (cid, fault)
         candidate = fused.get(key)
