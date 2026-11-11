@@ -20,7 +20,9 @@ permissions:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    # ubuntu-latest currently resolves to 26.04 in hosted CI; its Resolute
+    # mirrors failed DNS resolution repeatedly in the ngspice install job.
+    runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
