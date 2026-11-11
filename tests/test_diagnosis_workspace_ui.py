@@ -5,6 +5,7 @@ import pytest
 
 from circuitcare.dashboard.views import unified_workspace as workspace
 from circuitcare.dashboard.views import symptom_diagnosis_panel as symptoms
+from circuitcare.dashboard.views import inspection_panel as inspection
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.frontend.workbench_state import SELECTION_KEY, enter_workbench
 from circuitcare.dashboard.views.symptom_diagnosis_panel import candidate_focus_widget_key
@@ -165,6 +166,27 @@ def test_auto_qwen_prefers_installed_qwen35_9b_and_caches_lookup(monkeypatch):
     assert symptoms._auto_qwen_model(state) == "qwen3.5:9b"
     assert symptoms._auto_qwen_model(state) == "qwen3.5:9b"
     assert OllamaStub.calls == 1
+
+
+def test_compact_inspector_renders_selected_component_without_scope_error():
+    class InspectorStub(_StreamlitStub):
+        def selectbox(self, _label, options, *, key=None, **_kwargs):
+            return self.session_state.get(key, options[0])
+
+    project = ProjectContext("compact-p", "compact-b")
+    component = SimpleNamespace(
+        component_id="R1", board_component_id="BC-R1", component_type="resistor",
+        reference_designators=("R1",), ocr_marking="103", bbox_xyxy=(1, 2, 8, 9),
+        source_backend_photo_ids=("photo-1",),
+    )
+    state = {SELECTION_KEY: SimpleNamespace(project_id=project.project_id, selected_component="R1")}
+
+    inspection.render_inspection_panel(
+        InspectorStub(state=state), project, components=(component,),
+        selected_component=component, compact=True,
+    )
+
+    assert state[inspection.USER_SUSPECTS_KEY][f"{project.project_id}|{project.board_id}"] == {}
 
 
 def test_real_streamlit_app_test_renders_workbench_without_runtime_errors():

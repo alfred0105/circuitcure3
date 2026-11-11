@@ -346,7 +346,6 @@ def render_inspection_panel(
                         str(st.session_state.get(ACTIVE_PHOTO_KEY) or "target:default")),
                 )
                 inventory_item["confirmed_functional_roles"] = list(confirmed_roles)
-            from circuitcare.symptom_diagnosis import load_knowledge
             modes = load_knowledge().get("fault_modes", {}).get("fault_modes", {})
             component_type = str(selected_component.component_type).casefold()
             component_type = {"integrated_circuit": "ic"}.get(component_type, component_type)
