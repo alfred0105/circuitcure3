@@ -9,6 +9,7 @@ from typing import Any
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.frontend.board_component_registry import (
     current_source_observation_fingerprint, resolve_measurement_board_component,
+    source_component_key,
 )
 from circuitcare.frontend.measurement_adapter import adapt_measurement_input
 from circuitcare.frontend.measurement_models import (
@@ -44,6 +45,30 @@ def _sigma_for_input_unit(value: Any, measurement_type: str, unit: str) -> str |
     return str(sigma_base / MEASUREMENT_UNITS[measurement_type][unit])
 
 
+def _sync_profile_test_state(
+    state: Any, *, test_key: str, type_key: str, unit_key: str, sigma_key: str,
+    tests: dict[str, Any],
+) -> None:
+    """Apply a selected registered profile before the next rerun creates widgets."""
+    test_id = state.get(test_key)
+    profile = tests.get(test_id, {}) if test_id else {}
+    measurement_type = profile.get("measurement_type")
+    if measurement_type not in MEASUREMENT_UNITS:
+        return
+    state[type_key] = measurement_type
+    state[unit_key] = tuple(MEASUREMENT_UNITS[measurement_type])[0]
+    state[sigma_key] = ""
+
+
+def _reset_measurement_type_state(
+    state: Any, *, type_key: str, unit_key: str, sigma_key: str,
+) -> None:
+    measurement_type = state.get(type_key)
+    if measurement_type in MEASUREMENT_UNITS:
+        state[unit_key] = tuple(MEASUREMENT_UNITS[measurement_type])[0]
+        state[sigma_key] = ""
+
+
 def render_measurement_panel(
     st: Any, project: ProjectContext, *, selected_component: ComponentOverlayViewModel | None,
     preview: bool = False, component_map_version: str | None = None,
@@ -59,6 +84,28 @@ def render_measurement_panel(
         st.warning("보드 ID가 없어 측정 기록을 연결할 수 없습니다.")
         return
     board_component_id = selected_component.board_component_id
+    if isinstance(board_registry, dict):
+        photo_id = selected_component.canonical_frame_id
+        local_id = selected_component.component_id
+        source_key = source_component_key(photo_id, local_id)
+        registry_component = next((row for row in board_registry.get("components", [])
+                                   if str(row.get("board_component_id")) == str(board_component_id)), None)
+        source = next((row for row in (registry_component or {}).get("source_components", [])
+                       if row.get("source_key") == source_key and row.get("review_status") != "EXCLUDED"), None)
+        current_fp = current_source_observation_fingerprint(
+            board_registry, photo_id=photo_id, component_id=local_id)
+        mapped_id = board_registry.get("source_to_board_id", {}).get(source_key)
+        photo_manifest = next((row for row in board_registry.get("photos", [])
+                               if row.get("photo_id") == photo_id), None)
+        source_box = tuple(float(value) for value in source.get("bbox_xyxy", [])) if source else ()
+        selected_box = tuple(float(value) for value in selected_component.bbox_xyxy)
+        if (not registry_component or registry_component.get("presence_status") == "EXCLUDED"
+                or not source or not board_component_id or str(mapped_id) != str(board_component_id)
+                or not current_fp or not photo_manifest
+                or photo_manifest.get("image_fingerprint") != source.get("image_fingerprint")
+                or source_box != selected_box):
+            st.warning("소자 위치 확인 필요 · 현재 사진·소자 ID·검수 연결을 Registry에서 검증하지 못해 측정 저장을 중단했습니다.")
+            return
     owner = f"{project.project_id}-{project.board_id}-{board_component_id or selected_component.component_id}-{fault_hypothesis or 'no-fault'}"
     all_records = get_measurements(st.session_state, project_id=project.project_id,
                                    board_id=project.board_id)
@@ -123,35 +170,92 @@ def render_measurement_panel(
         st.info("미리보기에서는 측정 기록을 저장할 수 없습니다.")
         return
 
-    type_key = f"cc_v5_type_{owner}"
-    measurement_type = st.selectbox(
-        "측정 종류", TYPE_OPTIONS, format_func=MEASUREMENT_TYPE_LABELS.get,
-        key=type_key,
-    )
-    units = tuple(MEASUREMENT_UNITS[measurement_type])
     knowledge = load_knowledge()
     fault_modes = knowledge.get("fault_modes", {}).get("fault_modes", {})
     normalized_type = selected_component.component_type.casefold()
     type_profile = knowledge.get("component_test_profiles", {}).get("profiles", {}).get(normalized_type, {})
     test_profiles = type_profile.get("tests", {})
-    test_options = [""] + list(test_profiles)
-    if recommended_test_id in test_profiles:
-        default_test_id = recommended_test_id
-    else:
-        default_test_id = next((test_id for test_id, profile in test_profiles.items()
-                                if fault_hypothesis in profile.get("fault_relations", {})), "")
-    if default_test_id:
-        default_measurement = test_profiles[default_test_id].get("measurement_type")
-        if default_measurement in TYPE_OPTIONS:
-            st.session_state.setdefault(f"cc_v5_type_{owner}", default_measurement)
+    fault_id_key = f"cc_v5_fault_{owner}"
+    requested_fault_id = str(fault_hypothesis or "")
+    compatible_tests = {
+        test_id: profile for test_id, profile in test_profiles.items()
+        if not requested_fault_id or requested_fault_id in profile.get("fault_relations", {})
+    }
+    default_test_id = (recommended_test_id if recommended_test_id in compatible_tests else
+                       next(iter(compatible_tests), ""))
+    test_options = [""] + list(compatible_tests)
+    test_key = f"cc_v5_test_{owner}"
+    test_state = st.session_state.get(test_key)
+    if test_state not in test_options:
+        st.session_state[test_key] = default_test_id
+    selected_test_id = st.session_state.get(test_key, "")
+    profile_signature_key = f"cc_v5_profile_applied_{owner}"
+    type_key = f"cc_v5_type_{owner}"
+    unit_key = f"cc_v5_unit_{owner}"
+    sigma_key = f"cc_v5_sigma_{owner}"
+    selected_profile = compatible_tests.get(selected_test_id, {})
+    if st.session_state.get(profile_signature_key) != selected_test_id:
+        expected_type = selected_profile.get("measurement_type")
+        if expected_type in MEASUREMENT_UNITS:
+            st.session_state[type_key] = expected_type
+            st.session_state[unit_key] = tuple(MEASUREMENT_UNITS[expected_type])[0]
+            st.session_state[sigma_key] = ""
+        elif type_key not in st.session_state:
+            st.session_state[type_key] = TYPE_OPTIONS[0]
+        st.session_state[profile_signature_key] = selected_test_id
+    elif type_key not in st.session_state:
+        st.session_state[type_key] = TYPE_OPTIONS[0]
+    st.selectbox(
+        "부품별 검사 항목", test_options, key=test_key,
+        format_func=lambda value: "프로파일 검사 선택 안 함" if not value else value,
+        help="등록된 검사만 선택한 고장 가설의 검증에 연결됩니다.",
+        on_change=_sync_profile_test_state,
+        kwargs={"state": st.session_state, "test_key": test_key, "type_key": type_key,
+                "unit_key": unit_key, "sigma_key": sigma_key, "tests": compatible_tests},
+    )
+    selected_test_id = st.session_state.get(test_key, "")
+    selected_profile = compatible_tests.get(selected_test_id, {})
+    profile_relations = selected_profile.get("fault_relations", {})
+    fault_options = [""] + ([fault_id for fault_id in fault_modes if fault_id in profile_relations]
+                              if selected_test_id else
+                              ([requested_fault_id] if requested_fault_id in fault_modes else []))
+    saved_fault_id = st.session_state.get(fault_id_key)
+    default_fault_id = (requested_fault_id if requested_fault_id in fault_options else
+                        saved_fault_id if saved_fault_id in fault_options else
+                        requested_fault_id if not selected_test_id else "")
+    if st.session_state.get(fault_id_key) not in fault_options:
+        st.session_state[fault_id_key] = default_fault_id
+    if selected_test_id:
+        st.selectbox("검증할 고장 가설", fault_options, key=fault_id_key,
+                     format_func=lambda code: "선택 안 함" if not code else fault_modes[code]["title"])
+        target_keywords = selected_profile.get("target_keywords", [])
+        condition_keywords = selected_profile.get("condition_keywords", [])
+        if target_keywords:
+            st.caption("측정 대상 예시 · " + " · ".join(target_keywords))
+        if condition_keywords:
+            st.caption("검사 조건 · " + " · ".join(condition_keywords))
+    selected_fault_id = str(st.session_state.get(fault_id_key) or "")
+    if selected_test_id and selected_fault_id not in profile_relations:
+        st.warning("선택한 검사 프로파일은 이 고장 가설과 연결되지 않습니다. 호환되는 검사만 저장할 수 있습니다.")
+        selected_test_id = ""
+    measurement_type = st.selectbox(
+        "측정 종류", TYPE_OPTIONS, format_func=MEASUREMENT_TYPE_LABELS.get,
+        key=type_key,
+        on_change=_reset_measurement_type_state,
+        kwargs={"state": st.session_state, "type_key": type_key,
+                "unit_key": unit_key, "sigma_key": sigma_key},
+    )
+    units = tuple(MEASUREMENT_UNITS[measurement_type])
     unit_key = f"cc_v5_unit_{owner}"
     if st.session_state.get(unit_key) not in units:
         st.session_state[unit_key] = units[0]
+    if selected_test_id and selected_profile.get("measurement_type") != measurement_type:
+        st.caption("프로파일 검사 종류와 다른 측정 종류를 선택했습니다. 이 값은 기록되지만 해당 프로파일 판정에는 사용되지 않습니다.")
     with st.form(f"cc_v5_add_measurement_{owner}"):
         value = st.text_input("측정값", key=f"cc_v5_value_{owner}", placeholder="예: 0, -0.25, 3.3")
         unit = st.selectbox("단위", units, key=unit_key)
         target = st.text_input("측정 대상/단자", placeholder="예: BZ1 양단 전압, U1 VCC-GND")
-        uncertainty = uncertainty_source = test_id = fault_hypothesis = ""
+        uncertainty = uncertainty_source = ""
         reference_min = reference_max = reference_source = reference_source_id = ""
         reference_status = "UNVERIFIED"
         operating_conditions = reference_conditions = ""
@@ -167,22 +271,6 @@ def render_measurement_panel(
                 key=f"cc_v5_sigma_{owner}", placeholder="계측기 정확도 사양에 따른 양수",
             )
             uncertainty_source = st.text_input("불확실도 출처", placeholder="예: 멀티미터 모델·정확도 사양")
-            test_index = test_options.index(default_test_id) if default_test_id in test_options else 0
-            test_id = st.selectbox(
-                "부품별 검사 항목", test_options, index=test_index,
-                key=f"cc_v5_test_{owner}",
-                format_func=lambda value: "프로파일 검사 선택 안 함" if not value else value,
-                help="등록된 검사 항목만 가설 검증에 사용할 수 있습니다.",
-            )
-            relations = test_profiles.get(test_id, {}).get("fault_relations", {})
-            fault_options = [""] + [fault_id for fault_id in fault_modes if fault_id in relations]
-            default_fault = fault_hypothesis if fault_hypothesis in fault_options else ""
-            fault_index = fault_options.index(default_fault) if default_fault in fault_options else 0
-            fault_hypothesis = st.selectbox(
-                "검사할 고장 가설", fault_options, index=fault_index,
-                key=f"cc_v5_fault_{owner}",
-                format_func=lambda code: "선택 안 함" if not code else fault_modes[code]["title"],
-            )
             range_col_a, range_col_b = st.columns(2)
             with range_col_a:
                 reference_min = st.text_input(f"정상 범위 하한 ({unit})")
@@ -206,6 +294,8 @@ def render_measurement_panel(
         submitted = st.form_submit_button("측정 기록 저장", type="primary")
     if submitted:
         try:
+            if selected_test_id and selected_fault_id not in profile_relations:
+                raise ValueError("선택한 검사와 고장 가설의 프로파일 관계가 일치하지 않습니다.")
             record = adapt_measurement_input(
                 project_id=project.project_id, board_id=project.board_id,
                 component_id=selected_component.component_id,
@@ -226,9 +316,10 @@ def render_measurement_panel(
                 ),
                 source_component_id=selected_component.component_id,
                 measurement_location=target,
-                identity_resolution_status=("USER_SELECTED_VERIFIED" if board_component_id else "UNRESOLVED"),
-                measurement_target=target, fault_hypothesis=fault_hypothesis or None,
-                test_id=test_id or None,
+                identity_resolution_status=("VERIFIED_SOURCE_IDENTITY" if board_component_id and isinstance(board_registry, dict)
+                                            else "UNRESOLVED"),
+                measurement_target=target, fault_hypothesis=selected_fault_id or requested_fault_id or None,
+                test_id=selected_test_id or None,
                 reference_min=reference_min, reference_max=reference_max,
                 reference_source=reference_source,
                 reference_source_id=reference_source_id,

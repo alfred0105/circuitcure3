@@ -1295,13 +1295,32 @@ def _render_fault_analysis_workspace(
                 board_registry, board_component_id=candidate_id,
                 preferred_photo_id=st.session_state.get(ACTIVE_PHOTO_KEY),
             )
-        if measurement_component is None and isinstance(selected, ComponentOverlayViewModel):
-            measurement_component = selected
         if (measurement_component is None and not isinstance(board_registry, dict)
                 and candidate_id):
             measurement_component = next((item for item in components
                 if isinstance(item, ComponentOverlayViewModel)
                 and (item.board_component_id == candidate_id or item.component_id == candidate_id)), None)
+        # The candidate identity is authoritative for measurement. Never fall back
+        # to whichever unrelated box happened to be selected in the Viewer.
+        if candidate_id and measurement_component is not None:
+            target_photo = measurement_component.canonical_frame_id
+            target_local = measurement_component.component_id
+            selection = st.session_state.get(SELECTION_KEY)
+            selection_changed = (
+                st.session_state.get(ACTIVE_PHOTO_KEY) != target_photo
+                or getattr(selection, "selected_component", None) != target_local
+                or st.session_state.get(BOARD_COMPONENT_SELECTION_KEY) != candidate_id
+            )
+            if selection_changed:
+                st.session_state[BOARD_COMPONENT_SELECTION_KEY] = candidate_id
+                st.session_state["circuitcare_v2_photo_choice"] = target_photo
+                update_selection(st.session_state, project=project, active_photo_id=target_photo,
+                                 selected_component=target_local)
+                st.rerun()
+        elif not candidate_id and isinstance(selected, ComponentOverlayViewModel):
+            measurement_component = selected
+        if candidate_id and measurement_component is None:
+            st.warning("소자 위치 확인 필요 · 선택한 후보를 현재 사진의 유효한 Registry 관측에 연결할 수 없어 측정을 중단했습니다.")
         if candidates or get_measurements(st.session_state, project_id=project.project_id,
                                           board_id=project.board_id or ""):
             st.markdown("#### 다음 확인 · 측정")

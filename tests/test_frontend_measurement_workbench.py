@@ -10,6 +10,7 @@ from circuitcare.frontend.measurement_state import (
 )
 from circuitcare.dashboard.views.measurement_panel import (
     _measurement_verification_gaps, _sigma_for_input_unit,
+    _reset_measurement_type_state, _sync_profile_test_state,
 )
 from circuitcare.analysis.fingerprints import build_analysis_fingerprints
 from circuitcare.analysis.models import AnalysisScope, AnalysisStatus
@@ -154,3 +155,42 @@ def test_same_measurement_facts_keep_current_analysis_but_changed_facts_stale_it
 def test_ui_uncertainty_stays_in_base_unit_when_measurement_unit_changes():
     assert float(_sigma_for_input_unit("0.1", "voltage", "mV")) == pytest.approx(100.0)
     assert float(_sigma_for_input_unit("5", "resistance", "kΩ")) == pytest.approx(0.005)
+
+
+def test_registered_measurement_profile_callback_updates_type_unit_before_widget_creation():
+    state = {"test": "resistor_open", "type": "voltage", "unit": "mV", "sigma": "0.2"}
+    _sync_profile_test_state(
+        state, test_key="test", type_key="type", unit_key="unit", sigma_key="sigma",
+        tests={"resistor_open": {"measurement_type": "resistance"}},
+    )
+    assert state == {"test": "resistor_open", "type": "resistance", "unit": "Ω", "sigma": ""}
+
+
+def test_measurement_type_change_resets_only_dependent_unit_and_uncertainty():
+    state = {"type": "voltage", "unit": "mV", "sigma": "1.5", "value": "3.3"}
+    _reset_measurement_type_state(state, type_key="type", unit_key="unit", sigma_key="sigma")
+    assert state == {"type": "voltage", "unit": "V", "sigma": "", "value": "3.3"}
+
+
+def test_measurement_profile_and_fault_are_saved_through_real_streamlit_widgets():
+    app_testing = pytest.importorskip("streamlit.testing.v1")
+    from pathlib import Path
+    from circuitcare.frontend.measurement_state import MEASUREMENTS_KEY
+
+    app_path = Path(__file__).parent / "e2e" / "f5_measurement_profile_app.py"
+    app = app_testing.AppTest.from_file(str(app_path), default_timeout=30).run()
+    assert not app.exception
+    assert next(item for item in app.selectbox if item.label == "측정 종류").value == "resistance"
+    assert next(item for item in app.selectbox if item.label == "검증할 고장 가설").value == "RESISTOR_FAILURE"
+    assert next(item for item in app.selectbox if item.label == "부품별 검사 항목").value == "isolated_resistance"
+
+    app.text_input(key="cc_v5_value_f5-profile-apptest-f5-profile-board-BC-R1-RESISTOR_FAILURE").set_value("10")
+    next(item for item in app.text_input if item.label == "측정 대상/단자").set_value("R1 양단")
+    app.button(key="FormSubmitter:cc_v5_add_measurement_f5-profile-apptest-f5-profile-board-BC-R1-RESISTOR_FAILURE-측정 기록 저장").click().run()
+
+    assert not app.exception
+    records = app.session_state[MEASUREMENTS_KEY]
+    saved = next(iter(records.values()))[0]
+    assert saved.measurement_type == "resistance"
+    assert saved.test_id == "isolated_resistance"
+    assert saved.fault_hypothesis == "RESISTOR_FAILURE"

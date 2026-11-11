@@ -7,8 +7,13 @@ from circuitcare.dashboard.views import unified_workspace as workspace
 from circuitcare.dashboard.views import symptom_diagnosis_panel as symptoms
 from circuitcare.dashboard.views import inspection_panel as inspection
 from circuitcare.frontend.models import ProjectContext
+from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.frontend.workbench_state import SELECTION_KEY, enter_workbench
 from circuitcare.dashboard.views.symptom_diagnosis_panel import candidate_focus_widget_key
+from circuitcare.dashboard.views.symptom_diagnosis_panel import (
+    _queue_measurement_change_rerun, _consume_measurement_change_rerun,
+)
+from circuitcare.analysis.models import AnalysisStatus
 
 
 class _Context:
@@ -211,6 +216,120 @@ def test_integrated_workspace_uses_candidate_rows_and_guides_measurement(monkeyp
     # A board-level diagnosis DTO has no photo-local geometry and must not be
     # passed directly into a form that expects a viewer/measurement model.
     assert measured == [None]
+
+
+def test_integrated_measurement_never_falls_back_to_unrelated_viewer_selection(monkeypatch):
+    project = ProjectContext("integrated-target-p", "integrated-target-b")
+
+    def component(local_id, board_id, kind):
+        return ComponentOverlayViewModel(
+            project_id=project.project_id, board_id=project.board_id, board_side="TOP",
+            component_id=local_id, board_component_id=board_id, component_type=kind,
+            display_label=local_id, canonical_frame_id="photo-1",
+            coordinate_frame="SOURCE_PHOTO_PIXEL", bbox_xyxy=(1, 2, 8, 9), polygon_xy=(),
+            source_backend_photo_ids=("photo-1",), observation_ids=(), detection_confidence=.9,
+            identification_status="USER_CONFIRMED", identity_match_status="PHOTO_LOCAL",
+            ocr_marking=None, possible_part_number=None, evidence=(), overlay_status="CANDIDATE",
+        )
+
+    candidate = component("R1", "BC-R1", "resistor")
+    unrelated_selection = component("C2", "BC-C2", "capacitor")
+    result = {"candidate_fusion": {"candidates": [
+        {"board_component_id": "BC-R1", "component_id": "R1", "fault_id": "RESISTOR_OPEN"},
+    ]}}
+    snapshot = {"result": result, "record": {"status": "CURRENT"}}
+    monkeypatch.setattr(workspace, "render_symptom_diagnosis_panel", lambda *_a, **_k: None)
+    monkeypatch.setattr(workspace, "current_analysis_snapshot", lambda *_a, **_k: snapshot)
+    measured = []
+    monkeypatch.setattr(workspace, "render_measurement_panel",
+                        lambda _st, _project, **kwargs: measured.append(kwargs["selected_component"]))
+    state = {
+        "circuitcare_v4_current_components": (candidate, unrelated_selection),
+        SELECTION_KEY: SimpleNamespace(selected_component="C2"),
+        workspace.BOARD_COMPONENT_SELECTION_KEY: "BC-C2",
+    }
+    workspace._render_fault_analysis_workspace(
+        _StreamlitStub(state=state), project, preview=False, mode="통합", analysis_snapshot=snapshot,
+        photo_snapshot={"components": (candidate, unrelated_selection)},
+        board_components=(candidate, unrelated_selection),
+    )
+
+    assert measured == [candidate]
+
+
+def test_measurement_change_queues_exactly_one_reanalysis_for_current_fingerprint():
+    state = {"measurement_fingerprint": "m-v1", "run_after_measurement_change": None}
+    _queue_measurement_change_rerun(
+        state, previous_fingerprint="m-v1", current_fingerprint="m-v2",
+        prior_analysis_exists=True, current_result=None, central_status=AnalysisStatus.STALE.value,
+    )
+    assert state["run_after_measurement_change"] == "m-v2"
+    assert _consume_measurement_change_rerun(state, "m-v2") is True
+    assert state.get("run_after_measurement_change") is None
+    assert _consume_measurement_change_rerun(state, "m-v2") is False
+
+
+def test_measurement_change_does_not_run_diagnosis_for_stale_or_obsolete_fingerprint():
+    state = {}
+    _queue_measurement_change_rerun(
+        state, previous_fingerprint="m-v1", current_fingerprint="m-v2",
+        prior_analysis_exists=True, current_result=None, central_status=AnalysisStatus.STALE.value,
+    )
+    assert _consume_measurement_change_rerun(state, "m-v3") is False
+    assert state.get("run_after_measurement_change") is None
+    _queue_measurement_change_rerun(
+        state, previous_fingerprint="m-v1", current_fingerprint="m-v2",
+        prior_analysis_exists=True, current_result={"status": "CURRENT"},
+        central_status=AnalysisStatus.CURRENT.value,
+    )
+    assert state.get("run_after_measurement_change") is None
+
+
+def test_streamlit_measurement_submission_automatically_reexecutes_diagnosis(monkeypatch):
+    app_testing = pytest.importorskip("streamlit.testing.v1")
+    calls = []
+
+    def diagnose_stub(**kwargs):
+        calls.append(list(kwargs.get("measurements", [])))
+        return {
+            "status": "OK", "message": "mock result", "symptom_codes": ["NO_POWER"],
+            "component_candidates": [{
+                "component_id": "R1", "board_component_id": "BC-R1",
+                "component_type": "resistor", "fault_id": "RESISTOR_FAILURE",
+                "candidate_rank": 1, "supporting_evidence": ["입력 증상"],
+                "opposing_evidence": [], "recommended_tests": ["isolated_resistance"],
+            }],
+            "hypotheses": [], "next_tests": [],
+        }
+
+    class OllamaStub:
+        def __init__(self, *, timeout_seconds):
+            pass
+
+        def list_models(self):
+            return []
+
+    monkeypatch.setattr(symptoms, "diagnose", diagnose_stub)
+    monkeypatch.setattr(symptoms, "OllamaClient", OllamaStub)
+    app_path = Path(__file__).parent / "e2e" / "f5_measurement_reanalysis_app.py"
+    app = app_testing.AppTest.from_file(str(app_path), default_timeout=30).run()
+    assert not app.exception
+    next(button for button in app.button if button.label == "AI 진단 시작").click().run()
+    assert not app.exception
+    assert len(calls) == 1
+
+    app.text_input(key="cc_v5_value_f5-reanalysis-apptest-f5-reanalysis-board-BC-R1-RESISTOR_FAILURE").set_value("10")
+    next(item for item in app.text_input if item.label == "측정 대상/단자").set_value("R1 양단")
+    app.button(key="FormSubmitter:cc_v5_add_measurement_f5-reanalysis-apptest-f5-reanalysis-board-BC-R1-RESISTOR_FAILURE-측정 기록 저장").click().run()
+
+    assert not app.exception
+    assert len(calls) == 2
+    assert calls[0] == []
+    assert len(calls[1]) == 1
+    assert calls[1][0]["component_id"] == "R1"
+    app.run()
+    assert not app.exception
+    assert len(calls) == 2
 
 
 def test_real_streamlit_app_test_renders_workbench_without_runtime_errors():

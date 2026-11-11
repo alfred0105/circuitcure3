@@ -10,6 +10,7 @@ import hashlib
 from pathlib import Path
 from uuid import uuid4
 
+from circuitcare.analysis.models import AnalysisStatus
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.frontend.measurement_state import get_measurements
 from circuitcare.local_llm import LocalLLMError, OllamaClient
@@ -186,6 +187,132 @@ def _simple_candidate_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     return list(grouped.values())[:3]
 
 
+def _simple_candidate_information(result: dict[str, Any]) -> dict[tuple[str, str], tuple[str, str, tuple[str, ...], tuple[str, ...]]]:
+    """Stable rule/measurement facts used to decide whether a follow-up helped."""
+    information = {}
+    for candidate in _simple_candidate_rows(result):
+        component_id = str(candidate.get("board_component_id") or candidate.get("component_id") or "")
+        for hypothesis in candidate.get("fault_hypotheses", []):
+            fault_id = str(hypothesis.get("fault_id") or hypothesis.get("fault_hypothesis") or "")
+            if not component_id or not fault_id:
+                continue
+            information[(component_id, fault_id)] = (
+                str(hypothesis.get("visual_status") or "SUSPECTED"),
+                str(hypothesis.get("measurement_verdict") or hypothesis.get("verification_status") or ""),
+                tuple(sorted(str(value) for value in (hypothesis.get("supporting_evidence") or []))),
+                tuple(sorted(str(value) for value in (hypothesis.get("opposing_evidence") or []))),
+            )
+    return information
+
+
+def _followup_result_improved(previous: dict, current: dict) -> bool:
+    """Count hypothesis separation or evidence/verdict changes, never Qwen rank text."""
+    old_keys, new_keys = set(previous), set(current)
+    if old_keys - new_keys:
+        return True
+    for key in old_keys & new_keys:
+        old_status, old_verdict, old_support, old_oppose = previous[key]
+        new_status, new_verdict, new_support, new_oppose = current[key]
+        if (old_status, old_verdict, old_support, old_oppose) != (
+            new_status, new_verdict, new_support, new_oppose
+        ):
+            return True
+    return False
+
+
+def _queue_measurement_change_rerun(
+    state: dict[str, Any], *, previous_fingerprint: str | None,
+    current_fingerprint: str, prior_analysis_exists: bool,
+    current_result: dict[str, Any] | None, central_status: str,
+) -> None:
+    """Queue exactly one analysis for a changed measurement snapshot."""
+    if (previous_fingerprint not in (None, "")
+            and previous_fingerprint != current_fingerprint
+            and prior_analysis_exists and current_result is None
+            and central_status == AnalysisStatus.STALE.value):
+        state["run_after_measurement_change"] = current_fingerprint
+
+
+def _consume_measurement_change_rerun(state: dict[str, Any], current_fingerprint: str) -> bool:
+    """Consume the one-shot request only when it still matches current evidence."""
+    queued_fingerprint = state.pop("run_after_measurement_change", None)
+    return queued_fingerprint == current_fingerprint
+
+
+def _render_simple_followup_question(
+    st: Any, project: ProjectContext, result: dict[str, Any], *, state: dict[str, Any],
+    knowledge: dict[str, Any], preview: bool, candidates: list[dict[str, Any]],
+) -> None:
+    """Render the one active safe question before candidate results for every simple path."""
+    next_tests = result.get("next_tests", []) if isinstance(result.get("next_tests"), list) else []
+    answered = set(str(item) for item in state.get("answered_test_ids", []))
+    question = result.get("llm_follow_up_question")
+    if (not isinstance(question, dict) or question.get("test_id") in answered
+            or question.get("type") != "question"):
+        question = next((row for row in next_tests if isinstance(row, dict)
+                         and row.get("type") == "question"
+                         and str(row.get("test_id")) not in answered), None)
+    if (question is None and result.get("status") == "NEEDS_SYMPTOMS"
+            and state.get("initial_symptom_answer") == "기타·모르겠음"):
+        question = _safe_initial_followup(knowledge, answered)
+    answered_count = len(answered - {INITIAL_SYMPTOM_QUESTION_ID})
+    stopped = bool(state.get("followup_questions_stopped"))
+    no_progress = int(state.get("followup_no_improvement_streak", 0))
+    if answered_count >= 5 or no_progress >= 2:
+        stopped = True
+        state["followup_questions_stopped"] = True
+    if stopped:
+        question = None
+    if question:
+        question_id = str(question.get("test_id") or "")
+        if question_id:
+            st.markdown("#### 새로운 확인 질문")
+            st.caption(f"질문 진행 · {answered_count} / 5")
+            if question.get("selection_reason"):
+                st.caption(str(question["selection_reason"]))
+            st.write(question.get("question", "확인할 내용이 있나요?"))
+            answer_key = f"{_project_key(project)}_simple_answer_{question_id}"
+            answer = st.radio("답변", ("예", "아니오", "모르겠음"), horizontal=True, key=answer_key)
+            if st.button("답변 반영", key=f"{answer_key}_submit", disabled=preview):
+                state["followup_pending_comparison"] = {
+                    "test_id": question_id,
+                    "candidate_information": _simple_candidate_information(result),
+                }
+                _save_follow_up_answer(state, question, answer)
+                state["run_after_initial_answer"] = True
+                st.session_state[_project_key(project)] = state
+                st.rerun()
+    if not stopped and answered_count < 5 and no_progress < 2:
+        if st.button("현재 정보로 검사 진행", key=f"{_project_key(project)}_stop_followup", disabled=preview):
+            state["followup_questions_stopped"] = True
+            st.session_state[_project_key(project)] = state
+            st.rerun()
+    history = state.get("question_answers", {})
+    completed = [(test_id, row) for test_id, row in history.items()
+                 if test_id != INITIAL_SYMPTOM_QUESTION_ID and isinstance(row, dict)]
+    if completed:
+        with st.expander(f"앞서 답한 질문 · {len(completed)}개"):
+            tests = knowledge.get("test_catalog", {}).get("tests", {})
+            for test_id, row in completed:
+                st.caption(f"{row.get('question', {}).get('question', test_id)} · {row.get('answer', '미답변')}")
+                question_row = tests.get(test_id, row.get("question", {}))
+                edit_key = f"{_project_key(project)}_edit_answer_{test_id}"
+                edited = st.radio("답변 수정", ("예", "아니오", "모르겠음", "답변 취소"),
+                                  horizontal=True, key=edit_key, index=(
+                                      ("예", "아니오", "모르겠음", "답변 취소").index(row.get("answer"))
+                                      if row.get("answer") in ("예", "아니오", "모르겠음", "답변 취소") else 0))
+                if st.button("수정 저장", key=f"{edit_key}_save"):
+                    state["followup_pending_comparison"] = {
+                        "test_id": str(test_id),
+                        "candidate_information": _simple_candidate_information(result),
+                    }
+                    _save_follow_up_answer(state, question_row, edited)
+                    state.pop("followup_questions_stopped", None)
+                    state["run_after_initial_answer"] = True
+                    st.session_state[_project_key(project)] = state
+                    st.rerun()
+
+
 def _render_simple_diagnosis_result(
     st: Any, project: ProjectContext, result: dict[str, Any], *, state: dict[str, Any],
     knowledge: dict[str, Any], preview: bool, board_registry: dict[str, Any] | None,
@@ -194,30 +321,16 @@ def _render_simple_diagnosis_result(
         st.caption("로컬 AI에 연결할 수 없어 규칙 기반 기본 진단으로 진행합니다.")
     pending = state.pop("followup_pending_comparison", None)
     if isinstance(pending, dict):
-        current_ids = [str(row.get("board_component_id") or row.get("component_id"))
-                       for row in _simple_candidate_rows(result)]
-        previous_ids = list(pending.get("candidate_ids", []))
-        old_order = {value: index for index, value in enumerate(previous_ids)}
-        movement = sum(old_order.get(value, index) != index for index, value in enumerate(current_ids))
-        improved = set(current_ids) != set(previous_ids) or movement > 0
-        state["followup_no_improvement_streak"] = 0 if improved else int(
-            state.get("followup_no_improvement_streak", 0)) + 1
+        previous_information = pending.get("candidate_information", {})
+        current_information = _simple_candidate_information(result)
+        improved = _followup_result_improved(previous_information, current_information)
+        state["followup_no_improvement_streak"] = (0 if improved else
+            int(state.get("followup_no_improvement_streak", 0)) + 1)
     if result.get("status") == "NEEDS_SYMPTOMS":
         st.info("증상 정보가 더 필요합니다. 모르는 항목은 ‘모르겠음’을 선택할 수 있습니다.")
-        fallback = _safe_initial_followup(
-            knowledge, set(str(value) for value in state.get("answered_test_ids", [])),
-        )
-        if fallback and state.get("initial_symptom_answer") == "기타·모르겠음":
-            st.markdown("#### 다음 질문")
-            st.write(fallback.get("question", "확인할 내용이 있나요?"))
-            answer_key = f"{_project_key(project)}_simple_answer_{fallback.get('test_id')}"
-            answer = st.radio("답변", ("예", "아니오", "모르겠음"), horizontal=True, key=answer_key)
-            if st.button("답변 반영", key=f"{answer_key}_submit", disabled=preview):
-                _save_follow_up_answer(state, fallback, answer)
-                state["run_after_initial_answer"] = True
-                st.session_state[_project_key(project)] = state
-                st.rerun()
     candidates = _simple_candidate_rows(result)
+    _render_simple_followup_question(st, project, result, state=state, knowledge=knowledge,
+                                     preview=preview, candidates=candidates)
     if candidates:
         st.markdown("#### AI 추천 검사 후보")
         for index, candidate in enumerate(candidates, start=1):
@@ -287,62 +400,6 @@ def _render_simple_diagnosis_result(
     else:
         st.caption(result.get("message", "후보를 만들 수 있는 근거가 아직 부족합니다."))
 
-    next_tests = result.get("next_tests", []) if isinstance(result.get("next_tests"), list) else []
-    answered = set(str(item) for item in state.get("answered_test_ids", []))
-    question = result.get("llm_follow_up_question")
-    if not isinstance(question, dict) or question.get("test_id") in answered:
-        question = next((row for row in next_tests if isinstance(row, dict)
-                         and row.get("type") == "question" and str(row.get("test_id")) not in answered), None)
-    answered_followups = set(str(value) for value in state.get("answered_test_ids", [])) - {INITIAL_SYMPTOM_QUESTION_ID}
-    followup_count = len(answered_followups)
-    followup_stopped = bool(state.get("followup_questions_stopped"))
-    no_improvement = int(state.get("followup_no_improvement_streak", 0))
-    if followup_count >= 5 or no_improvement >= 2:
-        question = None
-        state["followup_questions_stopped"] = True
-    if followup_stopped:
-        question = None
-    if question:
-        st.markdown("#### 새로운 확인 질문")
-        st.caption(f"질문 진행 · {followup_count} / 5")
-        if question.get("selection_reason"):
-            st.caption(str(question["selection_reason"]))
-        st.write(question.get("question", "확인할 내용이 있나요?"))
-        answer_key = f"{_project_key(project)}_simple_answer_{question.get('test_id')}"
-        answer = st.radio("답변", ("예", "아니오", "모르겠음"), horizontal=True, key=answer_key)
-        if st.button("답변 반영", key=f"{answer_key}_submit", disabled=preview):
-            before_ids = [str(row.get("board_component_id") or row.get("component_id"))
-                          for row in candidates]
-            state["followup_pending_comparison"] = {"test_id": str(question.get("test_id")),
-                                                       "candidate_ids": before_ids}
-            _save_follow_up_answer(state, question, answer)
-            state["run_after_initial_answer"] = True
-            st.session_state[_project_key(project)] = state
-            st.rerun()
-    if not followup_stopped and followup_count < 5 and no_improvement < 2:
-        if st.button("현재 정보로 검사 진행", key=f"{_project_key(project)}_stop_followup", disabled=preview):
-            state["followup_questions_stopped"] = True
-            st.session_state[_project_key(project)] = state
-            st.rerun()
-    history = state.get("question_answers", {})
-    completed = [(test_id, row) for test_id, row in history.items()
-                 if test_id != INITIAL_SYMPTOM_QUESTION_ID and isinstance(row, dict)]
-    if completed:
-        with st.expander(f"앞서 답한 질문 · {len(completed)}개"):
-            tests = knowledge.get("test_catalog", {}).get("tests", {})
-            for test_id, row in completed:
-                st.caption(f"{row.get('question', {}).get('question', test_id)} · {row.get('answer', '미답변')}")
-                question_row = tests.get(test_id, row.get("question", {}))
-                edit_key = f"{_project_key(project)}_edit_answer_{test_id}"
-                edited = st.radio("답변 수정", ("예", "아니오", "모르겠음", "답변 취소"),
-                                  horizontal=True, key=edit_key, index=(
-                                      ("예", "아니오", "모르겠음", "답변 취소").index(row.get("answer"))
-                                      if row.get("answer") in ("예", "아니오", "모르겠음", "답변 취소") else 0))
-                if st.button("수정 저장", key=f"{edit_key}_save"):
-                    _save_follow_up_answer(state, question_row, edited)
-                    state["run_after_initial_answer"] = True
-                    st.session_state[_project_key(project)] = state
-                    st.rerun()
 
 
 def current_analysis_snapshot(
@@ -1012,6 +1069,17 @@ def render_symptom_diagnosis_panel(
     current_result = get_current_result(
         st.session_state, scope=analysis_scope, fingerprints=analysis_fingerprints,
     )
+    previous_measurement_fingerprint = state.get("measurement_fingerprint")
+    prior_analysis_exists = bool(state.get("result")) or state.get("analysis_status") == "CURRENT"
+    # Measurement writes already invalidate the central result. Queue one run
+    # for this exact fingerprint; subsequent reruns see the same fingerprint
+    # and cannot enqueue a duplicate diagnosis.
+    _queue_measurement_change_rerun(
+        state, previous_fingerprint=previous_measurement_fingerprint,
+        current_fingerprint=measurement_fingerprint,
+        prior_analysis_exists=prior_analysis_exists, current_result=current_result,
+        central_status=central_state.get("status", ""),
+    )
     if state.get("input_fingerprint") != fingerprint or state.get("measurement_fingerprint") != measurement_fingerprint:
         if state.get("result") and not current_result:
             state["invalidated_reason"] = central_state.get("reason") or "분석 입력 변경"
@@ -1028,7 +1096,9 @@ def render_symptom_diagnosis_panel(
         state["analysis_status"] = central_state.get("status", "NOT_RUN")
     run_clicked = st.button("AI 진단 시작" if not current_result else "다시 분석",
                             type="primary", disabled=preview, key=f"{key}_run")
-    run_requested = run_clicked or bool(state.pop("run_after_initial_answer", False))
+    run_after_measurement_change = _consume_measurement_change_rerun(state, measurement_fingerprint)
+    run_after_initial_answer = bool(state.pop("run_after_initial_answer", False))
+    run_requested = bool(run_clicked or run_after_initial_answer or run_after_measurement_change)
     if run_requested:
         if simple_ui:
             _save_initial_symptom_answer(state, simple_choice)
