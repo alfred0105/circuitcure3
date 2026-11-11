@@ -20,6 +20,7 @@ import torch
 from ultralytics import YOLO
 
 from circuitcare.vision.box_reconciliation import deduplicate_component_boxes
+from circuitcare.vision.weight_paths import resolve_pcb_weights_root
 from circuitcare.component_taxonomy import normalize_component_class
 from hr.infer.predict import agnostic_nms, combine, detect as _detect, draw, draw_elements
 
@@ -28,12 +29,7 @@ SAMPLES = ROOT / "data" / "samples"
 
 
 def _default_weights_root() -> Path:
-    configured = os.environ.get("CIRCUITCARE_PCB_WEIGHTS")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    local_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share"))
-    user_weights = local_data / "circuitcare-ai" / "models" / "pcb_component_pipeline"
-    return user_weights if user_weights.is_dir() else ROOT / "weights"
+    return resolve_pcb_weights_root(ROOT)
 
 
 WEIGHTS = _default_weights_root()

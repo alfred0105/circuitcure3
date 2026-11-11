@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from circuitcare.vision.weight_paths import resolve_pcb_weights_root
 from circuitcare.vision.box_reconciliation import (
     associate_ocr_with_components, boxes_overlap_candidate, preserve_review_rows,
     exclude_review_row, remove_unreviewed_legacy_secondary_rows, same_component_box_pair,
@@ -36,8 +37,7 @@ INFERENCE_CONFIG = {"model_pipeline": "yolo26s+doctor-v12n+arshia-yolov8s", "con
 
 
 def _model_cache_fingerprint() -> str:
-    configured_root = os.environ.get("CIRCUITCARE_PCB_WEIGHTS")
-    root = Path(configured_root).expanduser() if configured_root else APP_DIR / "weights"
+    root = resolve_pcb_weights_root(APP_DIR)
     specs = ((root / "any_best.pt"),
              (root / "external" / "pcb-ai-doctor" / "best_v12n.pt"),
              (root / "external" / "pcb-yolov8s-detection" / "best.pt"))
