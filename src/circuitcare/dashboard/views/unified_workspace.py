@@ -44,7 +44,8 @@ from circuitcare.dashboard.views.inspection_panel import (
     _diagnosis_status_label,
 )
 from circuitcare.dashboard.views.symptom_diagnosis_panel import (
-    candidate_rows_for_strategy, candidate_focus_widget_key, current_analysis_snapshot, render_symptom_diagnosis_panel,
+    candidate_rows_for_strategy, candidate_focus_widget_key, current_analysis_snapshot,
+    render_symptom_diagnosis_panel, _simple_candidate_rows,
 )
 from circuitcare.dashboard.views.measurement_panel import render_measurement_panel
 from circuitcare.dashboard.views.diagnosis_panel import render_diagnosis_panel

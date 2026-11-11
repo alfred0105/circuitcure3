@@ -189,6 +189,28 @@ def test_compact_inspector_renders_selected_component_without_scope_error():
     assert state[inspection.USER_SUSPECTS_KEY][f"{project.project_id}|{project.board_id}"] == {}
 
 
+def test_integrated_workspace_uses_candidate_rows_and_guides_measurement(monkeypatch):
+    project = ProjectContext("integrated-p", "integrated-b")
+    component = SimpleNamespace(component_id="R1", board_component_id="BC-R1", component_type="resistor")
+    result = {"candidate_fusion": {"candidates": [
+        {"board_component_id": "BC-R1", "component_id": "R1", "fault_id": "RESISTOR_OPEN"},
+    ]}}
+    snapshot = {"result": result, "record": {"status": "CURRENT"}}
+    monkeypatch.setattr(workspace, "render_symptom_diagnosis_panel", lambda *_a, **_k: None)
+    monkeypatch.setattr(workspace, "current_analysis_snapshot", lambda *_a, **_k: snapshot)
+    measured = []
+    monkeypatch.setattr(workspace, "render_measurement_panel",
+                        lambda _st, _project, **kwargs: measured.append(kwargs["selected_component"]))
+
+    workspace._render_fault_analysis_workspace(
+        _StreamlitStub(state={"circuitcare_v4_current_components": (component,)}), project,
+        preview=False, mode="통합", analysis_snapshot=snapshot,
+        photo_snapshot={"components": (component,)}, board_components=(component,),
+    )
+
+    assert measured == [component]
+
+
 def test_real_streamlit_app_test_renders_workbench_without_runtime_errors():
     app_testing = pytest.importorskip("streamlit.testing.v1")
     from circuitcare.frontend.state import INTAKE_IMAGES_KEY, INTAKE_PROJECT_KEY
