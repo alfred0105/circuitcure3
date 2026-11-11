@@ -281,6 +281,18 @@ def test_cached_qwen_review_is_invalidated_when_source_box_changes():
     assert qwen_key not in session_state
 
 
+def test_review_fingerprint_ignores_exclude_restore_but_tracks_inference_inputs():
+    rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
+             "x1": 1, "y1": 1, "x2": 10, "y2": 10}]
+    baseline = _review_fingerprint(rows, None)
+    excluded = [{**rows[0], "상태": "제외"}]
+    restored = [{**rows[0], "상태": "확인"}]
+    assert _review_fingerprint(excluded, None) == baseline
+    assert _review_fingerprint(restored, None) == baseline
+    assert _review_fingerprint([{**rows[0], "소자 종류": "capacitor"}], None) != baseline
+    assert _review_fingerprint([{**rows[0], "x1": 2}], None) != baseline
+
+
 def test_qwen_duplicate_exclusion_is_only_enabled_for_confident_same_component():
     pair = ([10, 10, 110, 110], [20, 20, 100, 100])
     far_pair = ([0, 0, 20, 20], [500, 500, 520, 520])
@@ -597,7 +609,7 @@ def test_unreviewed_legacy_yolo2_rows_removed_but_user_reviewed_rows_remain():
 def test_automatic_ai_review_is_cached_by_photo_observations(monkeypatch):
     import circuitcare.vision.component_recognition_panel as panel
     calls = []
-    def fake_run(st_api, *, image_bytes, scope, rows, records_key, ocr_key, qwen_key):
+    def fake_run(st_api, *, image_bytes, scope, rows, records_key, ocr_key, qwen_key, progress=None):
         calls.append((scope, rows[0]["x1"]))
         ocr = {"records": []}
         st_api.session_state[ocr_key] = ocr
@@ -619,3 +631,35 @@ def test_automatic_ai_review_is_cached_by_photo_observations(monkeypatch):
     assert panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="s", rows=changed,
                                             records_key="rows") == "complete"
     assert len(calls) == 2
+
+
+def test_excluding_and_restoring_box_reuses_cached_ocr_and_qwen(monkeypatch):
+    import circuitcare.vision.component_recognition_panel as panel
+    calls = []
+
+    def fake_run(st_api, *, image_bytes, scope, rows, records_key, ocr_key, qwen_key, progress=None):
+        calls.append(scope)
+        ocr = {"records": []}
+        st_api.session_state[ocr_key] = ocr
+        st_api.session_state[qwen_key] = {
+            "verification_status": "AI_SUGGESTIONS_ONLY",
+            "source_fingerprint": panel._review_fingerprint(rows, ocr),
+            "class_reviews": [],
+        }
+
+    monkeypatch.setattr(panel, "_run_ai_review_workflow", fake_run)
+    state = {}
+    st_api = SimpleNamespace(session_state=state)
+    active = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
+               "x1": 2, "y1": 2, "x2": 20, "y2": 18}]
+    panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="photo", rows=active,
+                                     records_key="rows")
+    excluded = [{**active[0], "상태": "제외"}]
+    panel.invalidate_component_review_state(state, scope="photo", project_id="p", board_id="b")
+    panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="photo", rows=excluded,
+                                     records_key="rows")
+    panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="photo", rows=active,
+                                     records_key="rows")
+    assert calls == ["photo"]
+    ocr_key, qwen_key = panel.review_aux_keys("photo")
+    assert ocr_key in state and qwen_key in state

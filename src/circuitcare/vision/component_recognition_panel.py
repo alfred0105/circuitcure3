@@ -113,6 +113,11 @@ def review_aux_keys(scope: str) -> tuple[str, str]:
     return f"cc_component_ocr_{scope}", f"cc_component_qwen_review_{scope}"
 
 
+def _write_analysis_status(progress: Any, message: str) -> None:
+    if progress is not None:
+        progress.write(message)
+
+
 def invalidate_qwen_review(state: Any, scope: str) -> None:
     """Drop suggestions whenever their detection/OCR evidence changes."""
     _ocr_key, qwen_key = review_aux_keys(scope)
@@ -120,8 +125,7 @@ def invalidate_qwen_review(state: Any, scope: str) -> None:
 
 
 def invalidate_component_review_state(state: Any, *, scope: str, project_id: str, board_id: str | None) -> None:
-    """Invalidate derived AI/diagnosis results while leaving measurement records untouched."""
-    invalidate_qwen_review(state, scope)
+    """Invalidate diagnosis output; AI caches self-invalidate from actual inference inputs."""
     invalidate_legacy_diagnosis(state, project_id=project_id, board_id=board_id or "")
     invalidate_analysis(
         state,
@@ -208,7 +212,7 @@ def undo_last_box_exclusion(state: Any, *, scope: str, rows: list[dict]) -> str 
 
 def _review_fingerprint(rows: list[dict], ocr_result: dict | None) -> str:
     snapshot = [{key: row.get(key) for key in (
-        "component_id", "소자 종류", "상태", "x1", "y1", "x2", "y2", "신뢰도",
+        "component_id", "소자 종류", "x1", "y1", "x2", "y2", "신뢰도",
         "ocr_candidates", "reference_designators", "ocr_class_hints",
     )} for row in rows]
     payload = json.dumps({"rows": snapshot, "ocr": (ocr_result or {}).get("records", [])},
@@ -273,7 +277,8 @@ def _store_predictions(state: Any, records_key: str, result: dict) -> None:
 
 def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: str,
                                photo_id: str, review_image_bytes: bytes | None = None,
-                               review_image_size: tuple[int, int] | None = None) -> tuple[dict | None, str | None]:
+                               review_image_size: tuple[int, int] | None = None,
+                               progress: Any = None) -> tuple[dict | None, str | None]:
     """Automatically detect a newly selected photo once per Streamlit session."""
     review_bytes = review_image_bytes or image_bytes
     scope = review_scope(review_bytes, project_id, photo_id)
@@ -284,10 +289,13 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
     if cleaned_rows != old_rows:
         st_api.session_state[records_key] = cleaned_rows
     if result_key in st_api.session_state:
+        _write_analysis_status(progress, "YOLO 소자 탐지 · 재사용")
         return st_api.session_state[result_key], None
     if error_key in st_api.session_state:
+        _write_analysis_status(progress, "YOLO 소자 탐지 · 이전 실행 실패")
         return None, st_api.session_state[error_key]
     try:
+        _write_analysis_status(progress, "YOLO 소자 탐지 · 진행 중")
         with st_api.spinner("선택한 PCB 사진에서 소자를 자동 탐지하고 있습니다…"):
             engine = _app_server()
             engine.load_component_locator()
@@ -304,14 +312,17 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
                                     x2 * scale_x, y2 * scale_y]
         st_api.session_state[result_key] = result
         _store_predictions(st_api.session_state, records_key, result)
+        _write_analysis_status(progress, f"YOLO 소자 탐지 · 완료 · {len(result.get('detections', []))}개")
         return result, None
     except Exception as exc:
         st_api.session_state[error_key] = str(exc)
+        _write_analysis_status(progress, f"YOLO 소자 탐지 · 실패 · {exc}")
         return None, str(exc)
 
 
 def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows: list[dict],
-                            records_key: str, ocr_key: str, qwen_key: str) -> None:
+                            records_key: str, ocr_key: str, qwen_key: str,
+                            progress: Any = None) -> None:
     """Run RapidOCR and Qwen review on the existing first-pass YOLO proposals."""
     invalidate_qwen_review(st_api.session_state, scope)
     ocr_result = st_api.session_state.get(ocr_key)
@@ -322,11 +333,15 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
 
         if (not isinstance(ocr_result, dict)
                 or ocr_result.get("source_image_fingerprint") != image_fingerprint):
+            _write_analysis_status(progress, "PCB OCR · 진행 중")
             with st_api.spinner("PCB 실크스크린 OCR 중…"):
                 with Image.open(io.BytesIO(image_bytes)) as source_image:
                     ocr_result = run_local_ocr(source_image.convert("RGB"))
             ocr_result["source_image_fingerprint"] = image_fingerprint
             st_api.session_state[ocr_key] = ocr_result
+            _write_analysis_status(progress, f"PCB OCR · 완료 · {len(ocr_result.get('records', []))}개 문자 후보")
+        else:
+            _write_analysis_status(progress, "PCB OCR · 재사용")
         associated = associate_ocr_with_components([
             {**row, "bbox_xyxy": [row["x1"], row["y1"], row["x2"], row["y2"]]}
             for row in rows
@@ -361,10 +376,12 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                        "reference_designators": row.get("reference_designators", []),
                        "body_marking": row.get("body_marking")} for row in live_rows]
         with st_api.spinner("Qwen3.5 9B로 소자 종류·중복·미탐지 후보 검수 중…"):
+            _write_analysis_status(progress, "Qwen 소자 검수 · 진행 중")
             review = review_components_with_qwen(ollama, DEFAULT_REVIEW_MODEL,
                 image_bytes, detections, (ocr_result or {}).get("records", []))
         review["source_fingerprint"] = _review_fingerprint(rows, ocr_result)
         st_api.session_state[qwen_key] = review
+        _write_analysis_status(progress, f"Qwen 소자 검수 · 완료 · {len(review.get('class_reviews', []))}개 제안")
     except Exception as exc:
         stage = getattr(exc, "stage", "qwen_validation")
         qwen_status = ("failed" if stage == "qwen" else
@@ -380,27 +397,32 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                                    "qwen": {"status": qwen_status, "error": str(exc)},
                                    "ui": {"status": "not_reached", "events": []}},
         }
+        _write_analysis_status(progress, f"Qwen 소자 검수 · 실패 · {exc}")
         stage_label = {"candidate_search": "묶음 후보 탐색", "qwen": "Qwen 응답",
                        "qwen_validation": "Qwen 응답 검증"}.get(stage, "AI 검수")
         st_api.warning(f"{stage_label} 실패 · {exc} · 탐지와 사용자 검수 기록은 보존됩니다.")
 
 
 def ensure_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
-                                rows: list[dict], records_key: str) -> str:
+                                rows: list[dict], records_key: str,
+                                progress: Any = None) -> str:
     """Run the existing OCR→Qwen review once for each unchanged photo observation."""
     ocr_key, qwen_key = review_aux_keys(scope)
     fingerprint = _review_fingerprint(rows, st_api.session_state.get(ocr_key))
     cached = st_api.session_state.get(qwen_key)
     if isinstance(cached, dict) and cached.get("source_fingerprint") == fingerprint:
+        _write_analysis_status(progress, "OCR/Qwen 검수 · 결과 재사용")
         return "failed" if cached.get("verification_status") == "AI_REVIEW_FAILED" else "complete"
     # A separate in-flight/completed key prevents slow-model retries on every Streamlit
     # rerun, including failures. Explicit re-review clears this key in the UI.
     run_key = f"cc_ai_review_run_{scope}"
     if st_api.session_state.get(run_key) == fingerprint:
+        _write_analysis_status(progress, "OCR/Qwen 검수 · 이전 결과 재사용")
         return "failed" if isinstance(cached, dict) and cached.get("verification_status") == "AI_REVIEW_FAILED" else "complete"
     st_api.session_state[run_key] = fingerprint
     _run_ai_review_workflow(st_api, image_bytes=image_bytes, scope=scope, rows=rows,
-                            records_key=records_key, ocr_key=ocr_key, qwen_key=qwen_key)
+                            records_key=records_key, ocr_key=ocr_key, qwen_key=qwen_key,
+                            progress=progress)
     result = st_api.session_state.get(qwen_key)
     if isinstance(result, dict):
         st_api.session_state[run_key] = _review_fingerprint(

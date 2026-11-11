@@ -23,6 +23,14 @@ from circuitcare.vision.component_recognition_panel import (
 )
 
 
+class _ProgressStub:
+    def write(self, *_args, **_kwargs):
+        pass
+
+    def update(self, *_args, **_kwargs):
+        pass
+
+
 def _model():
     return ComponentOverlayViewModel(
         project_id="p1", board_id="b1", board_side="TOP", component_id="c1",
@@ -307,10 +315,10 @@ def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(mon
     )
     state = {"circuitcare_v2_active_photo_id": "photo-1",
              "circuitcare_v2_photo_choice": "photo-1"}
-    st = SimpleNamespace(session_state=state)
+    st = SimpleNamespace(session_state=state, status=lambda *_args, **_kwargs: _ProgressStub())
 
     def fake_detection(st_api, *, image_bytes, project_id, photo_id,
-                       review_image_bytes=None, review_image_size=None):
+                       review_image_bytes=None, review_image_size=None, progress=None):
         scope = unified_workspace.component_review_scope(review_image_bytes, project_id, photo_id)
         _result_key, rows_key, _error_key = review_keys(scope)
         component_id = "R1" if photo_id == "photo-1" else "C1"
@@ -322,6 +330,8 @@ def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(mon
 
     from circuitcare.dashboard.views import unified_workspace
     monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
+    monkeypatch.setattr(unified_workspace, "ensure_ai_component_review",
+                        lambda *_args, **_kwargs: "complete")
     photos = [{"image_id": "photo-1", "data": image_bytes[0]},
               {"image_id": "photo-2", "data": image_bytes[1]}]
     first = _prepare_photo_component_snapshot(st, project, photos)
@@ -352,10 +362,10 @@ def test_board_registry_prepares_every_photo_and_keeps_each_local_snapshot(monke
     )
     state = {"circuitcare_v2_active_photo_id": "front",
              "circuitcare_v2_photo_choice": "front"}
-    st = SimpleNamespace(session_state=state)
+    st = SimpleNamespace(session_state=state, status=lambda *_args, **_kwargs: _ProgressStub())
 
     def fake_detection(st_api, *, image_bytes, project_id, photo_id,
-                       review_image_bytes=None, review_image_size=None):
+                       review_image_bytes=None, review_image_size=None, progress=None):
         scope = unified_workspace.component_review_scope(review_image_bytes, project_id, photo_id)
         _result_key, rows_key, _error_key = review_keys(scope)
         st_api.session_state[rows_key] = [{
@@ -367,6 +377,8 @@ def test_board_registry_prepares_every_photo_and_keeps_each_local_snapshot(monke
 
     from circuitcare.dashboard.views import unified_workspace
     monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
+    monkeypatch.setattr(unified_workspace, "ensure_ai_component_review",
+                        lambda *_args, **_kwargs: "complete")
     photos = [{"image_id": photo_id, "data": data}
               for photo_id, data in zip(photo_ids, image_bytes)]
 

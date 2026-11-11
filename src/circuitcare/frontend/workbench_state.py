@@ -10,6 +10,7 @@ from circuitcare.frontend.models import ProjectContext, SelectionState
 SCREEN_KEY = "circuitcare_v2_screen"
 SELECTION_KEY = "circuitcare_v2_selection"
 BOARD_COMPONENT_SELECTION_KEY = "circuitcare_v7_selected_board_component_id"
+MEASUREMENT_TARGET_BOARD_COMPONENT_KEY = "circuitcare_v7_measurement_target_board_component_id"
 ACTIVE_PHOTO_KEY = "circuitcare_v2_active_photo_id"
 VIEW_ZOOM_KEY = "circuitcare_v2_view_zoom"
 VIEW_TRANSFORM_KEY = "circuitcare_v2_view_transform"
@@ -31,6 +32,7 @@ def enter_workbench(
     state[MODE_KEY] = "PREVIEW_ONLY" if preview else "DIAGNOSTIC"
     state[PHOTO_STATUS_KEY] = "NO_IMAGES" if not project.image_records else "READY"
     state[SELECTION_KEY] = selection
+    state.pop(MEASUREMENT_TARGET_BOARD_COMPONENT_KEY, None)
     state[ACTIVE_PHOTO_KEY] = selection.active_photo_id
     state[VIEW_ZOOM_KEY] = 1.0
     state[VIEW_TRANSFORM_KEY] = {

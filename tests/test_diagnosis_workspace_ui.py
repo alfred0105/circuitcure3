@@ -104,7 +104,10 @@ def test_measurement_target_changes_shared_selection_only_when_callback_runs():
     enter_workbench(state, project)
     registry = {"components": [{
         "board_component_id": "bc-2",
-        "source_components": [{"photo_id": "back-photo", "component_id": "R8"}],
+        "presence_status": "UNCONFIRMED",
+        "source_components": [{"photo_id": "back-photo", "component_id": "R8",
+                               "coordinate_frame": "SOURCE_PHOTO_PIXEL", "bbox_xyxy": [1, 2, 8, 9],
+                               "component_type": "resistor", "review_status": "검수 필요"}],
     }]}
     st = _StreamlitStub(state=state)
     target_key = "measurement-target"
@@ -112,9 +115,10 @@ def test_measurement_target_changes_shared_selection_only_when_callback_runs():
 
     workspace._handle_measurement_target_change(state, project, registry, target_key)
 
-    assert state[workspace.BOARD_COMPONENT_SELECTION_KEY] == "bc-2"
-    assert state["circuitcare_v2_photo_choice"] == "back-photo"
-    assert state[SELECTION_KEY].selected_component == "R8"
+    assert state[workspace.MEASUREMENT_TARGET_BOARD_COMPONENT_KEY] == "bc-2"
+    assert workspace.BOARD_COMPONENT_SELECTION_KEY not in state
+    assert "circuitcare_v2_photo_choice" not in state
+    assert state[SELECTION_KEY].selected_component is None
 
 
 def test_fixed_viewer_shell_keeps_pcb_visible_and_renders_single_diagnosis_flow(monkeypatch):
@@ -194,6 +198,22 @@ def test_compact_inspector_renders_selected_component_without_scope_error():
     assert state[inspection.USER_SUSPECTS_KEY][f"{project.project_id}|{project.board_id}"] == {}
 
 
+def test_dismissed_board_suspect_is_not_restored_by_legacy_scope_migration():
+    project = ProjectContext("suspect-p", "suspect-b")
+    owner = f"{project.project_id}|{project.board_id}"
+    old_owner = f"{owner}|photo-1"
+    state = {
+        inspection.USER_SUSPECTS_KEY: {
+            old_owner: {"BC-R1": {"board_component_id": "BC-R1", "component_id": "R1"}},
+        },
+        inspection.USER_SUSPECTS_MIGRATION_KEY: {},
+    }
+
+    inspection.dismiss_board_suspect(state, project, "BC-R1")
+    assert inspection.board_suspects(state, project) == []
+    assert "BC-R1" in state[inspection.USER_SUSPECTS_DISMISSED_KEY][owner]
+
+
 def test_integrated_workspace_uses_candidate_rows_and_guides_measurement(monkeypatch):
     project = ProjectContext("integrated-p", "integrated-b")
     component = SimpleNamespace(component_id="R1", board_component_id="BC-R1", component_type="resistor")
@@ -255,6 +275,26 @@ def test_integrated_measurement_never_falls_back_to_unrelated_viewer_selection(m
     )
 
     assert measured == [candidate]
+    assert state[SELECTION_KEY].selected_component == "C2"
+    assert state[workspace.BOARD_COMPONENT_SELECTION_KEY] == "BC-C2"
+    assert state[workspace.MEASUREMENT_TARGET_BOARD_COMPONENT_KEY] == "BC-R1"
+
+
+def test_excluded_registry_component_cannot_be_focused_as_measurement_or_viewer_target():
+    project = ProjectContext("excluded-focus-p", "excluded-focus-b")
+    registry = {"components": [{
+        "board_component_id": "bc-x", "presence_status": "EXCLUDED",
+        "source_components": [{"photo_id": "p1", "component_id": "R1",
+                               "coordinate_frame": "SOURCE_PHOTO_PIXEL", "bbox_xyxy": [1, 2, 8, 9]}],
+    }]}
+    state = {}
+    enter_workbench(state, project)
+    st = _StreamlitStub(state=state)
+    assert workspace._focus_board_registry_component(st, project, registry, "bc-x") is False
+    state["target"] = "bc-x"
+    workspace._handle_measurement_target_change(state, project, registry, "target")
+    assert workspace.MEASUREMENT_TARGET_BOARD_COMPONENT_KEY not in state
+    assert workspace.BOARD_COMPONENT_SELECTION_KEY not in state
 
 
 def test_measurement_change_queues_exactly_one_reanalysis_for_current_fingerprint():

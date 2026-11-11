@@ -54,7 +54,7 @@ from circuitcare.dashboard.views.report_panel import render_report_panel
 from circuitcare.reporting.report_builder import build_pcb_diagnostic_snapshot
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
-    ensure_ai_component_review, ensure_component_detection, render_component_recognition_panel,
+    _review_fingerprint, ensure_ai_component_review, ensure_component_detection, render_component_recognition_panel,
     review_aux_keys, review_keys, review_scope as component_review_scope,
 )
 from circuitcare.vision.box_reconciliation import board_visible_review_rows, same_component_box_pair
@@ -63,7 +63,8 @@ from circuitcare.frontend.state import (
     reset_intake_for_new_project,
 )
 from circuitcare.frontend.workbench_state import (
-    ACTIVE_PHOTO_KEY, BOARD_COMPONENT_SELECTION_KEY, MODE_KEY, SCREEN_KEY, SELECTION_KEY, VIEW_ZOOM_KEY,
+    ACTIVE_PHOTO_KEY, BOARD_COMPONENT_SELECTION_KEY, MEASUREMENT_TARGET_BOARD_COMPONENT_KEY,
+    MODE_KEY, SCREEN_KEY, SELECTION_KEY, VIEW_ZOOM_KEY,
     VIEW_TRANSFORM_KEY, enter_workbench, update_selection,
 )
 from circuitcare.frontend.viewer_geometry import requested_view_transform
@@ -220,21 +221,50 @@ def _prepare_photo_component_snapshot(
     except (ImageLoadError, ValueError):
         return {"photo_id": photo_id, "components": (), "review_scope": None,
                 "error": "PCB 이미지 로드 실패"}
+    review_scope = component_review_scope(detector_image_bytes, project.project_id, photo_id)
+    result_key, records_key, error_key = review_keys(review_scope)
+    detection_needs_run = result_key not in st.session_state and error_key not in st.session_state
+    progress = st.status("PCB 분석 중", expanded=True) if detection_needs_run else None
+    if progress is not None:
+        progress.write("이미지 준비 · 완료")
     auto_result, auto_error = ensure_component_detection(
         st, image_bytes=image_data, project_id=project.project_id, photo_id=photo_id,
         review_image_bytes=detector_image_bytes, review_image_size=loaded.processed_size,
+        progress=progress,
     )
-    review_scope = component_review_scope(detector_image_bytes, project.project_id, photo_id)
-    _result_key, records_key, _error_key = review_keys(review_scope)
     rows = list(st.session_state.get(records_key, []))
     review_state = "unavailable"
     if (auto_result is not None and not auto_error
             and auto_result.get("image_width") and auto_result.get("image_height")):
+        ocr_key, qwen_key = review_aux_keys(review_scope)
+        ai_fingerprint = _review_fingerprint(rows, st.session_state.get(ocr_key))
+        cached_qwen = st.session_state.get(qwen_key)
+        ai_run_key = f"cc_ai_review_run_{review_scope}"
+        ai_needs_run = (not isinstance(cached_qwen, dict)
+                        or cached_qwen.get("source_fingerprint") != ai_fingerprint)
+        ai_needs_run = ai_needs_run and st.session_state.get(ai_run_key) != ai_fingerprint
+        if progress is None and ai_needs_run:
+            progress = st.status("PCB 분석 중", expanded=True)
+            progress.write("이미지 준비 · 완료")
+            progress.write("YOLO 소자 탐지 · 재사용")
+        if progress is not None:
+            progress.write("소자 종류·OCR 입력 확인 · 완료")
         review_state = ensure_ai_component_review(
             st, image_bytes=detector_image_bytes, scope=review_scope,
-            rows=rows, records_key=records_key,
+            rows=rows, records_key=records_key, progress=progress,
         )
         rows = list(st.session_state.get(records_key, []))
+        if progress is not None:
+            progress.write("Registry 및 소자 정보 통합 · 완료")
+            qwen_failure = review_state == "failed"
+            progress.update(
+                label=("일부 분석 실패 · 사용 가능한 결과로 계속 진행" if qwen_failure
+                       else f"분석 완료 · 탐지된 소자 {len(rows)}개 · 확인이 필요한 소자 "
+                            f"{sum(row.get('상태') != '확인' and row.get('상태') != '제외' for row in rows)}개"),
+                state="error" if qwen_failure else "complete", expanded=False,
+            )
+    elif progress is not None:
+        progress.update(label="YOLO 탐지 실패 · 사진 정보는 보존됩니다", state="error", expanded=True)
     _ocr_key, qwen_key = (f"cc_component_ocr_{review_scope}", f"cc_component_qwen_review_{review_scope}")
     qwen_result = st.session_state.get(qwen_key, {})
     qwen_types = {str(item.get("detection_id")): item for item in qwen_result.get("class_reviews", [])
@@ -1000,7 +1030,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
         with left:
             _render_pcb(st, project, st.session_state.get(INTAKE_IMAGES_KEY, []))
         with right:
-            _render_component_inspector(st, project, preview, compact=True)
+            _render_component_inspector(st, project, preview, compact=True, board_registry=board_registry)
             _render_fault_analysis_workspace(
                 st, project, preview, mode="통합",
                 analysis_snapshot=live_analysis_snapshot,
@@ -1025,8 +1055,12 @@ def _focus_board_registry_component(
 ) -> bool:
     rows = registry.get("components", []) if isinstance(registry, dict) else []
     row = next((item for item in rows if item.get("board_component_id") == board_component_id), None)
+    if not row or row.get("presence_status") == "EXCLUDED":
+        return False
     sources = sorted(row.get("source_components", []),
-                     key=lambda item: item.get("review_status") == "EXCLUDED") if row else []
+                     key=lambda item: item.get("review_status") == "EXCLUDED")
+    sources = [item for item in sources if item.get("review_status") != "EXCLUDED"
+               and item.get("presence_status") != "EXCLUDED"]
     if not sources:
         return False
     source = sources[0]
@@ -1041,24 +1075,26 @@ def _focus_board_registry_component(
 def _handle_measurement_target_change(
     state: Any, project: ProjectContext, registry: dict[str, Any] | None, widget_key: str,
 ) -> None:
-    """Change the shared selection only for an explicit target-widget event."""
+    """Change the measurement target only; Viewer selection is independent."""
     board_component_id = state.get(widget_key)
     rows = registry.get("components", []) if isinstance(registry, dict) else []
     row = next((item for item in rows
                 if item.get("board_component_id") == board_component_id), None)
-    sources = sorted(row.get("source_components", []),
-                     key=lambda item: item.get("review_status") == "EXCLUDED") if row else []
-    if not sources:
+    if not row or row.get("presence_status") == "EXCLUDED":
         return
-    source = sources[0]
-    state[BOARD_COMPONENT_SELECTION_KEY] = board_component_id
-    state["circuitcare_v2_photo_choice"] = source.get("photo_id")
-    update_selection(state, project=project, active_photo_id=source.get("photo_id"),
-                     selected_component=source.get("component_id"))
+    resolved = measurement_view_model_for_board_component(
+        registry, board_component_id=str(board_component_id),
+        preferred_photo_id=state.get(ACTIVE_PHOTO_KEY),
+    )
+    if resolved is None:
+        return
+    state[MEASUREMENT_TARGET_BOARD_COMPONENT_KEY] = str(board_component_id)
 
 
-def _render_component_inspector(st: Any, project: ProjectContext, preview: bool, *, compact: bool = False) -> None:
+def _render_component_inspector(st: Any, project: ProjectContext, preview: bool, *, compact: bool = False,
+                                board_registry: dict[str, Any] | None = None) -> None:
     current_components = tuple(st.session_state.get("circuitcare_v4_current_components", ()))
+    active_registry = board_registry or st.session_state.get("circuitcare_v7_active_board_registry")
     render_inspection_panel(
         st, project, preview=preview, components=current_components,
         selected_component=_selected_component(st),
@@ -1068,8 +1104,10 @@ def _render_component_inspector(st: Any, project: ProjectContext, preview: bool,
         inventory_scope=st.session_state.get("circuitcare_v4_component_inventory_scope"),
         review_image_bytes=st.session_state.get("cc_active_component_review_image"),
         review_scope=st.session_state.get("cc_active_component_review_scope"),
-        board_registry=st.session_state.get("circuitcare_v7_active_board_registry"),
+        board_registry=active_registry,
         compact=compact,
+        on_focus_component=lambda board_id: _focus_board_registry_component(
+            st, project, active_registry, board_id),
     )
     if compact:
         active_review_scope = st.session_state.get("cc_active_component_review_scope")
@@ -1258,6 +1296,7 @@ def _render_fault_analysis_workspace(
                 format_func=lambda value: candidate_labels.get(value, value),
             )
             candidate_id = selected_candidate_id if selected_candidate_id in candidate_ids else candidate_ids[0]
+            st.session_state[MEASUREMENT_TARGET_BOARD_COMPONENT_KEY] = candidate_id
             selected_candidate = next(row for row in candidates
                                       if str(row.get("board_component_id") or row.get("component_id")) == candidate_id)
             hypotheses = [row for row in selected_candidate.get("fault_hypotheses", []) if row.get("fault_id")]
@@ -1300,25 +1339,20 @@ def _render_fault_analysis_workspace(
             measurement_component = next((item for item in components
                 if isinstance(item, ComponentOverlayViewModel)
                 and (item.board_component_id == candidate_id or item.component_id == candidate_id)), None)
-        # The candidate identity is authoritative for measurement. Never fall back
-        # to whichever unrelated box happened to be selected in the Viewer.
-        if candidate_id and measurement_component is not None:
-            target_photo = measurement_component.canonical_frame_id
-            target_local = measurement_component.component_id
-            selection = st.session_state.get(SELECTION_KEY)
-            selection_changed = (
-                st.session_state.get(ACTIVE_PHOTO_KEY) != target_photo
-                or getattr(selection, "selected_component", None) != target_local
-                or st.session_state.get(BOARD_COMPONENT_SELECTION_KEY) != candidate_id
-            )
-            if selection_changed:
-                st.session_state[BOARD_COMPONENT_SELECTION_KEY] = candidate_id
-                st.session_state["circuitcare_v2_photo_choice"] = target_photo
-                update_selection(st.session_state, project=project, active_photo_id=target_photo,
-                                 selected_component=target_local)
-                st.rerun()
-        elif not candidate_id and isinstance(selected, ComponentOverlayViewModel):
-            measurement_component = selected
+        # Top candidate selection changes the measurement target only. The Viewer
+        # remains on the user's clicked component until they explicitly request
+        # a location jump.
+        if candidate_id and measurement_component is not None and st.button(
+            "PCB에서 위치 보기", key=f"cc_measure_candidate_focus_{project.project_id}_{candidate_id}",
+        ):
+            if isinstance(board_registry, dict):
+                _focus_board_registry_component(st, project, board_registry, candidate_id)
+            else:
+                update_selection(st.session_state, project=project,
+                                 active_photo_id=measurement_component.canonical_frame_id,
+                                 selected_component=measurement_component.component_id)
+                st.session_state[ACTIVE_PHOTO_KEY] = measurement_component.canonical_frame_id
+            st.rerun()
         if candidate_id and measurement_component is None:
             st.warning("소자 위치 확인 필요 · 선택한 후보를 현재 사진의 유효한 Registry 관측에 연결할 수 없어 측정을 중단했습니다.")
         if candidates or get_measurements(st.session_state, project_id=project.project_id,
@@ -1369,30 +1403,59 @@ def _render_fault_analysis_workspace(
                                 board_registry=board_registry)
     elif mode == "측정":
         st.markdown("#### 측정 기록과 가설 검증")
-        if components:
-            component_ids = [item.component_id for item in components]
-            option_labels = {item.component_id: f"{item.component_id} · {item.component_type}" for item in components}
-            selected_id = st.session_state.get(BOARD_COMPONENT_SELECTION_KEY)
+        if isinstance(board_registry, dict):
+            active_targets = [row for row in board_registry.get("components", [])
+                              if row.get("presence_status") != "EXCLUDED"
+                              and measurement_view_model_for_board_component(
+                                  board_registry,
+                                  board_component_id=str(row.get("board_component_id")),
+                                  preferred_photo_id=st.session_state.get(ACTIVE_PHOTO_KEY),
+                              ) is not None]
+            component_ids = [str(row.get("board_component_id")) for row in active_targets]
+            option_labels = {str(row.get("board_component_id")):
+                             f"{row.get('component_type', 'unknown')} · {row.get('board_component_id')}"
+                             for row in active_targets}
+            viewer_board_id = st.session_state.get(BOARD_COMPONENT_SELECTION_KEY)
+            selected_id = st.session_state.get(MEASUREMENT_TARGET_BOARD_COMPONENT_KEY)
             if selected_id not in component_ids:
-                selected_local_id = getattr(selection, "selected_component", None)
-                selected_id = (component_id_aliases or {}).get(selected_local_id) if selected_local_id else None
-            if selected_id not in component_ids:
-                selected_id = component_ids[0]
+                selected_id = viewer_board_id if viewer_board_id in component_ids else (component_ids[0] if component_ids else None)
+                if selected_id:
+                    st.session_state[MEASUREMENT_TARGET_BOARD_COMPONENT_KEY] = selected_id
             target_key = f"cc_measurement_target_{project.project_id}"
-            sync_key = f"cc_measurement_target_synced_{project.project_id}"
-            if (target_key not in st.session_state
-                    or st.session_state.get(sync_key) != st.session_state.get(BOARD_COMPONENT_SELECTION_KEY)):
+            if component_ids and st.session_state.get(target_key) not in component_ids:
                 st.session_state[target_key] = selected_id
-                st.session_state[sync_key] = st.session_state.get(BOARD_COMPONENT_SELECTION_KEY)
-            st.selectbox(
-                "측정 대상 소자", component_ids, index=component_ids.index(selected_id),
-                format_func=option_labels.get,
-                key=target_key, on_change=_handle_measurement_target_change,
-                kwargs={"state": st.session_state, "project": project,
-                        "registry": board_registry, "widget_key": target_key},
-            )
+            if component_ids:
+                st.selectbox(
+                    "측정 대상 소자", component_ids, format_func=option_labels.get,
+                    key=target_key, on_change=_handle_measurement_target_change,
+                    kwargs={"state": st.session_state, "project": project,
+                            "registry": board_registry, "widget_key": target_key},
+                )
+                selected_id = st.session_state.get(target_key)
+                st.session_state[MEASUREMENT_TARGET_BOARD_COMPONENT_KEY] = selected_id
+                measurement_component = measurement_view_model_for_board_component(
+                    board_registry, board_component_id=str(selected_id),
+                    preferred_photo_id=st.session_state.get(ACTIVE_PHOTO_KEY),
+                )
+                if measurement_component and st.button(
+                    "PCB에서 위치 보기", key=f"cc_measurement_target_focus_{project.project_id}_{selected_id}",
+                ):
+                    _focus_board_registry_component(st, project, board_registry, str(selected_id))
+                    st.rerun()
+            else:
+                measurement_component = None
+        else:
+            component_ids = [item.board_component_id or item.component_id for item in components
+                             if item.presence_status != "EXCLUDED"]
+            selected_id = st.session_state.get(MEASUREMENT_TARGET_BOARD_COMPONENT_KEY)
+            if selected_id not in component_ids:
+                selected_id = component_ids[0] if component_ids else None
+                if selected_id:
+                    st.session_state[MEASUREMENT_TARGET_BOARD_COMPONENT_KEY] = selected_id
+            measurement_component = next((item for item in components
+                                          if (item.board_component_id or item.component_id) == selected_id), None)
         render_measurement_panel(
-            st, project, selected_component=selected, preview=preview,
+            st, project, selected_component=measurement_component, preview=preview,
             component_map_version=(board_registry.get("version") if isinstance(board_registry, dict)
                                    else st.session_state.get(MAP_VERSION_KEY)),
             board_registry=board_registry,
@@ -1407,7 +1470,7 @@ def _render_fault_analysis_workspace(
                 component_map_version=st.session_state.get(MAP_VERSION_KEY),
             )
 
-        st.caption("PCB Viewer는 왼쪽에 고정되어 있으며, 측정 대상 변경은 같은 보드 소자 선택에 반영됩니다.")
+        st.caption("PCB Viewer 선택과 측정 대상은 별도로 유지됩니다. ‘PCB에서 위치 보기’로 선택한 측정을 강조할 수 있습니다.")
 
 
 def _render_cause_dashboard(

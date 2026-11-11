@@ -9,6 +9,15 @@ from PIL import Image
 from circuitcare.frontend.state import INTAKE_PROJECT_KEY
 
 
+@pytest.fixture(autouse=True)
+def _mock_detector_in_ui_soak(monkeypatch):
+    """Soak Streamlit navigation without invoking native YOLO/OCR runtimes."""
+    from circuitcare.dashboard.views import unified_workspace
+
+    monkeypatch.setattr(unified_workspace, "ensure_component_detection",
+                        lambda *_args, **_kwargs: (None, "mocked in UI soak test"))
+
+
 def _photo(color: tuple[int, int, int]) -> bytes:
     stream = io.BytesIO()
     Image.new("RGB", (48, 32), color).save(stream, format="PNG")

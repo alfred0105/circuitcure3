@@ -186,6 +186,9 @@ def test_measurement_profile_and_fault_are_saved_through_real_streamlit_widgets(
 
     app.text_input(key="cc_v5_value_f5-profile-apptest-f5-profile-board-BC-R1-RESISTOR_FAILURE").set_value("10")
     next(item for item in app.text_input if item.label == "측정 대상/단자").set_value("R1 양단")
+    condition = next(item for item in app.text_input if item.label == "측정 조건 (선택)")
+    condition.set_value("전원 차단 · 주변 25 °C")
+    assert sum(item.label in {"측정 조건", "측정 조건 (선택)"} for item in app.text_input) == 1
     app.button(key="FormSubmitter:cc_v5_add_measurement_f5-profile-apptest-f5-profile-board-BC-R1-RESISTOR_FAILURE-측정 기록 저장").click().run()
 
     assert not app.exception
@@ -194,3 +197,4 @@ def test_measurement_profile_and_fault_are_saved_through_real_streamlit_widgets(
     assert saved.measurement_type == "resistance"
     assert saved.test_id == "isolated_resistance"
     assert saved.fault_hypothesis == "RESISTOR_FAILURE"
+    assert saved.operating_conditions == "전원 차단 · 주변 25 °C"

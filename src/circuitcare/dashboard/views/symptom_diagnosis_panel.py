@@ -1100,6 +1100,8 @@ def render_symptom_diagnosis_panel(
     run_after_initial_answer = bool(state.pop("run_after_initial_answer", False))
     run_requested = bool(run_clicked or run_after_initial_answer or run_after_measurement_change)
     if run_requested:
+        analysis_progress = st.status("고장 후보 분석 중", expanded=True)
+        analysis_progress.write("증상·검수·현재 측정 Fingerprint · 확인 완료")
         if simple_ui:
             _save_initial_symptom_answer(state, simple_choice)
         state["symptoms"] = selected_codes
@@ -1114,16 +1116,20 @@ def render_symptom_diagnosis_panel(
         parsed = {"observations": [], "uncertain_facts": [], "parser_status": "SKIPPED"}
         if llm_enabled and selected_model and symptom_text.strip():
             try:
+                analysis_progress.write("증상 구조화 · 진행 중")
                 with st.spinner("AI가 증상을 정리하는 중…" if simple_ui else f"{selected_model}이 증상을 구조화하는 중…"):
                     parsed = parse_user_report(OllamaClient(timeout_seconds=120), selected_model, symptom_text)
+                analysis_progress.write("증상 구조화 · 완료")
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 parsed = {"observations": [], "uncertain_facts": [], "parser_status": "FAILED", "error": str(exc)}
+                analysis_progress.write("증상 구조화 · 실패 · 규칙 진단 계속")
         state["parsed_observations"] = parsed.get("observations", [])
         combined_observations = _combined_observations(state)
         parsed_symptoms = [row["code"] for row in state["parsed_observations"]
                            if row.get("status") in {"observed", "measured"} and row.get("value") is True
                            and row.get("code") in symptom_items]
         try:
+            analysis_progress.write("규칙 기반 고장 후보 분석 · 진행 중")
             result = diagnose(
                 symptoms=list(dict.fromkeys([*selected_codes, *parsed_symptoms])),
                 symptom_text=symptom_text,
@@ -1135,11 +1141,14 @@ def render_symptom_diagnosis_panel(
                 silkscreen_labels=silkscreen_labels,
                 connectivity_status="none",
             )
+            analysis_progress.write("규칙 기반 고장 후보 분석 · 완료")
         except Exception as exc:
             fail_analysis(st.session_state, scope=analysis_scope, run_id=run_id, error=str(exc))
             state["result"] = None
             state["analysis_status"] = "FAILED"
             st.session_state[key] = state
+            analysis_progress.update(label="고장 분석 실패 · 입력과 측정 기록은 보존됩니다",
+                                     state="error", expanded=True)
             st.error(f"규칙 기반 분석을 완료하지 못했습니다: {exc}")
             return
         # If the user reached the end of the safe catalog without identifying
@@ -1160,12 +1169,17 @@ def render_symptom_diagnosis_panel(
         if (result.get("status") != "NEEDS_SYMPTOMS" and result.get("symptom_codes")
                 and llm_enabled and selected_model and qwen_pcb_strategy):
             with st.spinner("AI가 PCB 구조를 검토하는 중…" if simple_ui else f"{selected_model}이 PCB 구조를 참고해 미검증 후보를 검토하는 중…"):
+                analysis_progress.write("Qwen PCB 보조 검토 · 진행 중")
                 _apply_qwen_pcb_assist(
                     result, project=project, components=component_rows,
                     suspected_components=valid_suspects, selected_model=selected_model,
                     knowledge=kb, answered_test_ids=list(state.get("answered_test_ids", [])),
                     board_registry=board_registry,
                 )
+            if result.get("qwen_pcb_assist_error"):
+                analysis_progress.write("Qwen PCB 보조 검토 · 실패 · 규칙 후보 유지")
+            else:
+                analysis_progress.write("Qwen PCB 보조 검토 · 완료")
         if len(result.get("hypotheses", [])) < 3 and llm_enabled and selected_model:
             try:
                 with st.spinner("AI가 추가 가능성을 확인하는 중…" if simple_ui else f"{selected_model}이 미등록 원인 가능성을 별도 검토하는 중…"):
@@ -1193,6 +1207,7 @@ def render_symptom_diagnosis_panel(
                     )
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 result["llm_component_error"] = str(exc)
+        analysis_progress.write("검사 추천 준비 · 완료")
         live_snapshot = current_analysis_snapshot(
             st, project, components=components, component_inventory=component_inventory,
             symptom_text=symptom_text, selected_codes=selected_codes,
@@ -1212,6 +1227,8 @@ def render_symptom_diagnosis_panel(
             state["analysis_status"] = "STALE"
             state["invalidated_reason"] = "분석 중 입력이 바뀌어 이전 버전 결과를 저장하지 않았습니다."
             st.session_state[key] = state
+            analysis_progress.update(label="분석 입력이 바뀌어 결과를 저장하지 않았습니다",
+                                     state="error", expanded=True)
             st.warning(state["invalidated_reason"])
             return
         state["analysis_target_id"] = analysis_scope.target_id
@@ -1224,6 +1241,18 @@ def render_symptom_diagnosis_panel(
         state["input_fingerprint"] = fingerprint
         state["measurement_fingerprint"] = measurement_fingerprint
         st.session_state[key] = state
+        has_llm_error = (
+            result.get("llm_parser", {}).get("parser_status") == "FAILED"
+            or any(result.get(field) for field in (
+                "llm_suggestion_error", "llm_error", "llm_component_error",
+                "qwen_pcb_assist_error",
+            ))
+        )
+        analysis_progress.update(
+            label=("분석 완료 · 일부 AI 보조 실패, 규칙 결과 유지" if has_llm_error
+                   else f"분석 완료 · 원인 후보 {len(_simple_candidate_rows(result))}개"),
+            state="complete", expanded=False,
+        )
         st.rerun()
     result = current_result
     if not result:

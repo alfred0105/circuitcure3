@@ -263,8 +263,10 @@ def render_measurement_panel(
         source_label = SOURCE_OPTIONS[0]
         if compact:
             location_verified = st.checkbox("측정 지점과 단자를 직접 확인함", key=f"cc_v5_compact_location_{owner}")
-            operating_conditions = st.text_input("측정 조건 (선택)", key=f"cc_v5_compact_condition_{owner}",
-                                                 placeholder="예: 전원 차단, 주변 온도")
+            operating_conditions = st.text_input(
+                "측정 조건 (선택)", key=f"cc_v5_condition_{owner}",
+                placeholder="예: 전원 차단, 주변 온도",
+            )
         with st.expander("가설 검증 정보 추가" if compact else "검증 정보 · 정상 범위 · 출처", expanded=False):
             uncertainty = st.text_input(
                 f"측정 불확실도 σ ({BASE_UNITS[measurement_type]})",
@@ -284,7 +286,11 @@ def render_measurement_panel(
                                                 "DATASHEET_VERIFIED": "데이터시트 확인",
                                                 "BOARD_SPEC_VERIFIED": "보드 사양 확인",
                                             }[value])
-            operating_conditions = st.text_input("측정 조건", placeholder="예: 전원 5 V, 무부하")
+            if not compact:
+                operating_conditions = st.text_input(
+                    "실제 측정 조건", key=f"cc_v5_condition_{owner}",
+                    placeholder="예: 전원 5 V, 무부하",
+                )
             reference_conditions = st.text_input("기준 조건", placeholder="실제 측정 조건과 동일하게")
             if not compact:
                 location_verified = st.checkbox("측정 지점이 지정 단자임을 확인함")

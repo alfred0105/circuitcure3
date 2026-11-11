@@ -16,6 +16,15 @@ from circuitcare.frontend.component_map_adapter import (
 from circuitcare.frontend.photo_adapter import adapt_component_map_input
 
 
+@pytest.fixture(autouse=True)
+def _mock_component_detection_for_app_tests(monkeypatch):
+    """Keep entry/routing AppTests independent from native model runtimes."""
+    from circuitcare.dashboard.views import unified_workspace
+
+    monkeypatch.setattr(unified_workspace, "ensure_component_detection",
+                        lambda *_args, **_kwargs: (None, "mocked in AppTest"))
+
+
 def test_entry_has_only_photo_diagnosis_route(monkeypatch):
     pytest.importorskip("streamlit")
     from streamlit.testing.v1 import AppTest

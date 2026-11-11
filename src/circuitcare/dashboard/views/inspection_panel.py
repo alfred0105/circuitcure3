@@ -26,6 +26,7 @@ COMPONENT_EDIT_KEY = "circuitcare_v4_component_edits"
 COMPONENT_INVENTORY_KEY = "circuitcare_v4_component_inventory_by_map"
 USER_SUSPECTS_KEY = "circuitcare_v4_user_suspects_by_map"
 USER_SUSPECTS_MIGRATION_KEY = "circuitcare_v4_user_suspects_migrated_scopes"
+USER_SUSPECTS_DISMISSED_KEY = "circuitcare_v4_user_suspects_dismissed"
 ROLE_OPTIONS = ("power", "control", "control_input", "control_timing", "driver", "output",
                 "input", "input_output", "protection", "thermal", "buzzer", "relay")
 LOGGER = logging.getLogger(__name__)
@@ -37,18 +38,39 @@ def board_suspects(state: Any, project: ProjectContext) -> list[dict[str, Any]]:
     store = state.setdefault(USER_SUSPECTS_KEY, {})
     rows = store.setdefault(owner, {})
     migrated = state.setdefault(USER_SUSPECTS_MIGRATION_KEY, {})
+    dismissed_store = state.setdefault(USER_SUSPECTS_DISMISSED_KEY, {})
+    dismissed = set(dismissed_store.get(owner, set()))
     if not migrated.get(owner):
         for old_owner, old_rows in list(store.items()):
             if old_owner == owner or not str(old_owner).startswith(f"{owner}|") or not isinstance(old_rows, dict):
                 continue
             for old_id, old_row in old_rows.items():
                 if isinstance(old_row, dict):
-                    rows.setdefault(str(old_row.get("board_component_id") or old_id), old_row)
+                    canonical_id = str(old_row.get("board_component_id") or old_id)
+                    if canonical_id not in dismissed:
+                        rows.setdefault(canonical_id, old_row)
         migrated[owner] = True
         state[USER_SUSPECTS_MIGRATION_KEY] = migrated
     store[owner] = rows
     state[USER_SUSPECTS_KEY] = store
     return [row for row in rows.values() if isinstance(row, dict)]
+
+
+def dismiss_board_suspect(state: Any, project: ProjectContext, board_component_id: str) -> None:
+    owner = f"{project.project_id}|{project.board_id or ''}"
+    state.setdefault(USER_SUSPECTS_KEY, {}).setdefault(owner, {}).pop(str(board_component_id), None)
+    dismissed_store = state.setdefault(USER_SUSPECTS_DISMISSED_KEY, {})
+    dismissed_store[owner] = set(dismissed_store.get(owner, set())) | {str(board_component_id)}
+    state[USER_SUSPECTS_DISMISSED_KEY] = dismissed_store
+
+
+def add_board_suspect(state: Any, project: ProjectContext, board_component_id: str,
+                      suspect: dict[str, Any]) -> None:
+    owner = f"{project.project_id}|{project.board_id or ''}"
+    dismissed_store = state.setdefault(USER_SUSPECTS_DISMISSED_KEY, {})
+    dismissed_store[owner] = set(dismissed_store.get(owner, set())) - {str(board_component_id)}
+    state[USER_SUSPECTS_DISMISSED_KEY] = dismissed_store
+    state.setdefault(USER_SUSPECTS_KEY, {}).setdefault(owner, {})[str(board_component_id)] = suspect
 
 
 def render_inspection_panel(
@@ -63,6 +85,7 @@ def render_inspection_panel(
     review_scope: str | None = None,
     board_registry: dict[str, Any] | None = None,
     compact: bool = False,
+    on_focus_component: Any = None,
 ) -> None:
     owner = f"{project.project_id}|{project.board_id or ''}|{inventory_scope or component_map_version or ''}"
     suspect_owner = f"{project.project_id}|{project.board_id or ''}"
@@ -73,6 +96,29 @@ def render_inspection_panel(
     suspects = all_suspects.setdefault(suspect_owner, {})
     with st.container(border=True):
         st.markdown('<span class="cc-inspection-marker"></span>', unsafe_allow_html=True)
+        if suspects:
+            with st.popover(f"내가 의심한 소자 · {len(suspects)}개", use_container_width=True):
+                registry_rows = board_registry.get("components", []) if isinstance(board_registry, dict) else []
+                for board_id, suspect in list(suspects.items()):
+                    registry_row = next((row for row in registry_rows
+                                         if str(row.get("board_component_id")) == str(board_id)), None)
+                    excluded = bool(registry_row and registry_row.get("presence_status") == "EXCLUDED")
+                    kind = suspect.get("component_type", registry_row.get("component_type", "unknown")
+                                       if registry_row else "unknown")
+                    fault = suspect.get("suspected_fault_mode")
+                    label = suspect.get("reference_designator") or suspect.get("component_id") or board_id
+                    st.markdown(f"**{label}** · {_component_label(str(kind))} · {fault or 'AI가 판단'}" +
+                                (" · 제외됨" if excluded else ""))
+                    if excluded:
+                        st.caption("박스 제외로 현재 후보에서 빠져 있습니다. 복원 후 다시 확인할 수 있습니다.")
+                    focus_col, clear_col = st.columns(2)
+                    if focus_col.button("PCB 위치 보기", key=f"cc_suspect_focus_{project.project_id}_{board_id}",
+                                         disabled=excluded or on_focus_component is None):
+                        if on_focus_component(str(board_id)):
+                            st.rerun()
+                    if clear_col.button("의심 해제", key=f"cc_suspect_clear_{project.project_id}_{board_id}"):
+                        dismiss_board_suspect(st.session_state, project, str(board_id))
+                        st.rerun()
         overlap_key = st.session_state.get("cc_active_component_overlap_key")
         overlap_ids = st.session_state.get(overlap_key, []) if overlap_key else []
         by_id = {item.component_id: item for item in components}
@@ -274,19 +320,22 @@ def render_inspection_panel(
                                      format_func=lambda value: "AI가 판단" if value == "__AI__" else modes[value].get("title", value))
                 if st.button("의심 해제" if saved else "의심 소자로 지정", key=f"cc_compact_suspect_toggle_{project.project_id}_{board_component_id}"):
                     if saved:
-                        suspects.pop(board_component_id, None)
+                        dismiss_board_suspect(st.session_state, project, board_component_id)
                     else:
                         source_photo = selected_component.source_backend_photo_ids[0] if len(selected_component.source_backend_photo_ids) == 1 else None
                         photo_record = next((row for row in project.image_records if row.image_id == source_photo), None)
-                        suspects[board_component_id] = {
+                        add_board_suspect(st.session_state, project, board_component_id, {
                             "component_id": component_id, "board_component_id": board_component_id,
                             "component_type": selected_component.component_type,
+                            "reference_designator": (selected_component.reference_designators[0]
+                                                      if selected_component.reference_designators else component_id),
                             "suspected_fault_mode": None if fault == "__AI__" else fault,
                             "selection_source": "USER", "evidence_status": "UNVERIFIED",
                             "photo_id": source_photo,
                             "photo_sha256": getattr(photo_record, "content_sha256", None),
                             "bbox_xyxy": list(selected_component.bbox_xyxy),
-                        }
+                        })
+                        suspects = st.session_state[USER_SUSPECTS_KEY][suspect_owner]
                     st.session_state[USER_SUSPECTS_KEY][suspect_owner] = suspects
                     st.rerun()
                 elif saved and saved.get("suspected_fault_mode") != (None if fault == "__AI__" else fault):
@@ -444,7 +493,7 @@ def render_inspection_panel(
             if st.button("의심 소자 해제" if active_suspect else "의심 소자로 지정",
                          key=f"cc_v4_toggle_suspect_{hash(suspect_owner)}_{board_component_id}"):
                 if active_suspect:
-                    suspects.pop(board_component_id, None)
+                    dismiss_board_suspect(st.session_state, project, board_component_id)
                 else:
                     photo_id = (selected_component.source_backend_photo_ids[0]
                                 if len(selected_component.source_backend_photo_ids) == 1 else None)
@@ -463,16 +512,20 @@ def render_inspection_panel(
                                             for source in component.get("source_components", [])
                                             if source.get("photo_id") == photo_id
                                             and source.get("component_id") == selected_component.component_id), None)
-                    suspects[board_component_id] = {
+                    add_board_suspect(st.session_state, project, board_component_id, {
                         "component_id": selected_component.component_id,
                         "board_component_id": board_component_id,
+                        "component_type": selected_component.component_type,
+                        "reference_designator": (selected_component.reference_designators[0]
+                                                  if selected_component.reference_designators else selected_component.component_id),
                         "suspected_fault_mode": None if suspected_fault == "__AI__" else suspected_fault,
                         "selection_source": "USER", "evidence_status": "UNVERIFIED",
                         "photo_id": photo_id, "observation_fingerprint": observation_fingerprint,
                         "component_map_version": inventory_scope or component_map_version,
                         "selection_version": (registry_source.get("source_observation_fingerprint") if registry_source
                                               else getattr(selected_component, "source_observation_fingerprint", None)),
-                    }
+                    })
+                    suspects = st.session_state[USER_SUSPECTS_KEY][suspect_owner]
                 all_suspects[suspect_owner] = suspects
                 st.session_state[USER_SUSPECTS_KEY] = all_suspects
                 st.rerun()
