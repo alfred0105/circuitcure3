@@ -265,6 +265,41 @@ def test_large_board_review_batches_cover_every_detection_once():
         row["detection_id"] for row in detections]
 
 
+def test_duplicate_candidate_search_can_include_pairs_across_review_batches():
+    detections = [{"detection_id": f"d{i}", "bbox_xyxy": [i * 200, 10, i * 200 + 30, 40]}
+                  for i in range(25)]
+    # These two detections fall on opposite sides of the 24-item review split.
+    detections[0]["bbox_xyxy"] = [0, 0, 30, 30]
+    detections[24]["bbox_xyxy"] = [2, 2, 32, 32]
+    pairs = _duplicate_pair_candidates(detections, limit=None)
+    pair_ids = {tuple(row["detection_id"] for row in pair["detections"]) for pair in pairs}
+    assert ("d0", "d24") in pair_ids
+
+
+def test_qwen_duplicate_pair_override_uses_crops_for_cross_batch_ids():
+    class PairClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            payload = _messages[1]["content"]
+            import json
+            data = json.loads(payload.split("\n", 1)[1])
+            assert data["duplicate_pair_crops"][0]["detection_ids"] == ["d0", "d24"]
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [{
+                    "detection_ids": ["d0", "d24"], "decision": "same_component",
+                    "confidence": .9, "reason": "Same package outline.",
+                }], "group_reviews": [], "missed_component_candidates": [], "notes": [],
+            }}
+
+    detections = [
+        {"detection_id": "d0", "component_id": "d0", "class_name": "ic", "bbox_xyxy": [5, 5, 30, 30]},
+        {"detection_id": "d24", "component_id": "d24", "class_name": "ic", "bbox_xyxy": [6, 6, 31, 31]},
+    ]
+    candidates = _duplicate_pair_candidates(detections, limit=None)
+    result = review_components_with_qwen(PairClient(), "qwen3.5:9b", _png(), detections, [],
+                                         duplicate_pair_candidates=candidates)
+    assert result["duplicate_reviews"][0]["detection_ids"] == ["d0", "d24"]
+
+
 def test_marking_ocr_targets_prioritize_ic_and_passives_and_skip_excluded_rows():
     rows = [{"component_id": f"r{i}", "소자 종류": "resistor", "상태": "검수 필요",
              "신뢰도": .8} for i in range(20)]

@@ -95,6 +95,7 @@ _SYSTEM = """Review the PCB images independently of YOLO. For each detection fir
 def _review_images(
     image_bytes: bytes, detections: list[dict[str, Any]], *,
     group_candidates: list[dict[str, Any]] | None = None,
+    duplicate_pair_candidates: list[dict[str, Any]] | None = None,
     review_diagnostics: list[dict[str, Any]] | None = None, max_crop_count: int = 10,
 ) -> tuple[list[bytes], tuple[int, int], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     with Image.open(io.BytesIO(image_bytes)) as source_image:
@@ -105,7 +106,9 @@ def _review_images(
     sx, sy = guide.width / width, guide.height / height
     painter = ImageDraw.Draw(guide)
     ordered = sorted(detections, key=lambda row: float(row.get("confidence") or 0.0))[:max_crop_count]
-    pair_candidates = _duplicate_pair_candidates(detections, diagnostics=review_diagnostics)
+    pair_candidates = (duplicate_pair_candidates if duplicate_pair_candidates is not None else
+                       _duplicate_pair_candidates(detections, diagnostics=review_diagnostics))
+    pair_candidates = pair_candidates[:12]
     ids_to_crop = {str(row["detection_id"]) for row in ordered}
     for row in detections:
         box = row.get("bbox_xyxy")
@@ -226,7 +229,7 @@ def _review_images(
 
 
 def _duplicate_pair_candidates(
-    detections: list[dict[str, Any]], *, limit: int = 12,
+    detections: list[dict[str, Any]], *, limit: int | None = 12,
     diagnostics: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Select only nearby, similar-scale pairs for focused visual re-review."""
@@ -264,13 +267,13 @@ def _duplicate_pair_candidates(
                                     "status": "candidate", "reason": "overlap_or_nearby_scale_match",
                                     "metrics": metrics})
     ranked = sorted(pairs, key=lambda item: item["rank"], reverse=True)
-    if diagnostics is not None:
+    if diagnostics is not None and limit is not None:
         for pair in ranked[limit:]:
             diagnostics.append({"stage": "duplicate_pair_search",
                                 "detection_ids": [row.get("detection_id") for row in pair["detections"]],
                                 "status": "deferred", "reason": "duplicate_crop_limit",
                                 "metrics": pair["metrics"]})
-    return ranked[:limit]
+    return ranked if limit is None else ranked[:limit]
 
 
 def _map_normalized_box(
@@ -304,6 +307,7 @@ def review_components_with_qwen(
     image_bytes: bytes,
     detections: list[dict[str, Any]],
     ocr_records: list[dict[str, Any]],
+    *, duplicate_pair_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Request suggestions and validate every ID and normalized box before display."""
     identified = []
@@ -331,6 +335,7 @@ def review_components_with_qwen(
                                           "status": "deferred", "reason": "group_crop_limit"})
         images, (width, height), image_manifest, pair_manifest, group_manifest = _review_images(
             image_bytes, identified, group_candidates=group_candidates,
+            duplicate_pair_candidates=duplicate_pair_candidates,
             review_diagnostics=candidate_diagnostics)
     except Exception as exc:
         raise AIReviewStageError("candidate_search", str(exc)) from exc

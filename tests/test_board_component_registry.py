@@ -283,3 +283,99 @@ def test_board_feature_qwen_proposal_is_not_exposed_as_a_component_type():
     assert row.component_type == "unknown"
     assert row.candidate_component_types == ()
     assert row.candidate_board_features == ("TP1",)
+
+
+def test_user_confirmed_board_feature_is_kept_in_registry_but_not_diagnosis_components():
+    snapshot = {"image_fingerprint": "hash", "registry_components": [{
+        "component_id": "TP1", "component_type": "board_feature", "effective_class": "board_feature",
+        "bbox_xyxy": [1, 1, 10, 10], "identification_status": "USER_CONFIRMED",
+        "presence_status": "CONFIRMED", "component_type_status": "USER_CONFIRMED_EXTENSION",
+        "confirmed_base_class": "board_feature", "confirmed_subtype": "test_point",
+        "qwen_component_type_status": "USER_CONFIRMED_EXTENSION",
+    }]}
+    registry = build_board_component_registry({}, project_id="p-feature-confirmed", board_id="b-feature-confirmed",
+                                              photo_snapshots={"front": snapshot})
+    assert registry["components"][0]["component_type"] == "board_feature"
+    assert diagnosis_components(registry) == ()
+
+
+def test_user_confirmed_extension_keeps_detector_qwen_and_effective_taxonomies_separate():
+    from circuitcare.component_taxonomy import review_taxonomy
+
+    connector = review_taxonomy({
+        "소자 종류": "ic", "qwen_component_type_candidate": "connector",
+        "qwen_component_subtype_candidate": "fpc_ffc", "qwen_component_type_status": "USER_CONFIRMED",
+    })
+    assert connector["detector_class"] == "ic"
+    assert connector["confirmed_base_class"] == "connector"
+    assert connector["confirmed_subtype"] == "fpc_ffc"
+    assert connector["diagnosis_class"] == "connector"
+
+    socket = review_taxonomy({
+        "소자 종류": "ic", "confirmed_base_class": "other_component",
+        "confirmed_subtype": "ic_socket", "qwen_component_type_status": "USER_CONFIRMED_EXTENSION",
+    })
+    assert socket["detector_class"] == "ic"
+    assert socket["effective_class"] == "other_component"
+    assert socket["diagnosis_class"] == "unknown"
+
+    feature = review_taxonomy({
+        "소자 종류": "ic", "confirmed_base_class": "board_feature",
+        "confirmed_subtype": "test_point", "qwen_component_type_status": "USER_CONFIRMED_EXTENSION",
+    })
+    assert feature["effective_class"] == "board_feature"
+    assert feature["diagnosis_class"] == "unknown"
+
+
+@pytest.mark.parametrize(("qwen_class", "subtype", "expected_registry_type", "expected_diagnosis"), [
+    ("connector", "fpc_ffc", "connector", "connector"),
+    ("other_component", "ic_socket", "other_component", "unknown"),
+    ("board_feature", "test_point", "board_feature", None),
+])
+def test_confirmed_qwen_class_flows_through_registry_to_safe_diagnosis(
+    qwen_class, subtype, expected_registry_type, expected_diagnosis,
+):
+    from circuitcare.dashboard.views.inspection_panel import confirm_qwen_component_type
+    from circuitcare.component_taxonomy import review_taxonomy
+
+    review_row = {"component_id": "U1", "소자 종류": "ic", "x1": 1, "y1": 1,
+                  "x2": 20, "y2": 20}
+    confirm_qwen_component_type(review_row, base_class=qwen_class, subtype=subtype)
+    resolved = review_taxonomy(review_row)
+    snapshot = {"image_fingerprint": "image", "registry_components": [{
+        **review_row, **resolved, "component_type": resolved["effective_class"],
+        "bbox_xyxy": [1, 1, 20, 20], "coordinate_frame": "SOURCE_PHOTO_PIXEL",
+        "identification_status": "USER_CONFIRMED", "presence_status": "CONFIRMED",
+    }]}
+    registry = build_board_component_registry({}, project_id="p-confirmed-class", board_id="b-confirmed-class",
+                                              photo_snapshots={"front": snapshot})
+    assert registry["components"][0]["component_type"] == expected_registry_type
+    diagnosis = diagnosis_components(registry)
+    if expected_diagnosis is None:
+        assert diagnosis == ()
+    else:
+        assert diagnosis[0].component_type == expected_diagnosis
+    source = registry["components"][0]["source_components"][0]
+    assert source["detector_class"] == "ic"
+    assert source["confirmed_base_class"] == qwen_class
+    assert source["confirmed_subtype"] == subtype
+
+
+def test_registry_preserves_part_number_and_qwen_ocr_conflict_candidates():
+    snapshot = {"image_fingerprint": "image-hash", "review_version": "v1",
+                "registry_components": [{
+                    "component_id": "U1", "component_type": "ic", "bbox_xyxy": [1, 2, 10, 12],
+                    "identification_status": "UNCONFIRMED", "presence_status": "UNCONFIRMED",
+                    "component_type_status": "UNCONFIRMED", "ocr_marking": "AMS1117",
+                    "ocr_candidates": ["AMS1117"], "ocr_source": "RapidOCR", "ocr_score": .83,
+                    "possible_part_number": "AMS1117", "part_number_status": "UNVERIFIED_PART_ID",
+                    "qwen_marking_candidates": ["AMS1117-3.3"],
+                    "qwen_conflicting_evidence": ["OCR candidates differ"],
+                }]}
+    registry = build_board_component_registry({}, project_id="p-ocr", board_id="b-ocr",
+                                              photo_snapshots={"front": snapshot})
+    source = registry["components"][0]["source_components"][0]
+    assert source["possible_part_number"] == "AMS1117"
+    assert source["ocr_marking"] == "AMS1117"
+    assert source["qwen_marking_candidates"] == ["AMS1117-3.3"]
+    assert source["qwen_conflicting_evidence"] == ["OCR candidates differ"]

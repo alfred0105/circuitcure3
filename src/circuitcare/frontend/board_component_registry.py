@@ -44,6 +44,9 @@ class BoardDiagnosisComponent:
     candidate_functional_roles: tuple[str, ...] = ()
     ai_review_statuses: tuple[str, ...] = ()
     candidate_board_features: tuple[str, ...] = ()
+    detector_classes: tuple[str, ...] = ()
+    confirmed_subtypes: tuple[str, ...] = ()
+    possible_part_numbers: tuple[str, ...] = ()
 
 
 def diagnosis_components(registry: dict[str, Any]) -> tuple[BoardDiagnosisComponent, ...]:
@@ -52,23 +55,38 @@ def diagnosis_components(registry: dict[str, Any]) -> tuple[BoardDiagnosisCompon
     for row in registry.get("components", []):
         if row.get("presence_status") == "EXCLUDED":
             continue
-        confirmed = row.get("presence_status") == "CONFIRMED"
-        type_confirmed = row.get("component_type_status") == "USER_CONFIRMED"
         source_rows = sorted(row.get("source_components", []),
                              key=lambda item: item.get("review_status") == "EXCLUDED")
+        resolved_type = str(row.get("component_type") or "unknown")
+        if resolved_type == "board_feature" and row.get("component_type_status") in {
+            "USER_CONFIRMED", "USER_CONFIRMED_EXTENSION"
+        }:
+            # PCB inspection structures remain in the Registry, but are not
+            # physical fault-component candidates for diagnosis.
+            continue
+        confirmed = row.get("presence_status") == "CONFIRMED"
+        type_confirmed = row.get("component_type_status") == "USER_CONFIRMED"
+        if resolved_type == "other_component":
+            resolved_type = "unknown"
         markings = [source.get("ocr_marking") for source in source_rows
                     if source.get("review_status") in {"USER_CONFIRMED", "user_confirmed"}
                     and source.get("ocr_marking")]
+        confirmed_parts = list(dict.fromkeys(
+            str(source.get("confirmed_part_number")) for source in source_rows
+            if source.get("confirmed_part_number")
+            and source.get("part_number_status") in {"USER_CONFIRMED", "VERIFIED_DATASHEET"}
+        ))
         result.append(BoardDiagnosisComponent(
             component_id=str(row["board_component_id"]),
             board_component_id=str(row["board_component_id"]),
-            component_type=str(row["component_type"] if type_confirmed else "unknown"),
+            component_type=str(resolved_type if type_confirmed else "unknown"),
             bbox_xyxy=None,
             ocr_marking=markings[0] if markings else None,
-            possible_part_number=None,
+            possible_part_number=confirmed_parts[0] if len(confirmed_parts) == 1 else None,
             component_info=None,
             identification_status="USER_CONFIRMED" if confirmed else "SUGGESTED_CLASS_ONLY",
-            component_type_status="USER_CONFIRMED" if type_confirmed else "UNCONFIRMED",
+            component_type_status=("USER_CONFIRMED_EXTENSION" if row.get("component_type") in {"other_component", "board_feature"}
+                                   else "USER_CONFIRMED" if type_confirmed else "UNCONFIRMED"),
             presence_status="CONFIRMED" if confirmed else "UNCONFIRMED",
             confirmed_functional_roles=tuple(row.get("functional_roles", ())) if confirmed else (),
             evidence=tuple(row.get("evidence", ())),
@@ -103,6 +121,13 @@ def diagnosis_components(registry: dict[str, Any]) -> tuple[BoardDiagnosisCompon
                 if source.get("qwen_component_type_candidate") == "board_feature"
                 and source.get("qwen_component_type_status") in {"AI_PROPOSED_UNVERIFIED", "USER_CONFIRMED_EXTENSION"}
             )),
+            detector_classes=tuple(dict.fromkeys(str(source.get("detector_class") or source.get("component_type"))
+                                                 for source in source_rows if source.get("component_type"))),
+            confirmed_subtypes=tuple(dict.fromkeys(str(source.get("confirmed_subtype")) for source in source_rows
+                                                    if source.get("confirmed_subtype"))),
+            possible_part_numbers=tuple(dict.fromkeys(
+                str(source.get("confirmed_part_number") or source.get("possible_part_number"))
+                for source in source_rows if source.get("confirmed_part_number") or source.get("possible_part_number"))),
         ))
     return tuple(result)
 
@@ -114,7 +139,7 @@ def measurement_view_model_for_board_component(
     """Resolve a board identity to a real, non-excluded photo observation for measurement UI."""
     component = next((row for row in registry.get("components", [])
                       if str(row.get("board_component_id")) == str(board_component_id)), None)
-    if not component:
+    if not component or component.get("component_type") == "board_feature":
         return None
     sources = [row for row in component.get("source_components", [])
                if row.get("review_status") != "EXCLUDED"
@@ -154,6 +179,8 @@ def measurement_component_aliases(registry: dict[str, Any]) -> dict[str, str | N
     """Map legacy local measurement IDs only when their identity is unambiguous."""
     candidates: dict[str, set[str]] = {}
     for row in registry.get("components", []):
+        if row.get("component_type") == "board_feature":
+            continue
         board_id = str(row.get("board_component_id") or "")
         for source in row.get("source_components", []):
             local_id = str(source.get("component_id") or "")
@@ -317,6 +344,12 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
                 "board_side": str(snapshot.get("side", "unknown")),
                 "capture_type": str(snapshot.get("capture_type", "unknown")),
                 "detection_id": local_id, "component_type": str(get("component_type", "unknown")),
+                "detector_class": get("detector_class"),
+                "qwen_base_class": get("qwen_base_class"),
+                "qwen_subtype": get("qwen_subtype"),
+                "confirmed_base_class": get("confirmed_base_class"),
+                "confirmed_subtype": get("confirmed_subtype"),
+                "effective_class": get("effective_class"),
                 "detection_version": get("detection_version", get("detection_model_version")),
                 "review_evidence_version": get("review_evidence_version"),
                 "detection_confidence": get("confidence", get("신뢰도")),
@@ -327,10 +360,17 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
                 "review_status": str(get("identification_status", "UNCONFIRMED")),
                 "presence_status": str(get("presence_status", "UNCONFIRMED")),
                 "type_status": str(get("component_type_status", "UNCONFIRMED")),
+                "component_type_status": str(get("component_type_status", "UNCONFIRMED")),
                 "ocr_marking": get("ocr_marking"),
+                "body_marking": get("body_marking"),
                 "ocr_candidates": list(get("ocr_candidates", ()) or ()),
                 "marking_candidates": list(get("marking_candidates", ()) or ()),
+                "ocr_source": get("ocr_source"),
+                "ocr_score": get("ocr_score"),
                 "possible_part_number": get("possible_part_number"),
+                "part_number_status": get("part_number_status"),
+                "confirmed_part_number": get("confirmed_part_number"),
+                "datasheet_source": get("datasheet_source"),
                 "part_identity_status": get("part_identity_status"),
                 "ic_identity_candidate": get("ic_identity_candidate"),
                 "functional_roles": list(get("confirmed_functional_roles", ()) or ()),

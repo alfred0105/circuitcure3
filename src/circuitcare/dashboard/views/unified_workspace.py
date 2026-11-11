@@ -24,6 +24,7 @@ from circuitcare.frontend.board_component_registry import (
     diagnosis_components, measurement_component_aliases, measurement_view_model_for_board_component,
     remove_component_match, source_key_for_component,
 )
+from circuitcare.component_taxonomy import review_taxonomy
 from circuitcare.frontend.measurement_state import get_measurements
 from circuitcare.analysis.fingerprints import build_measurement_fingerprint
 from circuitcare.analysis.models import AnalysisScope, AnalysisStatus
@@ -289,16 +290,17 @@ def _prepare_photo_component_snapshot(
     review_models = tuple(ComponentOverlayViewModel(
         project_id=project.project_id, board_id=project.board_id or "", board_side=side,
         component_id=str(row.get("component_id") or f"auto-{review_hash}-{index + 1}"),
-        component_type=str(row.get("소자 종류", "unknown")),
-        display_label=(f"AI 제안 · {row.get('소자 종류', 'unknown')}" if row.get("source") == "qwen_suggestion"
-                       else f"수동 · {row.get('소자 종류', 'unknown')}" if row.get("source") == "manual"
-                       else f"{index + 1} · {row.get('소자 종류', 'unknown')}"),
+        component_type=str(review_taxonomy(row)["effective_class"]),
+        display_label=(f"AI 제안 · {review_taxonomy(row)['effective_class']}" if row.get("source") == "qwen_suggestion"
+                       else f"수동 · {review_taxonomy(row)['effective_class']}" if row.get("source") == "manual"
+                       else f"{index + 1} · {review_taxonomy(row)['effective_class']}"),
         canonical_frame_id=photo_id, coordinate_frame="SOURCE_PHOTO_PIXEL",
         bbox_xyxy=(float(row["x1"]), float(row["y1"]), float(row["x2"]), float(row["y2"])),
         polygon_xy=(), source_backend_photo_ids=(photo_id,), observation_ids=(),
         detection_confidence=float(row.get("신뢰도", 0.0)),
         identification_status="USER_CONFIRMED" if row.get("상태") == "확인" else "SUGGESTED_CLASS_ONLY",
-        identity_match_status=None, ocr_marking=row.get("body_marking"), possible_part_number=None,
+        identity_match_status=None, ocr_marking=row.get("body_marking"),
+        possible_part_number=row.get("confirmed_part_number") or row.get("possible_part_number"),
         evidence=("Qwen 미확인 박스 제안" if row.get("source") == "qwen_suggestion"
                   else "사용자 추가 박스" if row.get("source") == "manual"
                   else "YOLO component proposal; awaiting user review",),
@@ -306,7 +308,7 @@ def _prepare_photo_component_snapshot(
         diagnosis_display_status="DIAGNOSIS_NOT_RUN",
         location_confidence=float(row.get("location_confidence", row.get("신뢰도", 0.0))),
         type_confidence=row.get("type_confidence"), match_score=row.get("match_score"),
-        component_type_status="USER_CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED",
+        component_type_status=review_taxonomy(row)["component_type_status"],
         presence_status="CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED",
         ocr_status=row.get("ocr_association_status"),
         ocr_candidates=tuple(row.get("ocr_candidates", [])),
@@ -347,18 +349,26 @@ def _prepare_photo_component_snapshot(
                 "review_version": review_version, "review_components": review_models,
                 "registry_components": tuple({
                     "component_id": str(row.get("component_id") or ""),
-                    "component_type": str(row.get("소자 종류", "unknown")),
+                    **review_taxonomy(row),
+                    "component_type": review_taxonomy(row)["effective_class"],
                     "bbox_xyxy": [row.get("x1", 0), row.get("y1", 0), row.get("x2", 0), row.get("y2", 0)],
                     "coordinate_frame": "SOURCE_PHOTO_PIXEL",
                     "identification_status": ("EXCLUDED" if row.get("상태") == "제외" else
                                               "USER_CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED"),
                     "presence_status": ("EXCLUDED" if row.get("상태") == "제외" else
                                         "CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED"),
-                    "component_type_status": "USER_CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED",
+                    "component_type_status": review_taxonomy(row)["component_type_status"],
                     "ocr_marking": row.get("body_marking"),
+                    "body_marking": row.get("body_marking"),
                     "ocr_candidates": row.get("ocr_candidates", []),
                     "marking_candidates": row.get("marking_candidates", []),
+                    "ocr_source": row.get("ocr_source", row.get("marking_ocr_source")),
+                    "ocr_score": row.get("ocr_score", row.get("marking_ocr_confidence")),
                     "possible_part_number": row.get("possible_part_number"),
+                    "part_number_status": row.get("part_number_status", "UNVERIFIED_PART_ID"
+                        if row.get("possible_part_number") else "UNREAD"),
+                    "confirmed_part_number": row.get("confirmed_part_number"),
+                    "datasheet_source": row.get("datasheet_source"),
                     "part_identity_status": row.get("part_identity_status", "UNCONFIRMED"),
                     "ic_identity_candidate": row.get("ic_identity_candidate"),
                     "ocr_class_hints": row.get("ocr_class_hints", []),
@@ -369,6 +379,14 @@ def _prepare_photo_component_snapshot(
                             qwen_types.get(str(row.get("component_id")), {}).get("proposed_class"))),
                     "qwen_component_subtype_candidate": (row.get("qwen_component_subtype_candidate")
                         or qwen_types.get(str(row.get("component_id")), {}).get("proposed_subtype")),
+                    "qwen_base_class": row.get("qwen_base_class") or row.get("qwen_component_type_candidate")
+                        or qwen_types.get(str(row.get("component_id")), {}).get("proposed_base_class"),
+                    "qwen_subtype": row.get("qwen_subtype") or row.get("qwen_component_subtype_candidate")
+                        or qwen_types.get(str(row.get("component_id")), {}).get("proposed_subtype"),
+                    "confirmed_base_class": row.get("confirmed_base_class"),
+                    "confirmed_subtype": row.get("confirmed_subtype"),
+                    "effective_class": row.get("effective_class") or review_taxonomy(row)["effective_class"],
+                    "detector_class": row.get("detector_class") or row.get("소자 종류", "unknown"),
                     "qwen_component_type_alternatives": (row.get("qwen_component_type_alternatives")
                         or qwen_types.get(str(row.get("component_id")), {}).get("alternative_classes", [])),
                     "qwen_component_type_evidence": (row.get("qwen_component_type_evidence")
@@ -394,7 +412,6 @@ def _prepare_photo_component_snapshot(
                         str(row.get("component_id")), {}).get("part_number_candidates", []),
                     "qwen_functional_role_candidates": row.get("qwen_functional_role_candidates") or qwen_types.get(
                         str(row.get("component_id")), {}).get("functional_role_candidates", []),
-                    "possible_part_number": None,
                     "confirmed_functional_roles": inventory.get(str(row.get("component_id")), {}).get(
                         "confirmed_functional_roles", []),
                     "evidence": ("사용자 제외 기록",) if row.get("상태") == "제외" else

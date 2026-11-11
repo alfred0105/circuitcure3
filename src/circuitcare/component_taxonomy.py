@@ -116,3 +116,54 @@ def normalize_qwen_subtype(base_class: object, subtype: object) -> str | None:
     if raw == "ic_socket" and base == "other_component":
         return raw
     return raw if raw in QWEN_SUBTYPES.get(base, ()) else None
+
+
+def review_taxonomy(row: dict) -> dict[str, str | None]:
+    """Resolve detector, Qwen, user-confirmed, and safe effective labels once.
+
+    ``effective_class`` is suitable for display/Registry storage. A confirmed
+    board feature or extension that the diagnosis engine cannot reason about
+    maps to ``unknown`` for diagnosis while its original taxonomy remains in
+    the returned fields.
+    """
+    detector = normalize_component_class(
+        row.get("detector_class") or row.get("소자 종류") or "unknown", allow_not_component=False
+    )
+    qwen_base = normalize_qwen_class(
+        row.get("qwen_base_class") or row.get("qwen_component_type_candidate") or "unknown"
+    )
+    qwen_subtype = normalize_qwen_subtype(
+        qwen_base, row.get("qwen_subtype") or row.get("qwen_component_subtype_candidate")
+    )
+    confirmed_base = row.get("confirmed_base_class")
+    confirmed_subtype = row.get("confirmed_subtype")
+    if confirmed_base:
+        confirmed_base = normalize_qwen_class(confirmed_base)
+        confirmed_subtype = normalize_qwen_subtype(confirmed_base, confirmed_subtype)
+    elif row.get("qwen_component_type_status") == "USER_CONFIRMED":
+        confirmed_base, confirmed_subtype = qwen_base, qwen_subtype
+    elif row.get("qwen_component_type_status") == "USER_CONFIRMED_EXTENSION":
+        # Legacy rows can lack the explicit confirmed fields. Preserve their
+        # extension meaning and never reinterpret the old detector class.
+        confirmed_base, confirmed_subtype = qwen_base, qwen_subtype
+
+    effective = confirmed_base or detector
+    if effective in {"other_component", "board_feature", "not_component"}:
+        diagnosis_class = "unknown"
+    else:
+        diagnosis_class = normalize_component_class(effective, allow_not_component=False)
+    return {
+        "detector_class": detector,
+        "qwen_base_class": qwen_base if qwen_base != "unknown" else None,
+        "qwen_subtype": qwen_subtype,
+        "confirmed_base_class": confirmed_base,
+        "confirmed_subtype": confirmed_subtype,
+        "effective_class": effective,
+        "diagnosis_class": diagnosis_class,
+        "component_type_status": (
+            "USER_CONFIRMED_EXTENSION" if confirmed_base in QWEN_EXTENSION_CLASSES
+            else "USER_CONFIRMED" if confirmed_base else "AI_PROPOSED_UNVERIFIED"
+            if qwen_base != "unknown" else "UNCONFIRMED"
+        ),
+        "presence_status": str(row.get("presence_status") or "UNCONFIRMED"),
+    }

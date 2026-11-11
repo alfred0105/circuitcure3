@@ -20,6 +20,8 @@ from circuitcare.vision.box_reconciliation import board_visible_review_rows
 from circuitcare.vision.component_recognition_panel import (
     _store_predictions, ensure_review_row_for_component, invalidate_component_review_state,
     record_box_exclusion, review_keys, restore_review_row, undo_last_box_exclusion, update_review_row,
+    qwen_cleanup_disposition,
+    _pending_duplicate_pair_candidates,
 )
 
 
@@ -232,10 +234,17 @@ def test_review_row_is_single_source_for_selected_box_edit_exclusion_and_restore
     box = _model()
     rows = []
     row = ensure_review_row_for_component(rows, box)
+    row.update({"qwen_component_type_status": "USER_CONFIRMED_EXTENSION",
+                "qwen_component_type_candidate": "other_component",
+                "confirmed_base_class": "other_component", "confirmed_subtype": "ic_socket",
+                "qwen_user_confirmed_extension": True})
     update_review_row(row, component_type="capacitor", status="확인", bbox_xyxy=[12, 22, 34, 56])
     assert row["component_id"] == "c1"
     assert row["소자 종류"] == "capacitor" and row["상태"] == "확인"
     assert [row[key] for key in ("x1", "y1", "x2", "y2")] == [12, 22, 34, 56]
+    assert row["confirmed_base_class"] == "capacitor"
+    assert row["component_type_status"] == "USER_CONFIRMED"
+    assert "qwen_user_confirmed_extension" not in row
     state = {}
     record_box_exclusion(state, scope="scope", row=row)
     assert row["상태"] == "제외" and row["user_edited"] is True
@@ -325,6 +334,10 @@ def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(mon
         st_api.session_state[rows_key] = [{
             "component_id": component_id, "소자 종류": "resistor" if component_id == "R1" else "capacitor",
             "상태": "검수 필요", "x1": 1, "y1": 1, "x2": 10, "y2": 10,
+            "body_marking": "AMS1117", "possible_part_number": "AMS1117",
+            "part_number_status": "UNVERIFIED_PART_ID", "ocr_source": "RapidOCR", "ocr_score": .88,
+            "qwen_marking_candidates": ["AMS1117-3.3"],
+            "qwen_conflicting_evidence": ["OCR 후보가 일치하지 않음"],
         }]
         return {"detections": []}, None
 
@@ -345,6 +358,47 @@ def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(mon
     assert first["analysis_scope_key"] != second["analysis_scope_key"]
     assert snapshots[first["analysis_scope_key"]]["photo_id"] == "photo-1"
     assert snapshots[second["analysis_scope_key"]]["photo_id"] == "photo-2"
+    first_source = snapshots[first["analysis_scope_key"]]["registry_components"][0]
+    assert first_source["possible_part_number"] == "AMS1117"
+    assert first_source["part_number_status"] == "UNVERIFIED_PART_ID"
+    assert first_source["ocr_source"] == "RapidOCR"
+    assert first_source["qwen_marking_candidates"] == ["AMS1117-3.3"]
+    from circuitcare.frontend.board_component_registry import build_board_component_registry
+    registry = build_board_component_registry({}, project_id="p1", board_id="b1", photo_snapshots={
+        "photo-1": snapshots[first["analysis_scope_key"]],
+    })
+    board_source = registry["components"][0]["source_components"][0]
+    assert board_source["possible_part_number"] == "AMS1117"
+    assert board_source["qwen_conflicting_evidence"] == ["OCR 후보가 일치하지 않음"]
+
+
+def test_unvalidated_qwen_cleanup_never_auto_excludes_and_protects_user_confirmed_rows():
+    assert qwen_cleanup_disposition({"decision": "suggest", "proposed_class": "not_component"}) == (
+        "REVIEW_REQUIRED", "실제 데이터로 검증된 자동 정리 기준이 없어 사용자 확인 필요")
+    assert qwen_cleanup_disposition({"decision": "same_component"}, geometry_valid=False)[0] == "REVIEW_REQUIRED"
+    assert qwen_cleanup_disposition({"decision": "different_components"})[0] == "KEEP"
+    assert qwen_cleanup_disposition({"decision": "same_component"}, protected=True)[0] == "USER_CONFIRMED"
+    validated = {"validated": True, "policy_version": "measured-v1"}
+    assert qwen_cleanup_disposition({"decision": "suggest", "proposed_class": "resistor"},
+                                    validation=validated)[0] == "REVIEW_REQUIRED"
+    assert qwen_cleanup_disposition({"decision": "same_component"}, geometry_valid=True,
+                                    validation=validated)[0] == "AUTO_EXCLUDED"
+
+
+def test_deferred_duplicate_pairs_are_paged_and_not_dropped():
+    candidates = [{"detections": ({"detection_id": f"d{i}"}, {"detection_id": f"d{i + 1}"})}
+                  for i in range(30)]
+    first = _pending_duplicate_pair_candidates(candidates, set(), limit=12)
+    first_ids = {"|".join(sorted(row["detection_id"] for row in pair["detections"])) for pair in first}
+    second = _pending_duplicate_pair_candidates(candidates, first_ids, limit=12)
+    second_ids = {"|".join(sorted(row["detection_id"] for row in pair["detections"])) for pair in second}
+    third = _pending_duplicate_pair_candidates(candidates, first_ids | second_ids, limit=12)
+    third_ids = {"|".join(sorted(row["detection_id"] for row in pair["detections"])) for pair in third}
+    assert len(first) == len(second) == 12
+    assert len(third) == 6
+    assert not first_ids & second_ids
+    assert not first_ids & third_ids
+    assert not second_ids & third_ids
 
 
 def test_board_registry_prepares_every_photo_and_keeps_each_local_snapshot(monkeypatch):

@@ -22,7 +22,9 @@ from circuitcare.vision.box_reconciliation import (
 from circuitcare.component_taxonomy import (
     COMPONENT_LABELS, normalize_component_class, normalize_qwen_class, normalize_qwen_subtype,
 )
-from circuitcare.vision.ai_review_service import AIReviewStageError
+from circuitcare.vision.ai_review_service import (
+    AIReviewStageError, _duplicate_pair_candidates,
+)
 from circuitcare.frontend.measurement_state import invalidate_legacy_diagnosis
 from circuitcare.analysis.models import AnalysisScope
 from circuitcare.analysis.state_manager import invalidate_analysis
@@ -37,6 +39,7 @@ INFERENCE_CONFIG = {"model_pipeline": "yolo26s+doctor-v12n+arshia-yolov8s", "con
                     "tile": 1024, "overlap": 0.25, "postprocess": "one-to-one-v2",
                     "ocr_engine": "rapidocr-v1", "review_model": "qwen3.5:9b",
                     "review_schema": "qwen-hierarchical-review-v2"}
+AUTO_CLEANUP_VALIDATION = None  # No independent PCB dataset/calibration is registered.
 
 
 def _model_cache_fingerprint() -> str:
@@ -123,6 +126,24 @@ def _review_detection_batches(detections: list[dict], batch_size: int = 24) -> l
             for index in range(0, len(detections), batch_size)] or [[]]
 
 
+def _pending_duplicate_pair_candidates(
+    candidates: list[dict], reviewed_pair_ids: set[str], *, limit: int = 12,
+) -> list[dict]:
+    """Page the deterministic board-wide pair queue without discarding deferred pairs."""
+    if limit <= 0:
+        return []
+    pending = []
+    for pair in candidates:
+        ids = sorted(str(row.get("detection_id") or row.get("component_id") or "")
+                     for row in pair.get("detections", ()))
+        pair_id = "|".join(ids)
+        if len(ids) == 2 and pair_id not in reviewed_pair_ids:
+            pending.append(pair)
+        if len(pending) >= limit:
+            break
+    return pending
+
+
 def _marking_ocr_targets(rows: list[dict], limit: int = 12) -> list[dict]:
     eligible = [row for row in rows if row.get("상태") != "제외"
                 and row.get("소자 종류") in {"ic", "resistor", "transistor", "diode", "connector"}]
@@ -198,9 +219,18 @@ def update_review_row(row: dict, *, component_type: str, status: str,
     x1, y1, x2, y2 = map(int, bbox_xyxy)
     if min(x1, y1) < 0 or x2 - x1 < 4 or y2 - y1 < 4:
         raise ValueError("박스 좌표가 유효하지 않습니다.")
+    row.setdefault("detector_class", row.get("소자 종류", "unknown"))
     row.update({"소자 종류": component_type, "상태": status,
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "user_edited": True})
+    # A manual type edit is an explicit override of any older Qwen extension
+    # confirmation. Keep AI evidence for audit, but make the effective class
+    # and Registry status follow the user edit.
+    row.update({"confirmed_base_class": component_type, "confirmed_subtype": None,
+                "effective_class": component_type, "diagnosis_class": component_type,
+                "component_type_status": "USER_CONFIRMED",
+                "type_confirmation_source": "USER_MANUAL"})
+    row.pop("qwen_user_confirmed_extension", None)
 
 
 def restore_review_row(row: dict) -> None:
@@ -242,7 +272,10 @@ def _review_fingerprint(rows: list[dict], ocr_result: dict | None) -> str:
     snapshot = [{key: row.get(key) for key in (
         "component_id", "소자 종류", "x1", "y1", "x2", "y2", "신뢰도",
         "ocr_candidates", "reference_designators", "ocr_class_hints", "body_marking",
-        "marking_ocr_fingerprint", "possible_part_number",
+        "marking_candidates", "marking_ocr_fingerprint", "possible_part_number",
+        "confirmed_part_number", "part_number_status", "part_identity_status",
+        "ocr_source", "ocr_score", "qwen_marking_candidates", "qwen_part_number_candidates",
+        "qwen_ocr_evidence", "qwen_conflicting_evidence",
     )} for row in rows]
     payload = json.dumps({"rows": snapshot, "ocr": (ocr_result or {}).get("records", [])},
                          ensure_ascii=False, sort_keys=True, default=str)
@@ -260,6 +293,34 @@ def duplicate_exclusion_enabled(proposal: dict, left_box: list | tuple,
         return False
     return (proposal.get("decision") == "same_component" and confidence >= 0.65
             and same_component_box_pair(left_box, right_box))
+
+
+def qwen_cleanup_disposition(
+    proposal: dict, *, protected: bool = False, geometry_valid: bool = False,
+    has_conflict: bool = False, is_group: bool = False,
+    validation: dict[str, Any] | None = AUTO_CLEANUP_VALIDATION,
+) -> tuple[str, str]:
+    """Return a reversible cleanup state; never auto-exclude on uncalibrated scores."""
+    if protected:
+        return "USER_CONFIRMED", "사용자가 확인·수정한 박스"
+    decision = str(proposal.get("decision") or "uncertain")
+    if decision == "different_components":
+        return "KEEP", "서로 다른 소자로 제안됨"
+    if is_group or has_conflict or decision == "uncertain":
+        return "REVIEW_REQUIRED", "묶음 박스·근거 충돌·불확실 판정"
+    if decision == "same_component" and not geometry_valid:
+        return "REVIEW_REQUIRED", "기하학적 정합이 확인되지 않음"
+    if decision == "suggest" and proposal.get("proposed_class") == "not_component":
+        return "REVIEW_REQUIRED", "실제 데이터로 검증된 자동 정리 기준이 없어 사용자 확인 필요"
+    if decision not in {"same_component", "not_component"}:
+        return "REVIEW_REQUIRED", "지원하지 않는 정리 판정"
+    if decision == "not_component" and proposal.get("proposed_class") != "not_component":
+        return "REVIEW_REQUIRED", "오탐으로 확인된 종류 제안이 아님"
+    if isinstance(validation, dict) and validation.get("validated") is True:
+        # Explicitly versioned, externally measured policy is required before
+        # this branch can be enabled; it is intentionally unset in this repo.
+        return "AUTO_EXCLUDED", "검증된 자동 정리 정책 통과"
+    return "REVIEW_REQUIRED", "실제 데이터로 검증된 자동 정리 기준이 없어 사용자 확인 필요"
 
 
 @st.cache_resource(show_spinner=False)
@@ -392,13 +453,23 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
         image_fingerprint = hashlib.sha256(image_bytes).hexdigest()
         marking_cache_key = f"cc_component_marking_ocr_{scope}"
         marking_cache = st_api.session_state.setdefault(marking_cache_key, {})
-        eligible = _marking_ocr_targets(rows)
+        # Prioritize the existing top twelve, then continue through later OCR
+        # batches so a large board never leaves the remaining markings silently
+        # unreviewed. Each target is independently fingerprint-cached.
+        eligible = _marking_ocr_targets(rows, limit=len(rows))
+        eligible_ids = {str(row.get("component_id")) for row in eligible}
+        for row in rows:
+            if row.get("상태") == "제외":
+                continue
+            if str(row.get("component_id")) not in eligible_ids:
+                row.setdefault("marking_ocr_status", "PENDING_PRIORITY")
         with Image.open(io.BytesIO(image_bytes)) as source_image:
-            for row in eligible:
+            for target_index, row in enumerate(eligible):
+                row["marking_ocr_batch"] = target_index // 12 + 1
                 marking_fingerprint = hashlib.sha256(json.dumps({
                     "photo": image_fingerprint, "id": row.get("component_id"),
                     "box": [row.get(key) for key in ("x1", "y1", "x2", "y2")],
-                    "class": row.get("소자 종류"), "engine": "rapidocr-marking-v1",
+                    "class": row.get("소자 종류"), "engine": "rapidocr-marking-v1", "version": 2,
                 }, sort_keys=True).encode()).hexdigest()
                 cached_marking = marking_cache.get(marking_fingerprint)
                 if isinstance(cached_marking, dict):
@@ -415,13 +486,19 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                     marking_cache[marking_fingerprint] = result
                 row["marking_ocr"] = result
                 row["marking_ocr_fingerprint"] = marking_fingerprint
+                row["marking_ocr_status"] = result.get("status", "REVIEWED")
                 if result.get("marking"):
                     row["body_marking"] = result["marking"]
                     row["marking_candidates"] = [item.get("text") for item in result.get("candidates", [])
                                                   if item.get("text")]
-                    if row.get("소자 종류") == "ic":
+                    row["ocr_source"] = "RapidOCR"
+                    candidates = result.get("candidates", [])
+                    row["ocr_score"] = (candidates[0].get("confidence") if candidates
+                                         and isinstance(candidates[0], dict) else None)
+                    if row.get("소자 종류") == "ic" and not row.get("confirmed_part_number"):
                         row["possible_part_number"] = result["marking"]
                         row["part_identity_status"] = "UNVERIFIED_PART_ID"
+                        row["part_number_status"] = "UNVERIFIED_PART_ID"
                         from circuitcare.symptom_diagnosis.ic_identity import resolve_ic_identity
                         row["ic_identity_candidate"] = resolve_ic_identity(result["marking"])
                     if result.get("inferred_value"):
@@ -472,7 +549,8 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                 _write_analysis_status(progress, f"Qwen 소자 검수 · {batch_index}/{len(batches)} 배치 진행 중")
                 batch_fingerprint = hashlib.sha256(json.dumps({
                     "image": image_fingerprint, "detections": batch,
-                    "ocr": (ocr_result or {}).get("records", []), "schema": "qwen-review-v2",
+                    "ocr": (ocr_result or {}).get("records", []), "model": DEFAULT_REVIEW_MODEL,
+                    "schema": "qwen-review-v2", "input_version": 2,
                 }, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
                 cached_batch = batch_cache.get(batch_fingerprint)
                 if isinstance(cached_batch, dict) and cached_batch.get("status") == "complete":
@@ -498,6 +576,70 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                     "review_tiles": partial.get("review_tiles", 0),
                     "duplicate_pair_crop_count": partial.get("duplicate_pair_crop_count", 0)})
                 review["review_diagnostics"][f"batch_{batch_index}"] = partial.get("review_diagnostics", {})
+            # Search the complete active detection set before considering batch
+            # boundaries. Cross-batch pairs receive their own focused paired crops.
+            indexed_detections = [dict(row, detection_id=str(row.get("component_id") or row.get("detection_id")))
+                                  for row in detections]
+            all_pairs = _duplicate_pair_candidates(indexed_detections, limit=None)
+            membership = {}
+            for batch_index, batch in enumerate(batches):
+                for row in batch:
+                    membership[str(row.get("component_id") or row.get("detection_id"))] = batch_index
+            batch_reviewed_pair_ids = {
+                "|".join(sorted(map(str, row.get("detection_ids", []))))
+                for row in review["duplicate_reviews"] if len(row.get("detection_ids", [])) == 2
+            }
+            pair_fingerprint = hashlib.sha256(json.dumps({
+                "image": image_fingerprint, "pairs": [
+                    [sorted(str(row.get("detection_id")) for row in pair["detections"]),
+                     [row.get("bbox_xyxy") for row in pair["detections"]]]
+                    for pair in all_pairs],
+                "model": DEFAULT_REVIEW_MODEL, "schema": "qwen-review-v2-board-pairs",
+            }, sort_keys=True, default=str).encode()).hexdigest()
+            pair_cache = st_api.session_state.setdefault(f"cc_component_qwen_pair_queue_{scope}", {})
+            pair_state = pair_cache.setdefault(pair_fingerprint, {"reviewed_pair_ids": [], "reviews": []})
+            reviewed_pair_ids = set(pair_state.get("reviewed_pair_ids", []))
+            pending_pairs = _pending_duplicate_pair_candidates(
+                all_pairs, reviewed_pair_ids | batch_reviewed_pair_ids, limit=12,
+            )
+            pair_error = None
+            if pending_pairs:
+                try:
+                    pair_detection_ids = {str(row.get("detection_id"))
+                                          for pair in pending_pairs for row in pair["detections"]}
+                    pair_detections = [row for row in indexed_detections
+                                       if str(row.get("detection_id")) in pair_detection_ids]
+                    pair_review = review_components_with_qwen(
+                        ollama, DEFAULT_REVIEW_MODEL, image_bytes, pair_detections,
+                        (ocr_result or {}).get("records", []), duplicate_pair_candidates=pending_pairs,
+                    )
+                    for proposal in pair_review.get("duplicate_reviews", []):
+                        pair_id = "|".join(sorted(map(str, proposal.get("detection_ids", []))))
+                        if pair_id:
+                            pair_state["reviewed_pair_ids"].append(pair_id)
+                            pair_state["reviews"].append(proposal)
+                    pair_state["reviewed_pair_ids"] = sorted(set(pair_state["reviewed_pair_ids"]))
+                    pair_cache[pair_fingerprint] = pair_state
+                    st_api.session_state[f"cc_component_qwen_pair_queue_{scope}"] = pair_cache
+                except Exception as pair_exc:
+                    pair_error = str(pair_exc)[:500]
+                    failed_batches.append({"batch": "board-wide duplicate pairs", "detection_ids": [],
+                        "status": "failed", "stage": "qwen", "error": pair_error})
+            review["duplicate_reviews"].extend(pair_state.get("reviews", []))
+            cross_batch_count = sum(
+                membership.get(str(pair["detections"][0].get("detection_id")))
+                != membership.get(str(pair["detections"][1].get("detection_id")))
+                for pair in all_pairs
+            )
+            all_reviewed_pair_ids = (set(pair_state.get("reviewed_pair_ids", []))
+                                     | batch_reviewed_pair_ids)
+            review["review_diagnostics"]["cross_batch_duplicate_search"] = {
+                "status": "failed" if pair_error else "complete",
+                "candidate_count": len(all_pairs), "cross_batch_candidate_count": cross_batch_count,
+                "reviewed_count": len(all_reviewed_pair_ids),
+                "deferred_count": max(0, len(all_pairs) - len(all_reviewed_pair_ids)),
+                "error": pair_error,
+            }
             review["failed_batches"] = failed_batches
             search_failed = any(row.get("stage") == "candidate_search" for row in failed_batches)
             batch_diagnostics = [review["review_diagnostics"].get(f"batch_{index}", {})
@@ -515,7 +657,8 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                                      "items": candidate_items[:240]},
                 "duplicate_pair_search": {"status": "complete",
                                           "pair_count": sum(row["duplicate_pair_crop_count"]
-                                                            for row in review["review_batches"]),
+                                                            for row in review["review_batches"])
+                                                      + len(pair_state.get("reviews", [])),
                                           "items": duplicate_items[:240]},
                 "qwen": {"status": ("failed" if any(row.get("stage") in {"qwen", "qwen_validation"}
                                                         for row in failed_batches)
@@ -698,6 +841,11 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
         ocr_result = st_api.session_state.get(ocr_key)
         if isinstance(ocr_result, dict):
             ocr_rows = ocr_result.get("records", [])
+            marking_pending = sum(row.get("상태") != "제외"
+                                  and row.get("marking_ocr_status") == "PENDING_PRIORITY" for row in rows)
+            marking_failed = sum(row.get("상태") != "제외"
+                                 and row.get("marking_ocr_status") == "OCR_FAILED" for row in rows)
+            st_api.caption(f"소자 본체 각인 OCR · 상위 12개 우선, 이후 12개씩 추가 검수 · 미검수 대기 {marking_pending} · 실패 {marking_failed}")
             if ocr_rows:
                 st_api.caption(f"OCR 문자 {len(ocr_rows)}개 · 엔진 {ocr_result.get('engine', 'RapidOCR')}")
                 st_api.dataframe([{"원문": row.get("raw_text", row.get("text", "")),
@@ -740,6 +888,9 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     for item in failed_items:
                         st_api.caption(f"{item.get('stage')} · {item.get('component_id', item.get('parent_id', ''))} · {item.get('reason')}")
             st_api.caption(f"제안 모델 · {qwen_review.get('model', 'Qwen Vision')} · 상태 {qwen_review.get('verification_status', 'AI_SUGGESTIONS_ONLY')} · {len(qwen_review.get('review_batches', []))}개 배치 · 1024px 고해상도 타일 {qwen_review.get('review_tiles', 0)}개 · 모든 AI 제안은 미확인")
+            cross_batch = diagnostics.get("cross_batch_duplicate_search", {})
+            if cross_batch.get("candidate_count"):
+                st_api.caption(f"보드 전체 중복 후보 {cross_batch.get('candidate_count')} · 배치 경계 {cross_batch.get('cross_batch_candidate_count')} · 검토 {cross_batch.get('reviewed_count')} · 다음 검수 대기 {cross_batch.get('deferred_count')}")
             false_positive_count = sum(row.get("proposed_class") == "not_component"
                                         for row in qwen_review.get("class_reviews", []))
             duplicate_count = sum(row.get("decision") == "same_component"
@@ -760,7 +911,13 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 title = f"{target['component_id']} · YOLO {target.get('소자 종류', 'unknown')} → Qwen {base_class}"
                 if proposal.get("proposed_subtype"):
                     title += f" / {proposal['proposed_subtype']}"
-                st_api.markdown(f"**{title}** · Qwen 점수 {proposal['confidence']:.2f} · {proposal.get('review_status', 'AI_SUGGESTED')} · 확인 필요")
+                st_api.markdown(f"**{title}** · Qwen 판단 점수 {proposal['confidence'] * 100:.0f}/100 · {proposal.get('review_status', 'AI_SUGGESTED')} · 확인 필요")
+                cleanup_status, cleanup_reason = qwen_cleanup_disposition(
+                    proposal, protected=target.get("상태") == "확인" or bool(target.get("user_edited")),
+                    has_conflict=bool(proposal.get("conflicting_evidence")),
+                    is_group=bool(target.get("group_parent_id")),
+                )
+                st_api.caption(f"오탐 정리 상태 · {cleanup_status} · {cleanup_reason}")
                 st_api.caption(proposal.get("visual_evidence") or proposal.get("evidence") or "시각 근거 없음")
                 if proposal.get("ocr_evidence"):
                     st_api.caption(f"OCR 교차 확인 · {proposal['ocr_evidence']}")
@@ -838,6 +995,10 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 if not geometric_duplicate:
                     st_api.warning("박스 위치·크기 관계가 중복 근거와 맞지 않습니다. Qwen 제안만으로는 제외할 수 없습니다.")
                 protected = any(row.get("상태") == "확인" or row.get("user_edited") for row in pair_rows)
+                cleanup_status, cleanup_reason = qwen_cleanup_disposition(
+                    proposal, protected=protected, geometry_valid=geometric_duplicate,
+                )
+                st_api.caption(f"중복 정리 상태 · {cleanup_status} · {cleanup_reason}")
                 can_exclude = duplicate_exclusion_enabled(proposal, left_box, right_box, protected=protected)
                 if protected:
                     st_api.info("사용자 확인 박스가 포함되어 AI 중복 제외를 막았습니다.")

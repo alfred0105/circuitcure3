@@ -221,6 +221,92 @@ def test_question_plan_does_not_pad_unrelated_catalog_questions_and_avoids_answe
     assert [row["test_id"] for row in changed["questions"]] == ["Q2"]
 
 
+def test_simple_diagnosis_question_renderer_runs_with_real_result_and_no_suspects():
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_string('''
+import streamlit as st
+from circuitcare.dashboard.views.symptom_diagnosis_panel import _render_simple_diagnosis_result
+from circuitcare.frontend.models import ProjectContext
+project = ProjectContext("app-test-question", "board")
+_render_simple_diagnosis_result(
+    st, project, {"status": "OK", "candidates": [], "next_tests": []},
+    state={"symptoms": []}, knowledge={"test_catalog": {"tests": {}}, "fault_modes": {"fault_modes": {}}},
+    preview=False, board_registry={"components": []}, suspected_components=[],
+)
+''').run()
+    assert not app.exception
+
+
+def test_question_renderer_receives_only_registry_valid_suspects():
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_string('''
+import streamlit as st
+from circuitcare.dashboard.views.symptom_diagnosis_panel import _render_simple_diagnosis_result
+from circuitcare.frontend.models import ProjectContext
+project = ProjectContext("app-test-suspects", "board")
+state = {"symptoms": []}
+_render_simple_diagnosis_result(
+    st, project, {"status": "OK", "candidates": [], "next_tests": []}, state=state,
+    knowledge={"test_catalog": {"tests": {}}, "fault_modes": {"fault_modes": {}}},
+    preview=False, board_registry={"components": []},
+    suspected_components=[{"component_id": "BC1", "board_component_id": "BC1"}],
+)
+st.write(state["valid_suspected_components"])
+''').run()
+    assert not app.exception
+
+
+def test_question_renderer_receives_prevalidated_suspects(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(symptoms, "_render_simple_followup_question",
+                        lambda _st, _project, _result, *, state, **_kwargs:
+                        captured.update(suspects=state["valid_suspected_components"]))
+    project = ProjectContext("question-suspects", "board")
+    valid, stale = symptoms._registry_valid_suspects(
+        [{"board_component_id": "BC1", "component_id": "local1", "photo_id": "front",
+          "selection_version": "obs1"},
+         {"board_component_id": "BC2", "component_id": "local2", "photo_id": "front",
+          "selection_version": "obs2"}],
+        {"photos": [{"photo_id": "front", "image_fingerprint": "hash"}],
+         "components": [{"board_component_id": "BC1", "presence_status": "CONFIRMED",
+             "source_components": [{"component_id": "local1", "photo_id": "front",
+                 "review_status": "USER_CONFIRMED", "source_observation_fingerprint": "obs1"}]},
+             {"board_component_id": "BC2", "presence_status": "EXCLUDED",
+              "source_components": [{"component_id": "local2", "photo_id": "front",
+                  "review_status": "EXCLUDED", "source_observation_fingerprint": "obs2"}]}]},
+    )
+    symptoms._render_simple_diagnosis_result(
+        SimpleNamespace(session_state={}, caption=lambda *_args, **_kwargs: None), project,
+        {"status": "OK", "candidates": [], "next_tests": []}, state={"symptoms": []},
+        knowledge={"test_catalog": {"tests": {}}, "fault_modes": {"fault_modes": {}}},
+        preview=False, board_registry=None, suspected_components=valid,
+    )
+    assert [row["board_component_id"] for row in captured["suspects"]] == ["BC1"]
+    assert len(stale) == 1
+
+
+@pytest.mark.parametrize(("base_class", "subtype", "expected_component", "expected_status"), [
+    ("connector", "fpc_ffc", "connector", "USER_CONFIRMED"),
+    ("other_component", "ic_socket", "unknown", "USER_CONFIRMED_EXTENSION"),
+    ("board_feature", "test_point", "unknown", "USER_CONFIRMED_EXTENSION"),
+])
+def test_confirmed_qwen_types_preserve_yolo_and_keep_extensions_out_of_18_classes(
+    base_class, subtype, expected_component, expected_status,
+):
+    from circuitcare.dashboard.views.inspection_panel import confirm_qwen_component_type
+
+    row = {"component_id": "U1", "소자 종류": "ic"}
+    confirm_qwen_component_type(row, base_class=base_class, subtype=subtype)
+    assert row["detector_class"] == "ic"
+    assert row["confirmed_base_class"] == base_class
+    assert row["confirmed_subtype"] == subtype
+    assert row["소자 종류"] == expected_component
+    assert row["qwen_component_type_status"] == expected_status
+    assert row["상태"] == "확인"
+
+
 def test_inspection_targets_use_real_registry_ids_order_evidence_and_never_invent_boxes():
     project = ProjectContext("workflow-targets", "workflow-target-board")
     registry = build_board_component_registry(

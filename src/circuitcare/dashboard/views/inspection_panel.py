@@ -56,6 +56,35 @@ def board_suspects(state: Any, project: ProjectContext) -> list[dict[str, Any]]:
     return [row for row in rows.values() if isinstance(row, dict)]
 
 
+def confirm_qwen_component_type(row: dict[str, Any], *, base_class: str, subtype: str | None = None) -> None:
+    """Persist a user-confirmed class without overwriting the detector observation."""
+    from circuitcare.component_taxonomy import normalize_qwen_class, normalize_qwen_subtype
+
+    base = normalize_qwen_class(base_class)
+    if base in {"unknown", "not_component"}:
+        raise ValueError("이 종류는 사용자 확정 소자 종류로 저장할 수 없습니다.")
+    subtype_value = normalize_qwen_subtype(base, subtype)
+    row["detector_class"] = row.get("detector_class") or row.get("소자 종류", "unknown")
+    row["qwen_base_class"] = base
+    row["qwen_subtype"] = subtype_value
+    row["confirmed_base_class"] = base
+    row["confirmed_subtype"] = subtype_value
+    row["effective_class"] = base
+    row["component_type_status"] = "USER_CONFIRMED_EXTENSION" if base in {"other_component", "board_feature"} else "USER_CONFIRMED"
+    row["qwen_component_type_status"] = row["component_type_status"]
+    row["qwen_review_status"] = "USER_CONFIRMED"
+    row["상태"] = "확인"
+    row["presence_status"] = "CONFIRMED"
+    row["user_edited"] = True
+    if row["component_type_status"] == "USER_CONFIRMED_EXTENSION":
+        row["소자 종류"] = "unknown"
+        row["diagnosis_class"] = "unknown"
+        row["qwen_user_confirmed_extension"] = True
+    else:
+        row["소자 종류"] = base
+        row["diagnosis_class"] = base
+
+
 def dismiss_board_suspect(state: Any, project: ProjectContext, board_component_id: str) -> None:
     owner = f"{project.project_id}|{project.board_id or ''}"
     state.setdefault(USER_SUSPECTS_KEY, {}).setdefault(owner, {}).pop(str(board_component_id), None)
@@ -285,11 +314,8 @@ def render_inspection_panel(
                                     rows = list(st.session_state.get(records_key, []))
                                     target = next((row for row in rows if row.get("component_id") == component_id), None)
                                     if target is not None:
-                                        target["소자 종류"] = candidate_type
-                                        target["상태"] = "확인"
-                                        target["user_edited"] = True
-                                        target["qwen_component_type_status"] = "USER_CONFIRMED"
-                                        target["qwen_review_status"] = "USER_CONFIRMED"
+                                        confirm_qwen_component_type(target, base_class=candidate_type,
+                                            subtype=selected_source.get("qwen_component_subtype_candidate"))
                                         st.session_state[records_key] = rows
                                         invalidate_component_review_state(st.session_state, scope=review_scope,
                                             project_id=project.project_id, board_id=project.board_id)
@@ -299,12 +325,8 @@ def render_inspection_panel(
                                     rows = list(st.session_state.get(records_key, []))
                                     target = next((row for row in rows if row.get("component_id") == component_id), None)
                                     if target is not None:
-                                        target["qwen_component_type_status"] = "USER_CONFIRMED_EXTENSION"
-                                        target["qwen_review_status"] = "USER_CONFIRMED"
-                                        target["qwen_user_confirmed_extension"] = True
-                                        if candidate_type == "other_component":
-                                            target["상태"] = "확인"
-                                            target["user_edited"] = True
+                                        confirm_qwen_component_type(target, base_class=candidate_type,
+                                            subtype=selected_source.get("qwen_component_subtype_candidate"))
                                         st.session_state[records_key] = rows
                                         invalidate_component_review_state(st.session_state, scope=review_scope,
                                             project_id=project.project_id, board_id=project.board_id)

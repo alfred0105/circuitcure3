@@ -431,6 +431,7 @@ def _render_simple_followup_question(
 def _render_simple_diagnosis_result(
     st: Any, project: ProjectContext, result: dict[str, Any], *, state: dict[str, Any],
     knowledge: dict[str, Any], preview: bool, board_registry: dict[str, Any] | None,
+    suspected_components: list[dict[str, Any]] | None = None,
     show_questions: bool = True, show_candidates: bool = True,
 ) -> None:
     if state.get("ollama_error"):
@@ -1429,6 +1430,7 @@ def render_symptom_diagnosis_panel(
         _render_simple_diagnosis_result(
             st, project, result, state=state, knowledge=kb, preview=preview,
             board_registry=board_registry,
+            suspected_components=valid_suspects,
             show_questions=workflow_stage != "REASSESSMENT",
             show_candidates=workflow_stage != "QUESTIONS",
         )
