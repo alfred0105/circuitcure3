@@ -27,6 +27,24 @@ USER_SUSPECTS_KEY = "circuitcare_v4_user_suspects_by_map"
 ROLE_OPTIONS = ("power", "control", "control_input", "control_timing", "driver", "output",
                 "input", "input_output", "protection", "thermal", "buzzer", "relay")
 LOGGER = logging.getLogger(__name__)
+
+
+def board_suspects(state: Any, project: ProjectContext) -> list[dict[str, Any]]:
+    """Read/migrate user suspicions under project + board + canonical board ID."""
+    owner = f"{project.project_id}|{project.board_id or ''}"
+    store = state.setdefault(USER_SUSPECTS_KEY, {})
+    rows = store.setdefault(owner, {})
+    for old_owner, old_rows in list(store.items()):
+        if old_owner == owner or not str(old_owner).startswith(f"{owner}|") or not isinstance(old_rows, dict):
+            continue
+        for old_id, old_row in old_rows.items():
+            if isinstance(old_row, dict):
+                rows.setdefault(str(old_row.get("board_component_id") or old_id), old_row)
+    store[owner] = rows
+    state[USER_SUSPECTS_KEY] = store
+    return [row for row in rows.values() if isinstance(row, dict)]
+
+
 def render_inspection_panel(
     st: Any, project: ProjectContext, *, preview: bool = False,
     components: tuple[ComponentOverlayViewModel, ...] = (),
@@ -37,12 +55,15 @@ def render_inspection_panel(
     inventory_scope: str | None = None,
     review_image_bytes: bytes | None = None,
     review_scope: str | None = None,
+    board_registry: dict[str, Any] | None = None,
 ) -> None:
     owner = f"{project.project_id}|{project.board_id or ''}|{inventory_scope or component_map_version or ''}"
+    suspect_owner = f"{project.project_id}|{project.board_id or ''}"
     inventories = st.session_state.setdefault(COMPONENT_INVENTORY_KEY, {})
     inventory = inventories.setdefault(owner, {})
+    board_suspects(st.session_state, project)
     all_suspects = st.session_state.setdefault(USER_SUSPECTS_KEY, {})
-    suspects = all_suspects.setdefault(owner, {})
+    suspects = all_suspects.setdefault(suspect_owner, {})
     with st.container(border=True):
         st.markdown('<span class="cc-inspection-marker"></span>', unsafe_allow_html=True)
         overlap_key = st.session_state.get("cc_active_component_overlap_key")
@@ -247,10 +268,11 @@ def render_inspection_panel(
             eligible_modes = [fault_id for fault_id, mode in modes.items()
                               if component_type in {str(value).casefold()
                                                     for value in mode.get("candidate_component_types", [])}]
-            suspicion_key = f"cc_v4_suspect_fault_{hash(owner)}_{selected_component.component_id}"
+            board_component_id = str(selected_component.board_component_id or selected_component.component_id)
+            suspicion_key = f"cc_v4_suspect_fault_{hash(suspect_owner)}_{board_component_id}"
             fault_options = ["__AI__", *eligible_modes]
             if st.session_state.get(suspicion_key) not in fault_options:
-                saved = suspects.get(selected_component.component_id, {}).get("suspected_fault_mode") or "__AI__"
+                saved = suspects.get(board_component_id, {}).get("suspected_fault_mode") or "__AI__"
                 st.session_state[suspicion_key] = saved if saved in fault_options else "__AI__"
             suspected_fault = st.selectbox(
                 "AI 진단 참고 · 의심 고장 유형", fault_options,
@@ -258,11 +280,11 @@ def render_inspection_panel(
                 key=suspicion_key,
                 help="사용자 의심은 미검증 참고 정보입니다. 측정 증거나 고장 확정으로 취급하지 않습니다.",
             )
-            active_suspect = selected_component.component_id in suspects
+            active_suspect = board_component_id in suspects
             if st.button("의심 소자 해제" if active_suspect else "의심 소자로 지정",
-                         key=f"cc_v4_toggle_suspect_{hash(owner)}_{selected_component.component_id}"):
+                         key=f"cc_v4_toggle_suspect_{hash(suspect_owner)}_{board_component_id}"):
                 if active_suspect:
-                    suspects.pop(selected_component.component_id, None)
+                    suspects.pop(board_component_id, None)
                 else:
                     photo_id = (selected_component.source_backend_photo_ids[0]
                                 if len(selected_component.source_backend_photo_ids) == 1 else None)
@@ -275,19 +297,27 @@ def render_inspection_panel(
                     observation_fingerprint = hashlib.sha256(json.dumps(
                         payload, sort_keys=True, ensure_ascii=False, default=str
                     ).encode("utf-8")).hexdigest()
-                    suspects[selected_component.component_id] = {
+                    registry = board_registry or st.session_state.get("circuitcare_v7_active_board_registry")
+                    registry_source = next((source for component in (registry or {}).get("components", [])
+                                            if component.get("board_component_id") == board_component_id
+                                            for source in component.get("source_components", [])
+                                            if source.get("photo_id") == photo_id
+                                            and source.get("component_id") == selected_component.component_id), None)
+                    suspects[board_component_id] = {
                         "component_id": selected_component.component_id,
-                        "board_component_id": selected_component.board_component_id or selected_component.component_id,
+                        "board_component_id": board_component_id,
                         "suspected_fault_mode": None if suspected_fault == "__AI__" else suspected_fault,
                         "selection_source": "USER", "evidence_status": "UNVERIFIED",
                         "photo_id": photo_id, "observation_fingerprint": observation_fingerprint,
                         "component_map_version": inventory_scope or component_map_version,
+                        "selection_version": (registry_source.get("source_observation_fingerprint") if registry_source
+                                              else getattr(selected_component, "source_observation_fingerprint", None)),
                     }
-                all_suspects[owner] = suspects
+                all_suspects[suspect_owner] = suspects
                 st.session_state[USER_SUSPECTS_KEY] = all_suspects
                 st.rerun()
             if active_suspect:
-                saved = suspects[selected_component.component_id]
+                saved = suspects[board_component_id]
                 new_fault = None if suspected_fault == "__AI__" else suspected_fault
                 if saved.get("suspected_fault_mode") != new_fault:
                     saved["suspected_fault_mode"] = new_fault

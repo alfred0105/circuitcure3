@@ -127,7 +127,11 @@ class OllamaClient:
             "done": response.get("done"),
             "done_reason": response.get("done_reason"),
             "total_duration_ns": response.get("total_duration"),
+            "load_duration_ns": response.get("load_duration"),
+            "prompt_eval_count": response.get("prompt_eval_count"),
+            "prompt_eval_duration_ns": response.get("prompt_eval_duration"),
             "eval_count": response.get("eval_count"),
+            "eval_duration_ns": response.get("eval_duration"),
         }
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:

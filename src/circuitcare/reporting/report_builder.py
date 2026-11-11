@@ -53,7 +53,8 @@ def build_pcb_diagnostic_snapshot(*, root: Path, project: Any, registry: dict[st
     result_snapshot = ({key: result.get(key) for key in (
         "status", "hypotheses", "hypothesis_groups", "next_tests", "measurement_evidence",
         "matched_rules", "functional_blocks", "llm_assist", "llm_component_explanations",
-        "llm_unverified_suggestions", "score_semantics",
+        "llm_unverified_suggestions", "score_semantics", "qwen_fault_proposals",
+        "candidate_fusion", "qwen_run_metadata", "pcb_context_summary", "user_suspicions",
     ) if key in result} | {"component_candidates": candidates}) if isinstance(result, dict) else None
     symptoms = list(analysis_snapshot.get("symptoms", []))
     component_rows = list(registry.get("components", []))

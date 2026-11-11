@@ -39,8 +39,8 @@ from circuitcare.dashboard.components.pcb_workspace import (
     render_component_viewer, scale_overlay_to_display,
 )
 from circuitcare.dashboard.views.inspection_panel import (
-    COMPONENT_EDIT_KEY, COMPONENT_INVENTORY_KEY, MAP_VERSION_KEY, USER_SUSPECTS_KEY,
-    render_inspection_panel,
+    COMPONENT_EDIT_KEY, COMPONENT_INVENTORY_KEY, MAP_VERSION_KEY,
+    board_suspects, render_inspection_panel,
     _diagnosis_status_label,
 )
 from circuitcare.dashboard.views.symptom_diagnosis_panel import (
@@ -903,12 +903,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
     analysis_target_id = "board:registry:v1"
     st.session_state["circuitcare_v7_analysis_target_id"] = analysis_target_id
     component_inventory = {"__board_registry__": {"registry_version": board_registry.get("version")}}
-    suspect_owner = (
-        f"{project.project_id}|{project.board_id or ''}|"
-        f"{st.session_state.get('circuitcare_v4_component_inventory_scope') or st.session_state.get(MAP_VERSION_KEY) or ''}"
-    )
-    suspect_store = st.session_state.get(USER_SUSPECTS_KEY, {})
-    suspected_components = list(suspect_store.get(suspect_owner, {}).values()) if isinstance(suspect_store, dict) else []
+    suspected_components = board_suspects(st.session_state, project)
     live_analysis_snapshot = current_analysis_snapshot(
         st, project, components=snapshot_components, component_inventory=component_inventory,
         analysis_target_id=analysis_target_id, component_id_aliases=measurement_aliases,
@@ -1031,6 +1026,7 @@ def _render_component_inspector(st: Any, project: ProjectContext, preview: bool)
         inventory_scope=st.session_state.get("circuitcare_v4_component_inventory_scope"),
         review_image_bytes=st.session_state.get("cc_active_component_review_image"),
         review_scope=st.session_state.get("cc_active_component_review_scope"),
+        board_registry=st.session_state.get("circuitcare_v7_active_board_registry"),
     )
     review_image = st.session_state.get("cc_active_component_review_image")
     review_scope = st.session_state.get("cc_active_component_review_scope")

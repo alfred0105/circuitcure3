@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import Any
+import json
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -17,6 +18,7 @@ from circuitcare.symptom_diagnosis.llm_assist import (
     suggest_pcb_fault_candidates, select_follow_up_question,
 )
 from circuitcare.symptom_diagnosis.pcb_context import build_pcb_context
+from circuitcare.symptom_diagnosis.candidate_fusion import fuse_inspection_candidates
 from circuitcare.symptom_diagnosis.observation_store import ObservationStore
 from circuitcare.symptom_diagnosis.diagnosis_state import build_overlay_state
 from circuitcare.symptom_diagnosis.schemas import ComponentRecord, Observation
@@ -66,7 +68,13 @@ def _diagnosis_fingerprint(
               "evidence_status": row.get("evidence_status", "UNVERIFIED")}
              for row in (suspected_components or []) if isinstance(row, dict)],
             key=lambda row: str(row.get("component_id")),
-        ), "answered_test_ids": sorted(state.get("answered_test_ids", []))},
+        ), "answered_test_ids": sorted(state.get("answered_test_ids", [])),
+        "question_answers": [
+            {"test_id": str(test_id), "answer": row.get("answer"),
+             "observation_codes": sorted((row.get("observations") or {}).keys())}
+            for test_id, row in sorted(state.get("question_answers", {}).items())
+            if isinstance(row, dict)
+        ]},
     )
 
 
@@ -74,6 +82,39 @@ def _analysis_scope(project: ProjectContext, state: Any, analysis_target_id: str
     return AnalysisScope(project.project_id, project.board_id or "",
                          str(analysis_target_id or state.get("circuitcare_v7_analysis_target_id")
                              or state.get(ACTIVE_PHOTO_KEY) or "target:default"))
+
+
+def _registry_valid_suspects(
+    rows: list[dict[str, Any]], registry: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep suspicions only while their board ID and source observation remain active."""
+    if not isinstance(registry, dict):
+        return rows, []
+    photos = {str(row.get("photo_id")): row for row in registry.get("photos", []) if isinstance(row, dict)}
+    components = {str(row.get("board_component_id")): row for row in registry.get("components", [])
+                  if isinstance(row, dict) and row.get("board_component_id")}
+    active: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+    for suspect in rows:
+        board_id = str(suspect.get("board_component_id") or suspect.get("component_id") or "")
+        component = components.get(board_id)
+        sources = component.get("source_components", []) if component else []
+        local_id = str(suspect.get("component_id") or "")
+        photo_id = str(suspect.get("photo_id") or "")
+        source = next((row for row in sources if isinstance(row, dict)
+                       and (not local_id or str(row.get("component_id")) == local_id)
+                       and (not photo_id or str(row.get("photo_id")) == photo_id)
+                       and str(row.get("review_status", "")).casefold() not in {"excluded", "exclude"}), None)
+        manifest = photos.get(photo_id, {})
+        image_matches = (not suspect.get("photo_sha256") or not manifest.get("image_fingerprint")
+                         or suspect.get("photo_sha256") == manifest.get("image_fingerprint"))
+        source_version_matches = (not suspect.get("selection_version") or not source
+                                  or suspect.get("selection_version") == source.get("source_observation_fingerprint"))
+        if component and source and component.get("presence_status") != "EXCLUDED" and image_matches and source_version_matches:
+            active.append(suspect)
+        else:
+            stale.append(suspect)
+    return active, stale
 
 
 def current_analysis_snapshot(
@@ -284,9 +325,52 @@ def _combined_observations(state: dict[str, Any], answers: dict[str, Any] | None
     rows = list(state.get("parsed_observations", []))
     rows.extend({"code": code, "value": value, "status": "observed", "source": "user_report"}
                 for code, value in state.get("manual_observations", {}).items())
-    rows.extend({"code": code, "value": value, "status": "observed", "source": "follow_up_answer"}
-                for code, value in (answers if answers is not None else state.get("answers", {})).items())
+    saved_answers = state.get("question_answers", {})
+    if isinstance(saved_answers, dict) and saved_answers:
+        rows.extend({"code": code, "value": value, "status": "observed", "source": "legacy_follow_up_answer"}
+                    for code, value in state.get("legacy_answers", {}).items())
+        for test_id, entry in saved_answers.items():
+            if not isinstance(entry, dict) or entry.get("answer") not in {"예", "아니오"}:
+                continue
+            rows.extend({"code": code, "value": value, "status": "observed",
+                         "source": "follow_up_answer", "test_id": test_id}
+                        for code, value in (entry.get("observations") or {}).items())
+    else:
+        rows.extend({"code": code, "value": value, "status": "observed", "source": "follow_up_answer"}
+                    for code, value in (answers if answers is not None else state.get("answers", {})).items())
     return rows
+
+
+def _save_follow_up_answer(state: dict[str, Any], question: dict[str, Any], answer: str) -> None:
+    """Persist/replace one catalog answer and rebuild compatibility state safely."""
+    test_id = str(question.get("test_id") or "")
+    if not test_id:
+        return
+    entries = state.setdefault("question_answers", {})
+    if not entries and state.get("answers") and "legacy_answers" not in state:
+        state["legacy_answers"] = dict(state.get("answers", {}))
+    if answer == "답변 취소":
+        entries.pop(test_id, None)
+        state["answered_test_ids"] = [value for value in state.get("answered_test_ids", []) if value != test_id]
+    elif answer in {"예", "아니오", "모르겠음"}:
+        outcome = question.get("results", {}).get("yes" if answer == "예" else "no", {}) if answer != "모르겠음" else {}
+        observations = outcome.get("observations", {}) if isinstance(outcome, dict) else {}
+        # Unknown is stored as an answer but yields no positive or negative fact.
+        entries[test_id] = {"test_id": test_id, "question": question,
+                            "answer": answer,
+                            "observations": dict(observations) if answer in {"예", "아니오"} else {},
+                            "source": "follow_up_answer"}
+        state["answered_test_ids"] = list(dict.fromkeys([*state.get("answered_test_ids", []), test_id]))
+    state["question_answers"] = entries
+    # Legacy readers expect a fact map; conflicts remain represented in the
+    # per-question rows consumed by _combined_observations and are not collapsed there.
+    flattened: dict[str, Any] = {}
+    for entry in entries.values():
+        if not isinstance(entry, dict) or entry.get("answer") not in {"예", "아니오"}:
+            continue
+        for code, value in (entry.get("observations") or {}).items():
+            flattened.setdefault(str(code), value)
+    state["answers"] = flattened
 
 
 def _persist_diagnosis(project: ProjectContext, state: dict[str, Any], result: dict[str, Any],
@@ -319,6 +403,7 @@ def _apply_qwen_pcb_assist(
     answered_test_ids: list[str], board_registry: dict[str, Any] | None = None,
 ) -> None:
     """Attach bounded Qwen proposals without changing rule ranks or verdicts."""
+    started = time.perf_counter()
     context = build_pcb_context(components=components, photo_records=project.image_records,
                                 diagnosis=result, suspected_components=suspected_components,
                                 board_registry=board_registry)
@@ -334,7 +419,19 @@ def _apply_qwen_pcb_assist(
             pcb_context=context, diagnosis=result, knowledge=knowledge,
         )
     except (LocalLLMError, ValueError, TypeError, OSError) as exc:
-        result["qwen_fault_proposals"] = {"proposals": [], "status": "FAILED", "error": str(exc)}
+        message = str(exc)
+        category = ("TIMEOUT" if isinstance(exc, TimeoutError) else
+                    "TRUNCATED_RESPONSE" if "truncated" in message.casefold() else
+                    "INVALID_JSON" if "invalid JSON" in message or "JSON content" in message else
+                    "MODEL_OR_TRANSPORT_ERROR")
+        result["qwen_fault_proposals"] = {"proposals": [], "status": "FAILED",
+                                          "failure_category": category, "error": message[:400]}
+    result["candidate_fusion"] = fuse_inspection_candidates(
+        rule_candidates=result.get("all_component_candidates", result.get("component_candidates", [])),
+        qwen_proposals=result.get("qwen_fault_proposals", {}).get("proposals", []),
+        components=components, suspected_components=suspected_components, top_k=3,
+        allowed_fault_ids=set(knowledge.get("fault_modes", {}).get("fault_modes", {})),
+    )
     eligible_questions = [row for row in result.get("next_tests", [])
                           if row.get("type") == "question" and row.get("test_id") not in set(answered_test_ids)]
     if len(result.get("hypotheses", [])) > 1 and eligible_questions:
@@ -345,6 +442,20 @@ def _apply_qwen_pcb_assist(
             )
         except (LocalLLMError, ValueError, TypeError, OSError) as exc:
             result["llm_follow_up_question_error"] = str(exc)
+    context_json = json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str)
+    qwen_result = result.get("qwen_fault_proposals", {})
+    result["qwen_run_metadata"] = {
+        "model": qwen_result.get("model", selected_model),
+        "model_digest": qwen_result.get("model_info", {}).get("digest"),
+        "context_char_count": len(context_json),
+        "context_token_estimate": context.get("context_token_estimate"),
+        "estimated_request_tokens": int(context.get("context_token_estimate", 0)) + 1200,
+        "token_estimate_method": "serialized JSON characters / 3.2 plus fixed prompt/schema reserve; estimate only",
+        "omitted_component_count": context.get("omitted_component_count", 0),
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+        "usage": qwen_result.get("usage", {}),
+        "failure_category": qwen_result.get("failure_category"),
+    }
 
 
 def render_symptom_diagnosis_panel(
@@ -391,12 +502,15 @@ def render_symptom_diagnosis_panel(
         active_component_ids.update(value for value in aliases if value)
         if component_row.get("presence_status") == "EXCLUDED":
             excluded_component_ids.update(value for value in aliases if value)
-    valid_suspects = [row for row in (suspected_components or []) if isinstance(row, dict)
+    active_suspects = [row for row in (suspected_components or []) if isinstance(row, dict)
                       and ({str(row.get("board_component_id") or ""), str(row.get("component_id") or "")}
                            & active_component_ids)
                       and not ({str(row.get("board_component_id") or ""), str(row.get("component_id") or "")}
                                & excluded_component_ids)
                       and row.get("evidence_status") == "UNVERIFIED"]
+    valid_suspects, stale_suspects = _registry_valid_suspects(active_suspects, board_registry)
+    if stale_suspects:
+        st.warning(f"저장된 사용자 의심 {len(stale_suspects)}개가 사진·Registry 관측과 달라 현재 진단에서 제외했습니다. PCB에서 다시 지정하면 기존 기록은 보존됩니다.")
     confirmed_component_ids = sorted(
         row["component_id"] for row in component_rows if row.get("presence_status") == "CONFIRMED"
     )
@@ -451,7 +565,7 @@ def render_symptom_diagnosis_panel(
             llm_enabled = st.checkbox("LLM 설명 보조 사용", key=llm_key)
             qwen_pcb_strategy = st.checkbox(
                 "Qwen PCB 구조 기반 고장 후보 제안 (미검증)",
-                key=f"{key}_qwen_pcb_strategy", value=bool(state.get("qwen_pcb_strategy", False)),
+                key=f"{key}_qwen_pcb_strategy", value=bool(state.get("qwen_pcb_strategy", True)),
                 help="규칙 기반 순위와 분리해 보조 제안으로 표시합니다. Qwen 제안만으로 판정을 확정하지 않습니다.",
             )
             state["qwen_pcb_strategy"] = qwen_pcb_strategy
@@ -535,11 +649,7 @@ def render_symptom_diagnosis_panel(
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 parsed = {"observations": [], "uncertain_facts": [], "parser_status": "FAILED", "error": str(exc)}
         state["parsed_observations"] = parsed.get("observations", [])
-        combined_observations = list(state["parsed_observations"])
-        combined_observations.extend({"code": fact, "value": value, "status": "observed", "source": "user_report"}
-                                     for fact, value in state["manual_observations"].items())
-        combined_observations.extend({"code": fact, "value": value, "status": "observed", "source": "follow_up_answer"}
-                                     for fact, value in state.get("answers", {}).items())
+        combined_observations = _combined_observations(state)
         parsed_symptoms = [row["code"] for row in state["parsed_observations"]
                            if row.get("status") in {"observed", "measured"} and row.get("value") is True
                            and row.get("code") in symptom_items]
@@ -640,8 +750,7 @@ def render_symptom_diagnosis_panel(
         for conflict in result["evidence_conflicts"]:
             st.caption(f"충돌 · {conflict['code']} · {conflict['values']} · {conflict['resolution']}")
     if result["status"] == "NEEDS_SYMPTOMS":
-        st.info(result["message"])
-        return
+        st.info(result["message"] + " 증상 없이 표시되는 소자 후보는 시각 검수용 미확정 제안이며 고장 판정이 아닙니다.")
     inventory = result.get("component_inventory", {})
     if not inventory.get("confirmed_count"):
         st.info("실제 존재한다고 확인한 소자가 없습니다. 소자 내부 고장 후보는 생성되지 않았습니다.")
@@ -650,17 +759,17 @@ def render_symptom_diagnosis_panel(
     st.markdown("#### 원인 후보")
     st.success(result["message"])
     component_candidates = result.get("component_candidates", [])[:3]
+    status_labels = {
+        "SUSPECTED": "검사 후보 · 아직 미확정",
+        "FAULT_SUPPORTED": "검증된 검사 · 해당 고장 가설 지지",
+        "FAULT_REFUTED": "검증된 검사 · 해당 고장 가설 반박",
+        "INCONCLUSIVE": "측정 판정 불가",
+        "CONFLICTED": "측정 결과 충돌 · 판단 보류",
+    }
     if component_candidates:
         st.markdown("**우선 확인할 실제 검출 소자 · 최대 3개**")
         explanations = (result.get("llm_component_explanations", {}).get("explanations", {})
                         if isinstance(result.get("llm_component_explanations"), dict) else {})
-        status_labels = {
-            "SUSPECTED": "검사 후보 · 아직 미확정",
-            "FAULT_SUPPORTED": "검증된 검사 · 해당 고장 가설 지지",
-            "FAULT_REFUTED": "검증된 검사 · 해당 고장 가설 반박",
-            "INCONCLUSIVE": "측정 판정 불가",
-            "CONFLICTED": "측정 결과 충돌 · 판단 보류",
-        }
         for candidate in component_candidates:
             label = status_labels.get(candidate.get("visual_status"), "판정 불가")
             st.markdown(f"**{candidate['candidate_rank']}. {candidate['component_id']}** · "
@@ -735,7 +844,41 @@ def render_symptom_diagnosis_panel(
                     st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
                 st.rerun()
     elif result.get("qwen_fault_proposals", {}).get("status") == "FAILED":
-        st.caption("Qwen 구조 제안 실패 · 기존 규칙 기반 결과는 유지됩니다.")
+        failure = result.get("qwen_fault_proposals", {})
+        st.caption(f"Qwen 구조 제안 실패 · {failure.get('failure_category', 'MODEL_ERROR')} · 기존 규칙 기반 결과는 유지됩니다.")
+    fusion = result.get("candidate_fusion", {})
+    if fusion.get("top_candidates"):
+        st.markdown("**통합 검사 후보 Top 3 · candidate_fusion_v1 · 실험 전략**")
+        st.caption("기존 규칙 순위와 측정 판정을 보존합니다. Qwen·사용자 의심은 점수에 가산하지 않으며, 순서는 검사 검토 우선순위입니다.")
+        for candidate in fusion["top_candidates"]:
+            sources = candidate.get("candidate_source", [])
+            source_label = "규칙+Qwen" if {"RULE_BASELINE", "QWEN_UNVERIFIED"}.issubset(sources) else (
+                "규칙 기반" if "RULE_BASELINE" in sources else
+                "사용자 의심" if "USER_SUSPICION" in sources else "Qwen 미검증")
+            status_label = ("소자 검수 필요" if candidate.get("verification_status") == "NEEDS_COMPONENT_REVIEW"
+                            else status_labels.get(candidate.get("visual_status"), "미검증 검사 후보"))
+            st.markdown(f"{candidate['candidate_rank']}. **{candidate['component_id']} · "
+                        f"{candidate.get('component_type', 'unknown')} · {candidate.get('fault_title', candidate['fault_id'])}** · "
+                        f"{source_label} · {status_label}")
+            if candidate.get("qwen_reason"):
+                st.caption(candidate["qwen_reason"])
+            if candidate.get("supporting_evidence_ids"):
+                st.caption("지지 근거 ID · " + " · ".join(candidate["supporting_evidence_ids"]))
+            if candidate.get("opposing_evidence_ids"):
+                st.caption("반대 근거 ID · " + " · ".join(candidate["opposing_evidence_ids"]))
+            if candidate.get("user_suspected"):
+                st.caption("사용자 지정 의심 단서 · 미검증 · 판정 점수에는 반영하지 않음")
+            if candidate.get("qwen_next_action"):
+                st.caption("검토 작업 · " + candidate["qwen_next_action"])
+            if st.button("통합 후보 위치 보기", key=f"cc_fused_candidate_{project.project_id}_{candidate['candidate_rank']}_{candidate['component_id']}"):
+                focused = (_focus_board_component(st, project, board_registry, candidate["component_id"])
+                           if board_registry else False)
+                if not focused and any(item.component_id == candidate["component_id"] for item in components):
+                    update_selection(st.session_state, project=project, selected_component=candidate["component_id"])
+                    focused = True
+                if focused:
+                    st.session_state[f"cc_analysis_viewer_open_{project.project_id}"] = True
+                st.rerun()
     if result.get("llm_assist"):
         assist = result["llm_assist"]
         st.markdown("**로컬 LLM 설명 보조**")
@@ -807,29 +950,52 @@ def render_symptom_diagnosis_panel(
                 st.caption(f"{candidate['title']} · 미확정 · " + " · ".join(candidate.get("evidence", [])))
     questions = [item for item in result.get("next_tests", []) if item.get("type") == "question"]
     answered_ids = set(state.get("answered_test_ids", []))
+    question_history = state.get("question_answers", {})
+    if isinstance(question_history, dict) and question_history:
+        with st.expander(f"추가 질문 답변 기록 · {len(question_history)}개", expanded=False):
+            for history_id, history_row in question_history.items():
+                if not isinstance(history_row, dict):
+                    continue
+                old_question = history_row.get("question", {})
+                prompt = old_question.get("question", history_id) if isinstance(old_question, dict) else history_id
+                st.caption(f"{prompt} · 답변: {history_row.get('answer', '미답변')}")
+                if st.button("이 답변 수정·취소", key=f"{key}_edit_answer_{history_id}"):
+                    state["editing_test_id"] = history_id
+                    st.session_state[key] = state
+                    st.rerun()
+    editing_test_id = state.get("editing_test_id")
     selected_question = result.get("llm_follow_up_question")
     allowed_question_ids = {row.get("test_id") for row in questions}
-    if (not selected_question or selected_question.get("test_id") in answered_ids
-            or selected_question.get("test_id") not in allowed_question_ids):
+    if editing_test_id and isinstance(question_history, dict):
+        history_item = question_history.get(editing_test_id, {})
+        selected_question = history_item.get("question") if isinstance(history_item, dict) else None
+    valid_edit_question = bool(editing_test_id and isinstance(selected_question, dict)
+                               and selected_question.get("type") == "question"
+                               and selected_question.get("test_id") == editing_test_id)
+    if (not selected_question or (selected_question.get("test_id") in answered_ids
+                                  and selected_question.get("test_id") != editing_test_id)
+            or (selected_question.get("test_id") not in allowed_question_ids and not valid_edit_question)):
         selected_question = next((row for row in questions if row.get("test_id") not in answered_ids), None)
+    followup_limit = 5
+    followup_limit_reached = len(answered_ids) >= followup_limit and not editing_test_id
+    if followup_limit_reached:
+        selected_question = None
     if selected_question:
-        st.markdown("**다음 확인 질문 · 한 번에 하나**")
+        st.markdown("**추가 질문 답변**" if editing_test_id else "**다음 확인 질문 · 한 번에 하나**")
         if selected_question.get("selection_reason"):
             st.caption(selected_question["selection_reason"])
         question_id = selected_question["test_id"]
-        answer = st.selectbox(selected_question["question"], ("미답변", "예", "아니오", "모르겠음"),
-                              key=f"{key}_answer_{question_id}")
-        answers: dict[str, Any] = {}
-        answered_question = answer in {"예", "아니오", "모르겠음"}
-        if answer in {"예", "아니오"}:
-            outcome = selected_question.get("results", {}).get("yes" if answer == "예" else "no", {})
-            answers.update(outcome.get("observations", {}))
-        if st.button("답변 반영하고 다시 추론", key=f"{key}_apply_answers", disabled=preview):
-            state["answers"] = answers
-            if answered_question:
-                state["answered_test_ids"] = list(dict.fromkeys([
-                    *state.get("answered_test_ids", []), question_id,
-                ]))
+        answer_key = f"{key}_answer_{question_id}"
+        options = ("미답변", "예", "아니오", "모르겠음", "답변 취소") if editing_test_id else (
+            "미답변", "예", "아니오", "모르겠음")
+        if answer_key not in st.session_state:
+            prior_answer = question_history.get(question_id, {}).get("answer") if isinstance(question_history, dict) else None
+            st.session_state[answer_key] = prior_answer if prior_answer in options else "미답변"
+        answer = st.selectbox(selected_question["question"], options, key=answer_key)
+        if st.button("답변 반영하고 다시 추론", key=f"{key}_apply_answers", disabled=preview or answer == "미답변"):
+            _save_follow_up_answer(state, selected_question, answer)
+            state.pop("editing_test_id", None)
+            answers = state.get("answers", {})
             answer_input_fingerprint = _diagnosis_fingerprint(
                 project, components, selected_codes, symptom_text,
                 observations, answers, measurements,
@@ -920,6 +1086,8 @@ def render_symptom_diagnosis_panel(
             _sync_component_candidates(st, project, answer_result)
             st.session_state[key] = state
             st.rerun()
+    elif followup_limit_reached:
+        st.info("추가 질문 한도에 도달했습니다. 현재 근거로 판단이 어려우면 권장 검사 또는 측정 검증을 확인하세요.")
     visuals = [item for item in result.get("next_tests", []) if item.get("type") == "visual_inspection"]
     if visuals:
         st.caption("육안 점검은 전원 차단 및 냉각을 확인한 뒤에만 표시됩니다.")
