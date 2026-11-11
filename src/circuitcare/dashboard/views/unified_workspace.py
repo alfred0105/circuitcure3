@@ -24,7 +24,6 @@ from circuitcare.frontend.board_component_registry import (
     diagnosis_components, measurement_component_aliases, remove_component_match,
     source_key_for_component,
 )
-BOARD_COMPONENT_SELECTION_KEY = "circuitcare_v7_selected_board_component_id"
 from circuitcare.frontend.measurement_state import get_measurements
 from circuitcare.analysis.models import AnalysisScope, AnalysisStatus
 from circuitcare.frontend.component_map_adapter import (
@@ -61,7 +60,7 @@ from circuitcare.frontend.state import (
     reset_intake_for_new_project,
 )
 from circuitcare.frontend.workbench_state import (
-    ACTIVE_PHOTO_KEY, MODE_KEY, SCREEN_KEY, SELECTION_KEY, VIEW_ZOOM_KEY,
+    ACTIVE_PHOTO_KEY, BOARD_COMPONENT_SELECTION_KEY, MODE_KEY, SCREEN_KEY, SELECTION_KEY, VIEW_ZOOM_KEY,
     VIEW_TRANSFORM_KEY, enter_workbench, update_selection,
 )
 from circuitcare.frontend.viewer_geometry import requested_view_transform
@@ -391,17 +390,21 @@ def _prepare_board_registry_snapshot(
         selected_board_id = registry["source_to_board_id"].get(
             source_key_for_component(previous_photo_id, previous_local_id))
     if selected_board_id:
-        st.session_state[BOARD_COMPONENT_SELECTION_KEY] = selected_board_id
         target_source = next((source for row in registry.get("components", [])
                              if row.get("board_component_id") == selected_board_id
                              for source in row.get("source_components", [])
                              if source.get("photo_id") == selected_id
                              and source.get("review_status") != "EXCLUDED"), None)
-        local_id = target_source.get("component_id") if target_source else None
-        if (getattr(selection_before, "active_photo_id", None) != selected_id
-                or getattr(selection_before, "selected_component", None) != local_id):
-            update_selection(st.session_state, project=project, active_photo_id=selected_id,
-                             selected_component=local_id)
+        if target_source:
+            local_id = target_source.get("component_id")
+            if (getattr(selection_before, "active_photo_id", None) != selected_id
+                    or getattr(selection_before, "selected_component", None) != local_id):
+                update_selection(st.session_state, project=project, active_photo_id=selected_id,
+                                 selected_component=local_id)
+        else:
+            # An excluded, retired, or non-visible registry source must not
+            # overwrite a newer local viewer click with a null/stale selection.
+            st.session_state.pop(BOARD_COMPONENT_SELECTION_KEY, None)
     return registry, selected_snapshot
 
 

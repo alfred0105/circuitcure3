@@ -13,6 +13,9 @@ from circuitcare.dashboard.views.unified_workspace import (
     _bind_review_models_to_map, _prepare_board_registry_snapshot, _prepare_photo_component_snapshot,
 )
 from circuitcare.frontend.models import ImageRecord, ProjectContext, SelectionState
+from circuitcare.frontend.workbench_state import (
+    BOARD_COMPONENT_SELECTION_KEY, SELECTION_KEY, update_component_selection,
+)
 from circuitcare.vision.box_reconciliation import board_visible_review_rows
 from circuitcare.vision.component_recognition_panel import (
     _store_predictions, ensure_review_row_for_component, invalidate_component_review_state,
@@ -75,7 +78,6 @@ def test_viewer_click_event_updates_real_streamlit_selection_and_overlap_stack(m
 
     streamlit = SimpleNamespace(session_state={})
     project = ProjectContext(project_id="p1", board_id="b1")
-    from circuitcare.frontend.workbench_state import SELECTION_KEY
     streamlit.session_state[SELECTION_KEY] = SelectionState(project_id="p1", board_id="b1")
     output = io.BytesIO()
     Image.new("RGB", (32, 32), "white").save(output, format="PNG")
@@ -110,7 +112,6 @@ def test_viewer_click_keeps_valid_selection_and_filters_stale_overlap_ids(monkey
 
     streamlit = SimpleNamespace(session_state={})
     project = ProjectContext(project_id="p1", board_id="b1")
-    from circuitcare.frontend.workbench_state import SELECTION_KEY
     streamlit.session_state[SELECTION_KEY] = SelectionState(project_id="p1", board_id="b1")
     output = io.BytesIO()
     Image.new("RGB", (32, 32), "white").save(output, format="PNG")
@@ -135,6 +136,46 @@ def test_viewer_click_keeps_valid_selection_and_filters_stale_overlap_ids(monkey
     )
     assert streamlit.session_state[SELECTION_KEY].selected_component == "c1"
     assert streamlit.session_state[f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"] == ["c1"]
+
+
+def test_exclusion_then_new_box_click_updates_local_and_board_selection_before_rerun(monkeypatch):
+    import circuitcare.dashboard.components.pcb_workspace as workspace
+
+    project = ProjectContext("p1", "b1")
+    state = {SELECTION_KEY: SelectionState("p1", "b1", selected_component="c1"),
+             BOARD_COMPONENT_SELECTION_KEY: "bc-c1"}
+    # The exclusion action must retire the old board identity atomically.
+    update_component_selection(state, project=project, selected_component=None)
+    assert state[SELECTION_KEY].selected_component is None
+    assert BOARD_COMPONENT_SELECTION_KEY not in state
+
+    streamlit = SimpleNamespace(session_state=state)
+    output = io.BytesIO()
+    Image.new("RGB", (32, 32), "white").save(output, format="PNG")
+    components = tuple(ComponentOverlayViewModel(**{
+        **_model().__dict__, "component_id": local_id, "board_component_id": board_id,
+    }) for local_id, board_id in (("c1", "bc-c1"), ("c2", "bc-c2")))
+
+    def fake_render(_st, **kwargs):
+        key = kwargs["key"]
+        streamlit.session_state[key] = {"selection_event": {
+            "project_id": "p1", "board_id": "b1", "board_side": "TOP",
+            "canonical_frame_id": "photo1", "component_id": "c2", "selection_action": "select",
+            "overlapping_component_ids": ["c2"], "event_seq": 1, "event_id": "after-exclude-click",
+            "event_epoch": kwargs["event_epoch"],
+        }}
+        kwargs["on_selection_event_change"]()
+        return object()
+
+    monkeypatch.setattr(workspace, "render_pcb_viewer", fake_render)
+    workspace.render_component_viewer(
+        streamlit, image=None, source_image_bytes=output.getvalue(), canonical_png_bytes=None,
+        image_size_px=(32, 32), components=components, project=project, board_side="TOP",
+        frame_id="photo1", selected_component_id=None, map_cache_key="map-after-exclusion",
+        image_mode="원본 사진",
+    )
+    assert state[SELECTION_KEY].selected_component == "c2"
+    assert state[BOARD_COMPONENT_SELECTION_KEY] == "bc-c2"
 
 
 def test_component_result_is_applied_even_when_callback_session_view_is_late(monkeypatch):

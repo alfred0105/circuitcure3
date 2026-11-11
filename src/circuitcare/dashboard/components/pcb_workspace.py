@@ -17,7 +17,9 @@ from PIL import Image
 from circuitcare.dashboard.components.pcb_viewer import render_pcb_viewer
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel, display_identity_status
 from circuitcare.frontend.models import ProjectContext
-from circuitcare.frontend.workbench_state import SELECTION_KEY, update_selection
+from circuitcare.frontend.workbench_state import (
+    SELECTION_KEY, update_component_selection, update_selection,
+)
 from circuitcare.vision.image_loader import load_board_image
 
 OVERLAPPING_SELECTION_KEY = "circuitcare_v4_overlapping_box_ids"
@@ -242,7 +244,13 @@ def render_component_viewer(
             st.session_state[overlap_key] = []
         else:
             st.session_state[overlap_key] = list(dict.fromkeys(overlap_ids))
-        update_selection(st.session_state, project=project, selected_component=component_id)
+        selected_model = next((item for item in components if item.component_id == component_id), None)
+        board_component_id = getattr(selected_model, "board_component_id", None)
+        # Commit local and board identity together before rerun. Otherwise the
+        # previous board selection can restore its old photo-local ID.
+        update_component_selection(st.session_state, project=project,
+                                   selected_component=component_id,
+                                   board_component_id=board_component_id)
         LOGGER.info("pcb_selection stage=selection_state viewer=%s event_id=%s selected=%s overlaps=%s",
                     viewer_key, event.get("event_id"), component_id, overlap_ids)
         _record_selection_trace(

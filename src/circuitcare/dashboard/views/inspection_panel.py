@@ -15,7 +15,9 @@ from circuitcare.vision.component_recognition_panel import (
     invalidate_component_review_state, record_box_exclusion, restore_review_row,
     review_keys, undo_last_box_exclusion, update_review_row,
 )
-from circuitcare.frontend.workbench_state import ACTIVE_PHOTO_KEY, SELECTION_KEY, update_selection
+from circuitcare.frontend.workbench_state import (
+    ACTIVE_PHOTO_KEY, SELECTION_KEY, update_component_selection, update_selection,
+)
 
 MAP_VERSION_KEY = "circuitcare_v4_selection_map_key"
 COMPONENT_EDIT_KEY = "circuitcare_v4_component_edits"
@@ -67,7 +69,12 @@ def render_inspection_panel(
                                        f"_{overlap_signature}_{selected_id or 'none'}_{event_seq}"),
                                   help="겹친 박스 중 편집하거나 제외할 대상을 선택합니다. Viewer 강조도 함께 바뀝니다.")
             if labels[choice] != selected_id:
-                update_selection(st.session_state, project=project, selected_component=labels[choice])
+                selected_model = by_id[labels[choice]]
+                update_component_selection(
+                    st.session_state, project=project,
+                    selected_component=selected_model.component_id,
+                    board_component_id=selected_model.board_component_id,
+                )
                 st.rerun()
         if preview:
             st.markdown("**부품** · 인식 결과 없음")
@@ -151,7 +158,8 @@ def render_inspection_panel(
                     st.session_state[records_key] = rows
                     invalidate_component_review_state(st.session_state, scope=review_scope,
                         project_id=project.project_id, board_id=project.board_id)
-                    update_selection(st.session_state, project=project, selected_component=None)
+                    update_component_selection(st.session_state, project=project,
+                                               selected_component=None)
                     st.rerun()
             if review_scope and records_key and review_image_bytes is not None:
                 box = review_row or {"x1": selected_component.bbox_xyxy[0], "y1": selected_component.bbox_xyxy[1],

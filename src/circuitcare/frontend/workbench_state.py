@@ -9,6 +9,7 @@ from circuitcare.frontend.models import ProjectContext, SelectionState
 
 SCREEN_KEY = "circuitcare_v2_screen"
 SELECTION_KEY = "circuitcare_v2_selection"
+BOARD_COMPONENT_SELECTION_KEY = "circuitcare_v7_selected_board_component_id"
 ACTIVE_PHOTO_KEY = "circuitcare_v2_active_photo_id"
 VIEW_ZOOM_KEY = "circuitcare_v2_view_zoom"
 VIEW_TRANSFORM_KEY = "circuitcare_v2_view_transform"
@@ -58,3 +59,18 @@ def update_selection(
     if "active_photo_id" in changes:
         state[ACTIVE_PHOTO_KEY] = changes["active_photo_id"]
     return updated
+
+
+def update_component_selection(state: MutableMapping[str, Any], *, project: ProjectContext,
+                               selected_component: str | None,
+                               board_component_id: str | None = None,
+                               active_photo_id: str | None = None) -> SelectionState:
+    """Update local and board identity together so a rerun cannot restore stale selection."""
+    if selected_component and board_component_id:
+        state[BOARD_COMPONENT_SELECTION_KEY] = str(board_component_id)
+    else:
+        state.pop(BOARD_COMPONENT_SELECTION_KEY, None)
+    changes = {"selected_component": selected_component}
+    if active_photo_id is not None:
+        changes["active_photo_id"] = active_photo_id
+    return update_selection(state, project=project, **changes)
