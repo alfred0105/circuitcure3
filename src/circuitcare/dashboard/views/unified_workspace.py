@@ -25,6 +25,7 @@ from circuitcare.frontend.board_component_registry import (
     remove_component_match, source_key_for_component,
 )
 from circuitcare.frontend.measurement_state import get_measurements
+from circuitcare.analysis.fingerprints import build_measurement_fingerprint
 from circuitcare.analysis.models import AnalysisScope, AnalysisStatus
 from circuitcare.frontend.component_map_adapter import (
     COMPONENT_MAP_STATE_KEY, LOGGER, REGISTRATION_LABELS,
@@ -783,7 +784,6 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
     if workflow_stage == WORKFLOW_REVIEW:
         candidate_state.clear()
     elif workflow_stage == WORKFLOW_QUESTIONS:
-        candidate_state.clear()
         for suspect_index, suspect in enumerate(board_suspects(st.session_state, project), start=1):
             board_id = str(suspect.get("board_component_id") or "")
             if board_id and suspect.get("evidence_status") == "UNVERIFIED":
@@ -1002,16 +1002,38 @@ def _workflow_stage_title(stage: str) -> str:
 
 def _inspection_targets(
     registry: dict[str, Any] | None, candidates: list[dict[str, Any]],
-    suspected_components: list[dict[str, Any]] | None,
+    suspected_components: list[dict[str, Any]] | None, *, knowledge: dict[str, Any] | None = None,
+    inspection_history: list[dict[str, Any]] | None = None,
+    measurements: list[Any] | None = None, allow_retest: bool = False,
 ) -> list[dict[str, Any]]:
-    """Choose up to three real, resolvable Board Components in evidence order."""
+    """Choose real targets, preferring compatible and not-yet-completed test profiles."""
     rows = registry.get("components", []) if isinstance(registry, dict) else []
     active_rows = [row for row in rows if isinstance(row, dict)
                    and row.get("presence_status") != "EXCLUDED"
                    and row.get("board_component_id")]
     by_id = {str(row["board_component_id"]): row for row in active_rows}
-    ordered: list[tuple[str, dict[str, Any], str]] = []
+    ordered: list[tuple[str, dict[str, Any], str, int]] = []
     used: set[str] = set()
+    knowledge = knowledge or load_knowledge()
+    profiles_by_type = knowledge.get("component_test_profiles", {}).get("profiles", {})
+    catalog = knowledge.get("test_catalog", {}).get("tests", {})
+    visual_checks = [{"test_id": str(test_id), **test} for test_id, test in catalog.items()
+                     if isinstance(test, dict) and test.get("type") == "visual_inspection"] \
+        if isinstance(catalog, dict) else []
+    completed: set[tuple[str, str, str]] = set()
+    if not allow_retest:
+        for item in inspection_history or []:
+            if (not isinstance(item, dict) or item.get("verification_status") not in {
+                    "FAULT_SUPPORTED", "FAULT_REFUTED", "CONFLICTED", "VERIFIED", "COMPLETE"}):
+                continue
+            completed.add((str(item.get("board_component_id") or item.get("target_id") or ""),
+                           str(item.get("fault_id") or ""), str(item.get("test_id") or "")))
+        for measurement in measurements or []:
+            status = str(getattr(measurement, "verification_status", "")).upper()
+            test_id = str(getattr(measurement, "test_id", "") or "")
+            board_id = str(getattr(measurement, "board_component_id", "") or "")
+            if test_id and board_id and status in {"VERIFIED", "VALID", "ACCEPTED", "DIAGNOSTIC"}:
+                completed.add((board_id, str(getattr(measurement, "fault_hypothesis", "") or ""), test_id))
 
     def add(board_id: str, details: dict[str, Any], reason: str) -> None:
         row = by_id.get(str(board_id))
@@ -1021,7 +1043,35 @@ def _inspection_targets(
             registry, board_component_id=str(board_id), preferred_photo_id=None,
         ) is None:
             return
-        ordered.append((str(board_id), details, reason))
+        component_type = str(row.get("component_type") or details.get("component_type") or "unknown")
+        component_profile = profiles_by_type.get(component_type.casefold(), {})
+        tests = component_profile.get("tests", {}) if isinstance(component_profile, dict) else {}
+        hypotheses = details.get("fault_hypotheses", []) if isinstance(details.get("fault_hypotheses"), list) else []
+        fault_ids = [str(item.get("fault_id") or item.get("fault_hypothesis") or "")
+                     for item in hypotheses if isinstance(item, dict)]
+        if not fault_ids:
+            fault_ids = [str(details.get("fault_id") or details.get("fault_hypothesis") or "")]
+        allowed_tests = []
+        completed_test_count = 0
+        for test_id, profile in tests.items() if isinstance(tests, dict) else []:
+            relations = profile.get("fault_relations", {}) if isinstance(profile, dict) else {}
+            related_faults = [fault for fault in fault_ids if fault and fault in relations]
+            compatible = bool(any(fault_ids) and related_faults)
+            unfinished_faults = [fault for fault in related_faults
+                                 if (str(board_id), fault, str(test_id)) not in completed]
+            was_completed = bool(related_faults) and not unfinished_faults
+            if was_completed:
+                completed_test_count += 1
+            if compatible and (allow_retest or unfinished_faults):
+                allowed_tests.append({"test_id": str(test_id), "profile": profile,
+                                      "fault_ids": (related_faults if allow_retest else unfinished_faults)})
+        ordinal = len(ordered)
+        annotated = {**details, "component_type": component_type,
+                     "available_tests": allowed_tests,
+                     "visual_checks": visual_checks,
+                     "inspection_kind": "MEASUREMENT" if allowed_tests else "VISUAL_ONLY",
+                     "completed_test_count": completed_test_count}
+        ordered.append((str(board_id), annotated, reason, ordinal))
         used.add(str(board_id))
 
     for candidate in candidates:
@@ -1031,20 +1081,28 @@ def _inspection_targets(
     for suspect in suspected_components or []:
         board_id = str(suspect.get("board_component_id") or "")
         if board_id:
-            add(board_id, {"component_type": suspect.get("component_type", "unknown")},
+            suspected_fault = str(suspect.get("suspected_fault_mode") or "")
+            add(board_id, {"component_type": suspect.get("component_type", "unknown"),
+                           "fault_hypotheses": ([{"fault_id": suspected_fault}]
+                                                if suspected_fault else [])},
                 "사용자가 의심 소자로 지정")
     for row in active_rows:
         board_id = str(row["board_component_id"])
         add(board_id, {"component_type": row.get("component_type", "unknown")},
             "추가 확인 대상 · 원인 미확정")
+    ordered.sort(key=lambda item: (item[1].get("inspection_kind") != "MEASUREMENT", item[3]))
     return [{"board_component_id": board_id,
              "component_type": str(by_id[board_id].get("component_type") or
                                     details.get("component_type") or "unknown"),
              "reference_designators": list(by_id[board_id].get("reference_designators", [])),
              "reason": reason, "candidate": details,
+             "inspection_kind": details.get("inspection_kind"),
+             "available_tests": details.get("available_tests", []),
+             "visual_checks": details.get("visual_checks", []),
+             "completed_test_count": details.get("completed_test_count", 0),
              "presence_status": by_id[board_id].get("presence_status"),
              "source_components": list(by_id[board_id].get("source_components", []))}
-            for board_id, details, reason in ordered[:3]]
+            for board_id, details, reason, _ordinal in ordered[:3]]
 
 
 def _render_workflow_stepper(st: Any, workflow: dict[str, Any]) -> None:
@@ -1062,20 +1120,42 @@ def _render_workflow_stepper(st: Any, workflow: dict[str, Any]) -> None:
             col.caption(label)
 
 
-def _render_left_transition_status(st: Any, slot: Any, workflow: dict[str, Any]) -> None:
-    label = workflow.pop("pending_left_status", None)
-    if not label or slot is None:
-        return
-    with slot.container():
-        progress = st.status(label, expanded=True)
-        progress.write("PCB 사진 · 기존 Viewer 이미지 재사용")
-        progress.write("사진별 Registry 및 소자 ID · 현재 버전 확인")
-        progress.update(label="다음 단계 준비 완료", state="complete", expanded=False)
-    slot.empty()
+class _LeftProgressSlot:
+    """Replace the PCB region with a running status only while work executes."""
+
+    def __init__(self, status_slot: Any, viewer_slot: Any) -> None:
+        self.status_slot = status_slot
+        self.viewer_slot = viewer_slot
+
+    def container(self) -> Any:
+        self.viewer_slot.empty()
+        return self.status_slot.container()
 
 
-def _advance_workflow(st: Any, project: ProjectContext, stage: str, label: str, event: str) -> None:
-    transition_workflow(st.session_state, project, stage, event=event, left_status=label)
+def _advance_workflow(st: Any, project: ProjectContext, stage: str, label: str, event: str, *,
+                      reason: str | None = None) -> None:
+    workflow = transition_workflow(st.session_state, project, stage, event=event,
+                                   left_status=label, reason=reason or event)
+    if stage == WORKFLOW_INSPECTION:
+        rows = get_measurements(st.session_state, project_id=project.project_id,
+                                board_id=project.board_id or "")
+        grouped: dict[str, list[Any]] = {}
+        grouped_ids: dict[str, dict[str, str]] = {}
+        for row in rows:
+            pair = "|".join((str(getattr(row, "board_component_id", None) or ""),
+                             str(getattr(row, "fault_hypothesis", None) or ""),
+                             str(getattr(row, "test_id", None) or "")))
+            grouped.setdefault(pair, []).append(row)
+            grouped_ids.setdefault(pair, {})[str(row.measurement_id)] = build_measurement_fingerprint([row])
+        previous_cycle = workflow.get("inspection_cycle")
+        cycle_id = int(previous_cycle.get("cycle_id", 0)) + 1 if isinstance(previous_cycle, dict) else 1
+        workflow["inspection_cycle"] = {
+            "cycle_id": cycle_id,
+            "baseline_by_pair": {pair: build_measurement_fingerprint(values)
+                                 for pair, values in grouped.items()},
+            "baseline_record_fingerprints": grouped_ids,
+            "started_event": event,
+        }
     st.rerun()
 
 
@@ -1091,6 +1171,22 @@ def _current_board_snapshot(
     )
 
 
+def _inspection_candidate_rows(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return only hypotheses that remain actionable for another test."""
+    if not isinstance(result, dict):
+        return []
+    rows = []
+    for candidate in _simple_candidate_rows(result, limit=1000):
+        hypotheses = candidate.get("fault_hypotheses", [])
+        active = [hypothesis for hypothesis in hypotheses if str(
+            hypothesis.get("measurement_verdict") or hypothesis.get("visual_status") or ""
+        ).casefold() not in {"refutes", "conflicted", "fault_refuted"}]
+        if hypotheses and not active:
+            continue
+        rows.append({**candidate, "fault_hypotheses": active or hypotheses})
+    return rows
+
+
 def _render_workflow_candidates(
     st: Any, project: ProjectContext, workflow: dict[str, Any], *,
     registry: dict[str, Any], analysis_snapshot: dict[str, Any],
@@ -1098,9 +1194,17 @@ def _render_workflow_candidates(
 ) -> None:
     result = analysis_snapshot.get("result")
     current_result = result if analysis_snapshot.get("record", {}).get("status") == AnalysisStatus.CURRENT.value else None
-    candidates = _simple_candidate_rows(current_result) if isinstance(current_result, dict) else []
+    candidates = _inspection_candidate_rows(current_result)
     suspects = board_suspects(st.session_state, project)
-    targets = _inspection_targets(registry, candidates, suspects)
+    all_measurements = get_measurements(st.session_state, project_id=project.project_id,
+                                        board_id=project.board_id or "")
+    retest_key = f"cc_wf_allow_retest_{project.project_id}"
+    allow_retest = st.checkbox("완료된 검사도 조건을 바꿔 재검사", key=retest_key,
+                               help="검사 조건 변경 또는 명시적인 재검사 시에만 같은 검사를 다시 선택할 수 있습니다.")
+    targets = _inspection_targets(
+        registry, candidates, suspects, inspection_history=workflow.get("inspection_history", []),
+        measurements=all_measurements, allow_retest=allow_retest,
+    )
     workflow["candidate_ids"] = [str(row.get("board_component_id") or row.get("component_id"))
                                   for row in candidates]
     workflow["inspection_targets"] = targets
@@ -1108,10 +1212,14 @@ def _render_workflow_candidates(
     if not targets:
         st.warning("현재 사진에서 측정·검사 대상으로 연결할 유효 소자가 없습니다. 1단계로 돌아가 소자 탐지와 검수를 확인하세요.")
         if st.button("소자 검수로 돌아가기", key=f"cc_wf_no_targets_{project.project_id}"):
-            _advance_workflow(st, project, WORKFLOW_REVIEW, "소자 검수 화면 준비 중", "no_valid_target")
+            _advance_workflow(st, project, WORKFLOW_REVIEW, "소자 검수 화면 준비 중",
+                              "no_valid_target",
+                              reason="현재 Registry에서 측정·검사 대상으로 해석 가능한 소자가 없습니다.")
         return
 
     st.markdown("#### 우선 확인할 검사 대상 · 최대 3개")
+    measurable = sum(target.get("inspection_kind") == "MEASUREMENT" for target in targets)
+    st.caption(f"측정 가능 {measurable}개 · 추가 확인 대상 {len(targets) - measurable}개")
     for index, target in enumerate(targets, start=1):
         candidate = target.get("candidate", {})
         hypotheses = candidate.get("fault_hypotheses", []) if isinstance(candidate, dict) else []
@@ -1124,6 +1232,9 @@ def _render_workflow_candidates(
             label += f" · {fault_title}"
         st.markdown(f"**{label}**")
         st.caption(f"선정 근거 · {target['reason']} · {target['board_component_id']}")
+        st.caption("검사 방식 · " + ("등록된 검사 프로파일로 측정 가능"
+                                     if target.get("inspection_kind") == "MEASUREMENT"
+                                     else "검증된 측정 프로파일 없음 · 추가 확인 대상"))
         st.caption("검증 상태 · " + ("측정으로 특정 가설을 확인" if hypothesis.get("visual_status") in
                   {"FAULT_SUPPORTED", "FAULT_REFUTED", "CONFLICTED", "INCONCLUSIVE"}
                   else "우선 확인 대상 · 아직 고장 판정 아님"))
@@ -1163,10 +1274,10 @@ def _render_workflow_candidates(
                                 index=fault_ids.index(fault_id))
     workflow["selected_fault_id"] = fault_id
     hypothesis = next((row for row in hypotheses if row.get("fault_id") == fault_id), {})
-    profiles = (load_knowledge().get("component_test_profiles", {}).get("profiles", {})
-                .get(str(target["component_type"]).casefold(), {}).get("tests", {}))
-    matching_tests = [test_id for test_id, profile in profiles.items()
-                      if not fault_id or fault_id in profile.get("fault_relations", {})]
+    available_tests = target.get("available_tests", [])
+    matching_tests = {str(item["test_id"]): item["profile"] for item in available_tests
+                      if isinstance(item, dict) and item.get("test_id") and
+                      (not fault_id or fault_id in item.get("fault_ids", []))}
     recommended = next((test_id for test_id in matching_tests), None)
     if not recommended and hypothesis.get("recommended_tests"):
         st.caption("추가 검사 안내 · " + " · ".join(str(item) for item in hypothesis["recommended_tests"][:2]))
@@ -1174,13 +1285,13 @@ def _render_workflow_candidates(
         current_test = workflow.get("selected_test_id")
         if current_test not in matching_tests:
             current_test = recommended or matching_tests[0]
-        test_id = st.selectbox("검사 방법", matching_tests,
+        test_id = st.selectbox("검사 방법", list(matching_tests),
                                key=f"cc_wf_test_{project.project_id}_{selected_id}_{fault_id or 'general'}",
-                               index=matching_tests.index(current_test),
-                               format_func=lambda value: profiles.get(value, {}).get("title", value))
+                               index=list(matching_tests).index(current_test),
+                               format_func=lambda value: matching_tests.get(value, {}).get("title", value))
     else:
         test_id = None
-        st.info("검증된 측정 프로파일이 없습니다. 임의의 전기적 기준은 만들지 말고 육안 확인 또는 부품 정보 확인을 진행하세요.")
+        st.info("새로 실행할 검증 측정이 없습니다. 기존 검사는 반복 추천하지 않습니다. 부품 표기·외관을 확인하거나 조건이 달라졌다면 위의 재검사 선택을 켜세요.")
     workflow["selected_test_id"] = test_id
     measurement_component = measurement_view_model_for_board_component(
         registry, board_component_id=selected_id, preferred_photo_id=st.session_state.get(ACTIVE_PHOTO_KEY),
@@ -1193,20 +1304,85 @@ def _render_workflow_candidates(
             component_map_version=registry.get("version"), board_registry=registry,
             compact=True, fault_hypothesis=fault_id, recommended_test_id=test_id,
         )
-    all_measurements = get_measurements(st.session_state, project_id=project.project_id,
-                                        board_id=project.board_id or "")
+    else:
+        visual_checks = target.get("visual_checks", [])
+        if visual_checks:
+            visual_key = f"cc_wf_visual_{project.project_id}_{selected_id}"
+            visual_ids = [str(row["test_id"]) for row in visual_checks]
+            visual_id = st.selectbox(
+                "안전한 추가 확인", visual_ids, key=visual_key,
+                format_func=lambda value: next((row.get("name", value) for row in visual_checks
+                                                if row["test_id"] == value), value),
+            )
+            visual_test = next(row for row in visual_checks if row["test_id"] == visual_id)
+            st.caption(str(visual_test.get("question") or "카탈로그에 등록된 외관 확인을 진행하세요."))
+            visual_result = st.radio(
+                "외관 확인 결과", ("이상 발견", "눈에 띄는 이상 없음", "확인 불가"),
+                horizontal=True, key=f"{visual_key}_result",
+            )
+            if st.button("외관 확인 기록 및 재판정", type="primary", disabled=preview,
+                         key=f"{visual_key}_save"):
+                outcome_key = {"이상 발견": "damage_found", "눈에 띄는 이상 없음": "no_visible_damage"}.get(visual_result)
+                outcome = (visual_test.get("results", {}).get(outcome_key, {})
+                           if outcome_key else {})
+                observations = outcome.get("observations", {}) if isinstance(outcome, dict) else {}
+                diagnosis_state_key = f"cc_symptom_diagnosis_{project.project_id}"
+                diagnosis_state = st.session_state.setdefault(diagnosis_state_key, {})
+                manual_observations = dict(diagnosis_state.get("manual_observations", {}))
+                manual_observations.update(observations)
+                diagnosis_state["manual_observations"] = manual_observations
+                diagnosis_state["run_after_initial_answer"] = True
+                st.session_state[diagnosis_state_key] = diagnosis_state
+                workflow["inspection_observations"] = [
+                    *workflow.get("inspection_observations", []),
+                    {"board_component_id": selected_id, "test_id": visual_id,
+                     "result": visual_result, "observations": dict(observations),
+                     "source": "user_visual_inspection",
+                     "analysis_fingerprint": analysis_snapshot.get("input_fingerprint")},
+                ][-100:]
+                _advance_workflow(st, project, WORKFLOW_REASSESSMENT,
+                                  "외관 확인 결과를 기존 규칙 엔진으로 재평가 중",
+                                  "visual_observation_saved")
     connected = [row for row in all_measurements
                  if str(getattr(row, "board_component_id", None) or "") == selected_id
+                 and str(getattr(row, "test_id", None) or "") == str(test_id or "")
                  and (not fault_id or getattr(row, "fault_hypothesis", None) in {None, fault_id})]
     workflow["measurement_ids"] = [row.measurement_id for row in all_measurements]
-    if connected:
-        st.success(f"이 검사 대상에 연결된 측정 기록 {len(connected)}개 · 측정 결과 분석 가능")
-    if st.button("측정 결과 분석", type="primary", disabled=preview or not connected,
+    cycle = workflow.get("inspection_cycle")
+    if not isinstance(cycle, dict):
+        cycle = {"cycle_id": 1, "baseline_by_pair": {}}
+        workflow["inspection_cycle"] = cycle
+    pair_key = f"{selected_id}|{fault_id or ''}|{test_id or ''}"
+    current_measurement_fingerprint = build_measurement_fingerprint(connected)
+    baseline_fingerprint = cycle.get("baseline_by_pair", {}).get(pair_key)
+    if baseline_fingerprint is None:
+        baseline_fingerprint = current_measurement_fingerprint
+        cycle.setdefault("baseline_by_pair", {})[pair_key] = baseline_fingerprint
+    has_new_measurement = bool(connected) and current_measurement_fingerprint != baseline_fingerprint
+    baseline_records = cycle.get("baseline_record_fingerprints", {}).get(pair_key, {})
+    changed_measurement_ids = [str(row.measurement_id) for row in connected
+                               if baseline_records.get(str(row.measurement_id))
+                               != build_measurement_fingerprint([row])]
+    cycle["active_pair_key"] = pair_key
+    cycle["current_pair_fingerprint"] = current_measurement_fingerprint
+    cycle["baseline_pair_fingerprint"] = baseline_fingerprint
+    cycle["connected_measurement_ids"] = [row.measurement_id for row in connected]
+    cycle["changed_measurement_ids"] = changed_measurement_ids
+    if connected and has_new_measurement:
+        st.success(f"새 검사 주기의 기록 {len(connected)}개 · 재판단 가능")
+    elif connected:
+        st.info(f"이전 검사 기록 {len(connected)}개는 보존되어 있습니다. 새 측정이나 유효한 수정 후 재판단할 수 있습니다.")
+    if st.button("측정 결과 분석", type="primary", disabled=preview or not has_new_measurement,
                  key=f"cc_wf_reassess_{project.project_id}_{selected_id}"):
         workflow["reassessment_history"] = [
             *workflow.get("reassessment_history", []),
-            {"target_id": selected_id, "fault_id": fault_id, "test_id": test_id,
-             "measurement_ids": [row.measurement_id for row in connected]},
+            {"target_id": selected_id, "board_component_id": selected_id,
+             "fault_id": fault_id, "test_id": test_id,
+             "measurement_ids": [row.measurement_id for row in connected],
+             "changed_measurement_ids": changed_measurement_ids,
+             "measurement_fingerprint": current_measurement_fingerprint,
+             "verification_status": "PENDING",
+             "analysis_fingerprint": analysis_snapshot.get("input_fingerprint")},
         ][-100:]
         _advance_workflow(st, project, WORKFLOW_REASSESSMENT,
                           "측정 결과 분석 중 · 현재 PCB Registry 유지", "measurement_saved")
@@ -1240,13 +1416,17 @@ def _render_workflow_reassessment(
             workflow["reassessment_history"] = [{"analysis_fingerprint": fingerprint,
                                                    "status": "CURRENT"}]
     st.markdown("#### 고장 가설별 재판정")
-    candidates = _simple_candidate_rows(result)
+    candidates = _simple_candidate_rows(result, limit=1000)
     if not candidates:
         st.info("현재 근거로 소자 고장 후보를 특정하지 못했습니다. 임의의 소자 판정을 만들지 않았습니다.")
     for candidate in candidates:
         identity = candidate.get("board_component_id") or candidate.get("component_id")
         for hypothesis in candidate.get("fault_hypotheses", []):
-            status = str(hypothesis.get("visual_status") or "SUSPECTED")
+            verdict = str(hypothesis.get("measurement_verdict") or "").casefold()
+            status = str(hypothesis.get("visual_status") or {
+                "supports": "FAULT_SUPPORTED", "refutes": "FAULT_REFUTED",
+                "conflicted": "CONFLICTED", "non_diagnostic": "INCONCLUSIVE",
+            }.get(verdict, "SUSPECTED"))
             label = {"FAULT_SUPPORTED": "측정이 이 고장 가설을 지지",
                      "FAULT_REFUTED": "측정이 이 고장 가설을 반박",
                      "INCONCLUSIVE": "판단 보류 · 측정 근거 부족",
@@ -1259,6 +1439,53 @@ def _render_workflow_reassessment(
             st.caption("반대 근거 · " + (" · ".join(map(str, opposing)) or "없음"))
     measurements = get_measurements(st.session_state, project_id=project.project_id,
                                     board_id=project.board_id or "")
+    by_id = {str(row.measurement_id): row for row in measurements}
+    if workflow.get("reassessment_history"):
+        active_cycle = workflow["reassessment_history"][-1]
+        changed_ids = set(str(value) for value in active_cycle.get("changed_measurement_ids", []))
+        st.markdown("#### 이번 재판단에 사용한 측정")
+        for measurement_id in active_cycle.get("measurement_ids", []):
+            measured = by_id.get(str(measurement_id))
+            if measured is None:
+                continue
+            qualifier = "새로 입력 또는 수정" if str(measurement_id) in changed_ids else "이전 기록 · 참고 증거"
+            st.caption(
+                f"{qualifier} · {getattr(measured, 'test_id', None) or '검사 미지정'} · "
+                f"{getattr(measured, 'value', '')} {getattr(measured, 'unit', '')} · "
+                f"검증 {getattr(measured, 'verification_status', '미확인')} · "
+                f"기준 {getattr(measured, 'reference_source', None) or '출처 미확인'}"
+            )
+    if workflow.get("reassessment_history"):
+        latest_cycle = workflow["reassessment_history"][-1]
+        if latest_cycle.get("verification_status") == "PENDING":
+            hypotheses_by_key = {}
+            for candidate in candidates:
+                for hypothesis in candidate.get("fault_hypotheses", []):
+                    hypotheses_by_key[(str(candidate.get("board_component_id") or candidate.get("component_id")),
+                                       str(hypothesis.get("fault_id") or hypothesis.get("fault_hypothesis") or ""))] = hypothesis
+            verified_hypothesis = hypotheses_by_key.get((
+                str(latest_cycle.get("board_component_id") or latest_cycle.get("target_id") or ""),
+                str(latest_cycle.get("fault_id") or ""),
+            ), {})
+            status = str(verified_hypothesis.get("visual_status") or verified_hypothesis.get("measurement_verdict") or "INCONCLUSIVE").upper()
+            latest_cycle["verification_status"] = {
+                "SUPPORTS": "FAULT_SUPPORTED", "REFUTES": "FAULT_REFUTED",
+                "CONFLICTED": "CONFLICTED", "INCONCLUSIVE": "INCONCLUSIVE",
+                "NON_DIAGNOSTIC": "INCONCLUSIVE", "FAULT_SUPPORTED": "FAULT_SUPPORTED",
+                "FAULT_REFUTED": "FAULT_REFUTED",
+            }.get(status, "INCONCLUSIVE")
+            latest_cycle["measurement_fingerprint"] = build_measurement_fingerprint(
+                [by_id[mid] for mid in latest_cycle.get("measurement_ids", []) if mid in by_id]
+            )
+            workflow.setdefault("inspection_history", []).append({
+                "board_component_id": latest_cycle.get("board_component_id"),
+                "target_id": latest_cycle.get("board_component_id"),
+                "fault_id": latest_cycle.get("fault_id"), "test_id": latest_cycle.get("test_id"),
+                "measurement_ids": list(latest_cycle.get("measurement_ids", [])),
+                "measurement_fingerprint": latest_cycle.get("measurement_fingerprint"),
+                "verification_status": latest_cycle["verification_status"],
+                "analysis_fingerprint": latest_cycle.get("analysis_fingerprint"),
+            })
     st.caption(f"보존된 측정 기록 · {len(measurements)}개")
     return latest
 
@@ -1288,75 +1515,121 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
             preview=st.session_state.get(MODE_KEY) == "PREVIEW_ONLY",
         )
     photos = st.session_state.get(INTAKE_IMAGES_KEY, [])
-    board_registry, photo_snapshot = _prepare_board_registry_snapshot(st, project, photos)
-    snapshot_components = diagnosis_components(board_registry)
-    measurement_aliases = measurement_component_aliases(board_registry)
-    analysis_target_id = "board:registry:v1"
-    st.session_state["circuitcare_v7_analysis_target_id"] = analysis_target_id
-    component_inventory = {"__board_registry__": {"registry_version": board_registry.get("version")}}
-    suspected_components = board_suspects(st.session_state, project)
-    live_analysis_snapshot = current_analysis_snapshot(
-        st, project, components=snapshot_components, component_inventory=component_inventory,
-        analysis_target_id=analysis_target_id, component_id_aliases=measurement_aliases,
-        board_registry=board_registry, suspected_components=suspected_components,
-        auto_qwen=True,
-    )
     workflow = get_workflow_state(st.session_state, project)
-    workflow["analysis_fingerprint"] = live_analysis_snapshot.get("input_fingerprint")
-    if workflow.get("stage") in {WORKFLOW_INSPECTION, WORKFLOW_REASSESSMENT}:
-        live_result = (live_analysis_snapshot.get("result")
-                       if live_analysis_snapshot.get("record", {}).get("status") == AnalysisStatus.CURRENT.value
-                       else None)
-        live_candidates = _simple_candidate_rows(live_result) if isinstance(live_result, dict) else []
-        workflow["inspection_targets"] = _inspection_targets(
-            board_registry, live_candidates, suspected_components,
-        )
-        workflow["candidate_ids"] = [str(row.get("board_component_id") or row.get("component_id"))
-                                      for row in live_candidates]
-
-    title, add_photo, edit, new = st.columns([5, 1, 1, 1])
-    with title:
-        st.markdown('<div class="cc-wb-header">CircuitCare AI</div>', unsafe_allow_html=True)
-        st.caption(f"{project.project_id[:8]} · 사진 {len(project.image_records)}장 · "
-                   f"{_diagnosis_status_label(st, project, analysis_snapshot=live_analysis_snapshot)}")
-        confirmed_count = sum(item.presence_status == "CONFIRMED" for item in snapshot_components)
-        st.markdown(f'<div class="cc-wb-subtle">보드 확인 소자 {confirmed_count}개 · Registry {board_registry.get("version", "미구성")[-12:]}</div>', unsafe_allow_html=True)
-    if add_photo.button("사진 추가", use_container_width=True, key="cc_v2_workbench_add_photo"):
-        st.session_state["circuitcare_v2_edit_project_id"] = project.project_id
-        st.session_state["circuitcare_v2_edit_board_id"] = project.board_id
-        clear_intake_draft(st.session_state)
-        st.session_state[SCREEN_KEY] = "entry"
-        st.session_state.pop(SELECTION_KEY, None)
-        st.session_state.pop("circuitcare_v2_photo_choice", None)
-        st.session_state.pop(VIEW_ZOOM_KEY, None)
-        st.rerun()
-    if edit.button("입력 수정", use_container_width=True, key="cc_v2_workbench_edit"):
-        st.session_state["circuitcare_v2_edit_project_id"] = project.project_id
-        st.session_state["circuitcare_v2_edit_board_id"] = project.board_id
-        clear_intake_draft(st.session_state)
-        st.session_state[SCREEN_KEY] = "entry"
-        st.session_state.pop(SELECTION_KEY, None)
-        st.session_state.pop("circuitcare_v2_photo_choice", None)
-        st.session_state.pop(VIEW_ZOOM_KEY, None)
-        st.rerun()
-    if new.button("새 프로젝트", use_container_width=True, key="cc_v2_workbench_new"):
-        reset_intake_for_new_project(st.session_state)
-        st.session_state[SCREEN_KEY] = "entry"
-        st.rerun()
-
-    preview = st.session_state.get(MODE_KEY) == "PREVIEW_ONLY"
-    st.session_state[f"cc_candidate_strategy_{project.project_id}"] = (
-        "candidate_fusion_v1" if isinstance(live_analysis_snapshot.get("result"), dict)
-        and isinstance(live_analysis_snapshot["result"].get("candidate_fusion"), dict) else "baseline"
-    )
     with st.container(key="cc_workbench_body"):
         left, right = st.columns([1.85, 1], gap="large")
-        left_progress_slot = None
+        status_slot = None
+        viewer_slot = None
         with left:
-            left_progress_slot = st.empty()
-            _render_left_transition_status(st, left_progress_slot, workflow)
-            _render_pcb(st, project, st.session_state.get(INTAKE_IMAGES_KEY, []))
+            status_slot = st.empty()
+            viewer_slot = st.empty()
+            pending_label = workflow.pop("pending_left_status", None)
+            transition_progress = None
+            if pending_label:
+                workflow["transition_status"] = "PREPARING"
+                with status_slot.container():
+                    transition_progress = st.status(pending_label, expanded=True)
+                    transition_progress.write("입력과 프로젝트 범위를 확인합니다.")
+                    transition_progress.write("기존 사진별 탐지 결과·Registry·분석 Fingerprint를 재사용합니다.")
+        try:
+            board_registry, photo_snapshot = _prepare_board_registry_snapshot(st, project, photos)
+            snapshot_components = diagnosis_components(board_registry)
+            measurement_aliases = measurement_component_aliases(board_registry)
+            analysis_target_id = "board:registry:v1"
+            st.session_state["circuitcare_v7_analysis_target_id"] = analysis_target_id
+            component_inventory = {"__board_registry__": {"registry_version": board_registry.get("version")}}
+            suspected_components = board_suspects(st.session_state, project)
+            live_analysis_snapshot = current_analysis_snapshot(
+                st, project, components=snapshot_components, component_inventory=component_inventory,
+                analysis_target_id=analysis_target_id, component_id_aliases=measurement_aliases,
+                board_registry=board_registry, suspected_components=suspected_components,
+                auto_qwen=True,
+            )
+            workflow["analysis_fingerprint"] = live_analysis_snapshot.get("input_fingerprint")
+            if workflow.get("stage") in {WORKFLOW_INSPECTION, WORKFLOW_REASSESSMENT}:
+                live_result = (live_analysis_snapshot.get("result")
+                               if live_analysis_snapshot.get("record", {}).get("status") == AnalysisStatus.CURRENT.value
+                               else None)
+                live_candidates = _inspection_candidate_rows(live_result)
+                workflow["inspection_targets"] = _inspection_targets(
+                    board_registry, live_candidates, suspected_components,
+                    inspection_history=workflow.get("inspection_history", []),
+                    measurements=get_measurements(st.session_state, project_id=project.project_id,
+                                                  board_id=project.board_id or ""),
+                )
+                workflow["candidate_ids"] = [str(row.get("board_component_id") or row.get("component_id"))
+                                              for row in live_candidates]
+            preview = st.session_state.get(MODE_KEY) == "PREVIEW_ONLY"
+            st.session_state[f"cc_candidate_strategy_{project.project_id}"] = (
+                "candidate_fusion_v1" if isinstance(live_analysis_snapshot.get("result"), dict)
+                and isinstance(live_analysis_snapshot["result"].get("candidate_fusion"), dict) else "baseline"
+            )
+            workflow["transition_status"] = "PREPARING" if transition_progress is not None else "READY"
+            workflow.pop("transition_error", None)
+        except Exception as exc:
+            workflow["transition_status"] = "FAILED"
+            workflow["transition_error"] = f"{type(exc).__name__}: {str(exc)[:400]}"
+            if transition_progress is not None:
+                transition_progress.update(label="단계 자료 준비 실패 · 기존 검수·측정 기록 보존",
+                                           state="error", expanded=True)
+            with left:
+                try:
+                    with viewer_slot.container():
+                        _render_pcb(st, project, photos)
+                except Exception:
+                    pass
+            with right:
+                st.error(f"PCB 진단 자료를 준비하지 못했습니다 · {type(exc).__name__}: {str(exc)[:300]}")
+            return
+        with left:
+            try:
+                with viewer_slot.container():
+                    _render_pcb(st, project, photos)
+            except Exception as exc:
+                workflow["transition_status"] = "FAILED"
+                workflow["transition_error"] = f"{type(exc).__name__}: {str(exc)[:400]}"
+                with status_slot.container():
+                    failed = st.status("PCB Viewer 준비 실패 · 기존 입력은 유지됩니다", state="error", expanded=True)
+                    failed.write(f"{type(exc).__name__}: {str(exc)[:300]}")
+            if transition_progress is not None:
+                if workflow.get("transition_status") != "FAILED":
+                    transition_progress.update(label="단계 자료와 PCB Overlay 준비 완료",
+                                               state="complete", expanded=False)
+                    workflow["transition_status"] = "READY"
+                    status_slot.empty()
+        left_progress_slot = _LeftProgressSlot(status_slot, viewer_slot)
         with right:
+            if workflow.get("transition_status") == "FAILED" and workflow.get("transition_error"):
+                st.error(f"단계 준비 실패 · {workflow['transition_error']} · 기존 검수·측정 기록은 보존됩니다.")
+            title, add_photo, edit, new = st.columns([5, 1, 1, 1])
+            with title:
+                st.markdown('<div class="cc-wb-header">CircuitCare AI</div>', unsafe_allow_html=True)
+                st.caption(f"{project.project_id[:8]} · 사진 {len(project.image_records)}장 · "
+                           f"{_diagnosis_status_label(st, project, analysis_snapshot=live_analysis_snapshot)}")
+                confirmed_count = sum(item.presence_status == "CONFIRMED" for item in snapshot_components)
+                st.markdown(f'<div class="cc-wb-subtle">보드 확인 소자 {confirmed_count}개 · Registry {board_registry.get("version", "미구성")[-12:]}</div>', unsafe_allow_html=True)
+            if add_photo.button("사진 추가", use_container_width=True, key="cc_v2_workbench_add_photo"):
+                st.session_state["circuitcare_v2_edit_project_id"] = project.project_id
+                st.session_state["circuitcare_v2_edit_board_id"] = project.board_id
+                clear_intake_draft(st.session_state)
+                st.session_state[SCREEN_KEY] = "entry"
+                st.session_state.pop(SELECTION_KEY, None)
+                st.session_state.pop("circuitcare_v2_photo_choice", None)
+                st.session_state.pop(VIEW_ZOOM_KEY, None)
+                st.rerun()
+            if edit.button("입력 수정", use_container_width=True, key="cc_v2_workbench_edit"):
+                st.session_state["circuitcare_v2_edit_project_id"] = project.project_id
+                st.session_state["circuitcare_v2_edit_board_id"] = project.board_id
+                clear_intake_draft(st.session_state)
+                st.session_state[SCREEN_KEY] = "entry"
+                st.session_state.pop(SELECTION_KEY, None)
+                st.session_state.pop("circuitcare_v2_photo_choice", None)
+                st.session_state.pop(VIEW_ZOOM_KEY, None)
+                st.rerun()
+            if new.button("새 프로젝트", use_container_width=True, key="cc_v2_workbench_new"):
+                reset_intake_for_new_project(st.session_state)
+                st.session_state[SCREEN_KEY] = "entry"
+                st.rerun()
             _render_workflow_stepper(st, workflow)
             stage = workflow.get("stage", WORKFLOW_REVIEW)
             if stage == WORKFLOW_REVIEW:
@@ -1391,6 +1664,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                 symptom_state = st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {})
                 if isinstance(symptom_state, dict):
                     workflow["question_answers"] = list(symptom_state.get("question_answers", {}).values())
+                    workflow["question_plan"] = symptom_state.get("question_plan")
                     workflow["symptom_scope"] = live_analysis_snapshot.get("scope")
                 question_snapshot = _current_board_snapshot(
                     st, project, snapshot_components, board_registry, measurement_aliases,

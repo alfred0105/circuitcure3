@@ -158,13 +158,12 @@ def _auto_qwen_model(state: dict[str, Any], *, refresh_seconds: int = 60) -> str
     return chosen
 
 
-def _simple_candidate_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
-    """Create a physical-component Top 3 while preserving each fault hypothesis."""
+def _simple_candidate_rows(result: dict[str, Any], *, limit: int = 3) -> list[dict[str, Any]]:
+    """Create physical-component rows, optionally preserving refuted/conflicted hypotheses."""
     fusion = result.get("candidate_fusion")
     if isinstance(fusion, dict):
         all_rows = fusion.get("candidates", fusion.get("top_candidates", []))
-        rows = [row for row in all_rows if isinstance(row, dict)
-                and row.get("measurement_verdict") not in {"refutes", "conflicted"}]
+        rows = [row for row in all_rows if isinstance(row, dict)]
     else:
         rows = result.get("all_component_candidates", result.get("component_candidates", []))
         rows = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
@@ -184,7 +183,60 @@ def _simple_candidate_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
                                      "fault_hypotheses": [hypothesis]}
         else:
             current["fault_hypotheses"].append(hypothesis)
-    return list(grouped.values())[:3]
+    return list(grouped.values())[:max(0, int(limit))]
+
+
+def _ensure_question_plan(
+    state: dict[str, Any], result: dict[str, Any], *, knowledge: dict[str, Any],
+    input_fingerprint: str,
+) -> dict[str, Any]:
+    """Freeze up to five safe catalog questions for this evidence version."""
+    existing = state.get("question_plan")
+    if (isinstance(existing, dict) and existing.get("input_fingerprint") == input_fingerprint
+            and isinstance(existing.get("questions"), list)):
+        return existing
+    tests = knowledge.get("test_catalog", {}).get("tests", {})
+    tests = tests if isinstance(tests, dict) else {}
+    answered = set(str(value) for value in state.get("answered_test_ids", []))
+    ordered_ids: list[str] = []
+    proposed = result.get("llm_follow_up_question")
+    if isinstance(proposed, dict):
+        proposed_id = str(proposed.get("test_id") or "")
+        if (proposed_id in tests and isinstance(tests[proposed_id], dict)
+                and tests[proposed_id].get("type") == "question"):
+            ordered_ids.append(proposed_id)
+    next_tests = result.get("next_tests", [])
+    if isinstance(next_tests, list):
+        ordered_ids.extend(
+            str(row.get("test_id")) for row in next_tests if isinstance(row, dict)
+            and row.get("type") == "question" and str(row.get("test_id") or "") in tests
+        )
+    # Fill only from the existing safe catalog; never accept generated question text.
+    catalog_answered = set(answered)
+    catalog_answered.update(ordered_ids)
+    while len(dict.fromkeys(ordered_ids)) < 5:
+        question = _safe_initial_followup(knowledge, catalog_answered)
+        if not question:
+            break
+        question_id = str(question.get("test_id") or "")
+        if not question_id or question_id in catalog_answered:
+            break
+        ordered_ids.append(question_id)
+        catalog_answered.add(question_id)
+    unique_ids = list(dict.fromkeys(ordered_ids))[:5]
+    question_rows = [{"test_id": question_id, "question": dict(tests[question_id]),
+                      "status": "ANSWERED" if question_id in answered else "PENDING",
+                      "selected_reason": "Qwen 카탈로그 질문 선택" if question_id ==
+                      str((proposed or {}).get("test_id") or "") else "증상 규칙·안전 질문 카탈로그"}
+                     for question_id in unique_ids]
+    plan_id = hashlib.sha256(
+        f"{input_fingerprint}|{'|'.join(unique_ids)}".encode("utf-8")
+    ).hexdigest()[:20]
+    plan = {"plan_id": plan_id, "questions": question_rows,
+            "current_question_index": 0, "input_fingerprint": input_fingerprint,
+            "termination_reason": ("NO_SAFE_CATALOG_QUESTIONS" if not question_rows else None)}
+    state["question_plan"] = plan
+    return plan
 
 
 def _simple_candidate_information(result: dict[str, Any]) -> dict[tuple[str, str], tuple[str, str, tuple[str, ...], tuple[str, ...]]]:
@@ -246,13 +298,21 @@ def _render_simple_followup_question(
     """Render the one active safe question before candidate results for every simple path."""
     next_tests = result.get("next_tests", []) if isinstance(result.get("next_tests"), list) else []
     answered = set(str(item) for item in state.get("answered_test_ids", []))
-    question = result.get("llm_follow_up_question")
-    if (not isinstance(question, dict) or question.get("test_id") in answered
-            or question.get("type") != "question"):
+    plan = state.get("question_plan") if isinstance(state.get("question_plan"), dict) else {}
+    planned = plan.get("questions", []) if isinstance(plan.get("questions"), list) else []
+    skipped = set(str(value) for value in plan.get("skipped_question_ids", []))
+    pending_indices = [index for index, row in enumerate(planned) if isinstance(row, dict)
+                       and str(row.get("test_id") or "") not in answered | skipped]
+    plan["current_question_index"] = pending_indices[0] if pending_indices else len(planned)
+    question = planned[plan["current_question_index"]].get("question") if pending_indices else None
+    if not planned and question is None:
+        question = result.get("llm_follow_up_question")
+    if (not planned and (not isinstance(question, dict) or question.get("test_id") in answered | skipped
+                         or question.get("type") != "question")):
         question = next((row for row in next_tests if isinstance(row, dict)
                          and row.get("type") == "question"
-                         and str(row.get("test_id")) not in answered), None)
-    if (question is None and result.get("status") == "NEEDS_SYMPTOMS"
+                         and str(row.get("test_id")) not in answered | skipped), None)
+    if (not planned and question is None and result.get("status") == "NEEDS_SYMPTOMS"
             and state.get("initial_symptom_answer") == "기타·모르겠음"):
         question = _safe_initial_followup(knowledge, answered)
     answered_count = len(answered - {INITIAL_SYMPTOM_QUESTION_ID})
@@ -261,6 +321,7 @@ def _render_simple_followup_question(
     if answered_count >= 5 or no_progress >= 2:
         stopped = True
         state["followup_questions_stopped"] = True
+        plan["termination_reason"] = "MAX_5_QUESTIONS_ANSWERED" if answered_count >= 5 else "NO_CANDIDATE_SEPARATION"
     if stopped:
         question = None
     if question:
@@ -282,9 +343,23 @@ def _render_simple_followup_question(
                 state["run_after_initial_answer"] = True
                 st.session_state[_project_key(project)] = state
                 st.rerun()
+            plan_skip_key = f"{answer_key}_skip"
+            if st.button("이 질문 건너뛰기", key=plan_skip_key, disabled=preview):
+                plan["skipped_question_ids"] = list(dict.fromkeys([
+                    *plan.get("skipped_question_ids", []), question_id,
+                ]))
+                plan["termination_reason"] = "USER_SKIPPED_QUESTION"
+                for row in planned:
+                    if isinstance(row, dict) and str(row.get("test_id") or "") == question_id:
+                        row["status"] = "SKIPPED"
+                state["question_plan"] = plan
+                st.session_state[_project_key(project)] = state
+                st.rerun()
     if not stopped and answered_count < 5 and no_progress < 2:
         if st.button("현재 정보로 검사 진행", key=f"{_project_key(project)}_stop_followup", disabled=preview):
             state["followup_questions_stopped"] = True
+            if isinstance(state.get("question_plan"), dict):
+                state["question_plan"]["termination_reason"] = "USER_EARLY_STOP"
             st.session_state[_project_key(project)] = state
             st.rerun()
     history = state.get("question_answers", {})
@@ -331,6 +406,10 @@ def _render_simple_diagnosis_result(
         st.info("증상 정보가 더 필요합니다. 모르는 항목은 ‘모르겠음’을 선택할 수 있습니다.")
     candidates = _simple_candidate_rows(result)
     if show_questions:
+        _ensure_question_plan(
+            state, result, knowledge=knowledge,
+            input_fingerprint=str(state.get("input_fingerprint") or "unfingerprinted"),
+        )
         _render_simple_followup_question(st, project, result, state=state, knowledge=knowledge,
                                          preview=preview, candidates=candidates)
     if not show_candidates:
@@ -688,6 +767,16 @@ def _save_follow_up_answer(state: dict[str, Any], question: dict[str, Any], answ
         for code, value in (entry.get("observations") or {}).items():
             flattened.setdefault(str(code), value)
     state["answers"] = flattened
+    plan = state.get("question_plan")
+    if isinstance(plan, dict):
+        answered_ids = set(str(value) for value in state.get("answered_test_ids", []))
+        skipped_ids = set(str(value) for value in plan.get("skipped_question_ids", []))
+        for row in plan.get("questions", []):
+            if not isinstance(row, dict):
+                continue
+            question_id = str(row.get("test_id") or "")
+            row["status"] = ("SKIPPED" if question_id in skipped_ids else
+                             "ANSWERED" if question_id in answered_ids else "PENDING")
 
 
 INITIAL_SYMPTOM_QUESTION_ID = "INITIAL_SYMPTOM_CAPTURE"

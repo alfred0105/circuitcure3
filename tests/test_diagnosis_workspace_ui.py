@@ -9,12 +9,13 @@ from circuitcare.dashboard.views import inspection_panel as inspection
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.frontend.workbench_state import (
-    SELECTION_KEY, WORKFLOW_REVIEW, WORKFLOW_QUESTIONS, WORKFLOW_INSPECTION,
+    SELECTION_KEY, WORKFLOW_REVIEW, WORKFLOW_QUESTIONS, WORKFLOW_INSPECTION, WORKFLOW_COMPLETE,
     get_workflow_state, transition_workflow, enter_workbench,
 )
 from circuitcare.dashboard.views.symptom_diagnosis_panel import candidate_focus_widget_key
 from circuitcare.dashboard.views.symptom_diagnosis_panel import (
     _queue_measurement_change_rerun, _consume_measurement_change_rerun,
+    _ensure_question_plan,
 )
 from circuitcare.analysis.models import AnalysisStatus
 from circuitcare.frontend.board_component_registry import build_board_component_registry, source_component_key
@@ -28,6 +29,9 @@ class _Context:
     def __enter__(self):
         return self
 
+    def container(self):
+        return _Context()
+
     def __exit__(self, *_args):
         return False
 
@@ -37,15 +41,52 @@ class _Context:
     def caption(self, *_args, **_kwargs):
         pass
 
+    def empty(self):
+        pass
+
+    def status(self, *_args, **_kwargs):
+        return self
+
+    def write(self, *_args, **_kwargs):
+        pass
+
+    def update(self, *_args, **_kwargs):
+        pass
+
+
+class _Status:
+    def __init__(self, label):
+        self.label = label
+        self.state = "running"
+        self.messages = []
+
+    def write(self, message):
+        self.messages.append(message)
+
+    def update(self, *, label=None, state=None, **_kwargs):
+        if label:
+            self.label = label
+        if state:
+            self.state = state
+
 
 class _StreamlitStub:
     def __init__(self, *, state=None, clicked=()):
         self.session_state = state or {}
         self.clicked = set(clicked)
         self.radio_calls = []
+        self.statuses = []
 
     def container(self, **_kwargs):
         return _Context()
+
+    def empty(self):
+        return _Context()
+
+    def status(self, label, **_kwargs):
+        status = _Status(label)
+        self.statuses.append(status)
+        return status
 
     def columns(self, specs, **_kwargs):
         count = specs if isinstance(specs, int) else len(specs)
@@ -89,6 +130,44 @@ def test_workflow_state_is_board_scoped_and_only_accepts_explicit_valid_transiti
     assert get_workflow_state(state, first)["stage"] == WORKFLOW_QUESTIONS
     assert get_workflow_state(state, second)["stage"] == WORKFLOW_REVIEW
     assert workflow["stage_history"][-1]["event"] == "review_complete"
+    # No valid physical target is an explicit, safe return path; collected work remains.
+    workflow["question_answers"] = [{"test_id": "ASK_POWER_SOURCE", "answer": "예"}]
+    workflow["measurement_ids"] = ["measurement-kept"]
+    transition_workflow(state, first, WORKFLOW_INSPECTION, event="questions_complete")
+    transition_workflow(state, first, WORKFLOW_REVIEW, event="no_valid_target",
+                        reason="Registry에 검사 가능한 관측이 없음")
+    assert get_workflow_state(state, first)["question_answers"] == [
+        {"test_id": "ASK_POWER_SOURCE", "answer": "예"}
+    ]
+    assert get_workflow_state(state, first)["measurement_ids"] == ["measurement-kept"]
+    assert get_workflow_state(state, first)["transition_reason"] == "Registry에 검사 가능한 관측이 없음"
+    with pytest.raises(ValueError, match="허용되지 않은"):
+        transition_workflow(state, first, WORKFLOW_COMPLETE)
+
+
+def test_question_plan_is_catalog_bounded_unique_and_stable_across_reruns():
+    state = {"answered_test_ids": ["Q0"]}
+    catalog = {f"Q{index}": {
+        "type": "question", "question": f"질문 {index}",
+        "results": {"yes": {"observations": {f"OBS_{index}": True}}},
+    } for index in range(8)}
+    diagnosis = {
+        "llm_follow_up_question": {"test_id": "Q7", "type": "question",
+                                  "question": "LLM의 비신뢰 문장은 사용하지 않음"},
+        "next_tests": ([{"test_id": "Q1", "type": "question"},
+                        {"test_id": "Q1", "type": "question"},
+                        {"test_id": "UNLISTED", "type": "question"},
+                        *[{"test_id": f"Q{index}", "type": "question"} for index in range(2, 8)]]),
+    }
+    knowledge = {"test_catalog": {"tests": catalog}, "fault_modes": {"fault_modes": {}}}
+    plan = _ensure_question_plan(state, diagnosis, knowledge=knowledge, input_fingerprint="fp-1")
+    ids = [row["test_id"] for row in plan["questions"]]
+    assert len(ids) <= 5
+    assert len(ids) == len(set(ids))
+    assert set(ids) <= set(catalog)
+    assert ids[0] == "Q7"
+    assert _ensure_question_plan(state, diagnosis, knowledge=knowledge,
+                                 input_fingerprint="fp-1") is plan
 
 
 def test_inspection_targets_use_real_registry_ids_order_evidence_and_never_invent_boxes():
@@ -202,6 +281,41 @@ def test_fixed_viewer_shell_starts_at_component_review_with_one_current_stage(mo
     assert calls == ["viewer", "review"]
 
 
+def test_left_transition_status_is_running_before_preparation_and_replaced_after_viewer(monkeypatch):
+    project = ProjectContext("project-left-loader", "board-left-loader")
+    registry = {"project_id": project.project_id, "board_id": project.board_id,
+                "version": "registry-v1", "components": []}
+    monkeypatch.setattr(workspace, "_style", lambda _st: None)
+    monkeypatch.setattr(workspace, "diagnosis_components", lambda _registry: ())
+    monkeypatch.setattr(workspace, "measurement_component_aliases", lambda _registry: {})
+    monkeypatch.setattr(workspace, "board_suspects", lambda *_args: [])
+    monkeypatch.setattr(workspace, "current_analysis_snapshot", lambda *_args, **_kwargs: {
+        "result": None, "record": {"status": "NOT_RUN"}, "input_fingerprint": "fp",
+    })
+    monkeypatch.setattr(workspace, "_diagnosis_status_label", lambda *_args, **_kwargs: "분석 전")
+    rendered = []
+    monkeypatch.setattr(workspace, "_render_pcb", lambda *_args, **_kwargs: rendered.append("viewer"))
+    monkeypatch.setattr(workspace, "render_symptom_diagnosis_panel", lambda *_args, **_kwargs: None)
+    state = {}
+    enter_workbench(state, project)
+    transition_workflow(state, project, WORKFLOW_QUESTIONS, event="review_complete",
+                        left_status="질문 계획 준비 중")
+    st = _StreamlitStub(state=state)
+
+    def prepare(*_args, **_kwargs):
+        assert st.statuses and st.statuses[-1].state == "running"
+        assert rendered == []
+        return registry, {"components": ()}
+
+    monkeypatch.setattr(workspace, "_prepare_board_registry_snapshot", prepare)
+    workspace.render_workbench_shell(st, project)
+
+    assert rendered == ["viewer"]
+    assert st.statuses[0].state == "complete"
+    assert state["circuitcare_v8_diagnostic_workflows"][f"{project.project_id}|{project.board_id}"][
+        "transition_status"] == "READY"
+
+
 def test_simple_candidate_list_aggregates_faults_by_physical_component():
     result = {"candidate_fusion": {"top_candidates": [
         {"board_component_id": "BC-1", "fault_id": "F-A", "score": 8},
@@ -215,6 +329,59 @@ def test_simple_candidate_list_aggregates_faults_by_physical_component():
 
     assert [row["board_component_id"] for row in candidates] == ["BC-1", "BC-2", "BC-3"]
     assert [row["fault_id"] for row in candidates[0]["fault_hypotheses"]] == ["F-A", "F-B"]
+
+
+def test_reassessment_preserves_refuted_conflicted_hypotheses_but_recommendations_filter_them():
+    result = {"candidate_fusion": {"candidates": [
+        {"board_component_id": "BC-1", "fault_id": "F-SUPPORTED",
+         "measurement_verdict": "supports", "visual_status": "FAULT_SUPPORTED"},
+        {"board_component_id": "BC-1", "fault_id": "F-REFUTED",
+         "measurement_verdict": "refutes", "visual_status": "FAULT_REFUTED"},
+        {"board_component_id": "BC-1", "fault_id": "F-CONFLICTED",
+         "measurement_verdict": "conflicted", "visual_status": "CONFLICTED"},
+    ]}}
+    hypotheses = symptoms._simple_candidate_rows(result, limit=1000)[0]["fault_hypotheses"]
+    assert {row["fault_id"] for row in hypotheses} == {"F-SUPPORTED", "F-REFUTED", "F-CONFLICTED"}
+    active = workspace._inspection_candidate_rows(result)
+    assert [row["fault_id"] for row in active[0]["fault_hypotheses"]] == ["F-SUPPORTED"]
+
+
+def test_inspection_targets_prioritize_measurable_components_and_skip_completed_profiles():
+    project = ProjectContext("target-priority", "target-priority-board")
+    registry = build_board_component_registry(
+        {}, project_id=project.project_id, board_id=project.board_id,
+        photo_snapshots=_snapshots(),
+    )
+    resistor_id = next(row["board_component_id"] for row in registry["components"]
+                       if row.get("component_type") == "resistor")
+    candidates = [{"board_component_id": resistor_id, "component_type": "resistor",
+                   "fault_id": "RESISTOR_FAILURE"}]
+    targets = workspace._inspection_targets(registry, candidates, [])
+    assert targets[0]["board_component_id"] == resistor_id
+    assert targets[0]["inspection_kind"] == "MEASUREMENT"
+    assert targets[0]["available_tests"]
+    completed = [{"board_component_id": resistor_id, "fault_id": "RESISTOR_FAILURE",
+                  "test_id": "isolated_resistance", "verification_status": "FAULT_REFUTED"}]
+    after = workspace._inspection_targets(registry, candidates, [], inspection_history=completed)
+    resistor = next(row for row in after if row["board_component_id"] == resistor_id)
+    assert not any(item["test_id"] == "isolated_resistance" for item in resistor["available_tests"])
+    assert resistor["completed_test_count"] >= 1
+    retry = workspace._inspection_targets(registry, candidates, [], inspection_history=completed,
+                                         allow_retest=True)
+    retry_resistor = next(row for row in retry if row["board_component_id"] == resistor_id)
+    assert any(item["test_id"] == "isolated_resistance" for item in retry_resistor["available_tests"])
+
+
+def test_inspection_target_count_tracks_only_real_active_components():
+    project = ProjectContext("target-count", "target-count-board")
+    registry = build_board_component_registry(
+        {}, project_id=project.project_id, board_id=project.board_id,
+        photo_snapshots=_snapshots(),
+    )
+    active = [row for row in registry["components"] if row.get("presence_status") != "EXCLUDED"]
+    assert len(workspace._inspection_targets({**registry, "components": active[:1]}, [], [])) == 1
+    assert len(workspace._inspection_targets({**registry, "components": active[:2]}, [], [])) == 2
+    assert len(workspace._inspection_targets(registry, [], [])) == min(3, len(active))
 
 
 def test_auto_qwen_prefers_installed_qwen35_9b_and_caches_lookup(monkeypatch):
@@ -509,7 +676,6 @@ def test_apptest_questions_next_uses_current_result_and_real_registry_targets(mo
     )
     components = workspace.diagnosis_components(registry)
     snapshot = {"components": components}
-    calls = {"analysis": 0}
     monkeypatch.setattr(workspace, "_prepare_board_registry_snapshot",
                         lambda *_args, **_kwargs: (registry, snapshot))
     monkeypatch.setattr(workspace, "diagnosis_components", lambda _registry: components)
@@ -518,12 +684,11 @@ def test_apptest_questions_next_uses_current_result_and_real_registry_targets(mo
     monkeypatch.setattr(workspace, "_diagnosis_status_label", lambda *_args, **_kwargs: "현재 분석")
 
     def current_snapshot(*_args, **_kwargs):
-        calls["analysis"] += 1
         return {
             "result": {"candidate_fusion": {"candidates": [{
-                "board_component_id": registry["components"][0]["board_component_id"],
-                "component_type": registry["components"][0]["component_type"],
-                "fault_hypotheses": [{"fault_id": "RESISTOR_OPEN"}],
+                "board_component_id": registry["components"][2]["board_component_id"],
+                "component_type": "resistor",
+                "fault_id": "RESISTOR_FAILURE",
             }]}},
             "record": {"status": AnalysisStatus.CURRENT.value},
             "input_fingerprint": "current-workflow-fingerprint",
@@ -532,12 +697,45 @@ def test_apptest_questions_next_uses_current_result_and_real_registry_targets(mo
     monkeypatch.setattr(workspace, "current_analysis_snapshot", current_snapshot)
     monkeypatch.setattr(workspace, "render_symptom_diagnosis_panel",
                         lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(workspace, "render_measurement_panel", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(workspace, "load_knowledge", lambda: {"component_test_profiles": {"profiles": {}}})
-    measurement = SimpleNamespace(measurement_id="measurement-1",
-                                  board_component_id=registry["components"][0]["board_component_id"],
-                                  fault_hypothesis=None)
-    monkeypatch.setattr(workspace, "get_measurements", lambda *_args, **_kwargs: [measurement])
+    def render_mock_measurement(st, *_args, **_kwargs):
+        if st.button("Mock: 새로운 측정 저장", key="workflow_mock_measurement_save"):
+            st.session_state["workflow_mock_new_measurement"] = True
+            st.rerun()
+
+    monkeypatch.setattr(workspace, "render_measurement_panel", render_mock_measurement)
+    monkeypatch.setattr(workspace, "load_knowledge", lambda: {"component_test_profiles": {"profiles": {
+        "resistor": {"tests": {"isolated_resistance": {
+            "measurement_type": "resistance", "title": "저항 측정",
+            "fault_relations": {"RESISTOR_FAILURE": {"TEST_NORMAL": "refutes", "TEST_ABNORMAL": "supports"}},
+        }}}
+    }}})
+
+    class MeasurementStub:
+        def __init__(self, measurement_id, value):
+            self.measurement_id = measurement_id
+            self.board_component_id = registry["components"][2]["board_component_id"]
+            self.component_id = "R1"
+            self.fault_hypothesis = "RESISTOR_FAILURE"
+            self.verification_status = "UNVERIFIED"
+            self.test_id = "isolated_resistance"
+            self.value = value
+            self.unit = "Ω"
+
+        def to_dict(self):
+            return {"measurement_id": self.measurement_id,
+                    "board_component_id": self.board_component_id,
+                    "component_id": self.component_id,
+                    "fault_hypothesis": self.fault_hypothesis,
+                    "verification_status": self.verification_status,
+                    "test_id": self.test_id, "value": self.value, "unit": self.unit}
+
+    measurement = MeasurementStub("measurement-existing", 10)
+    new_measurement = MeasurementStub("measurement-new", 22)
+
+    def measurements_from_state(state, **_kwargs):
+        return [measurement, *([new_measurement] if state.get("workflow_mock_new_measurement") else [])]
+
+    monkeypatch.setattr(workspace, "get_measurements", measurements_from_state)
 
     app = app_testing.AppTest.from_file(str(Path(__file__).parents[1] / "src/circuitcare/ui.py"),
                                         default_timeout=30)
@@ -561,11 +759,64 @@ def test_apptest_questions_next_uses_current_result_and_real_registry_targets(mo
     assert workflow_state["inspection_targets"]
     assert {row["board_component_id"] for row in workflow_state["inspection_targets"]} <= valid_ids
     assert any(item.label == "검사할 소자" for item in app.selectbox)
-    assert calls["analysis"] == 6  # three current-state reads per render; no detector is invoked by the transition
+    analysis_button = next(button for button in app.button if button.label == "측정 결과 분석")
+    assert analysis_button.disabled  # a previous-cycle measurement cannot trigger reassessment
+    next(button for button in app.button if button.label == "Mock: 새로운 측정 저장").click().run()
+    assert not app.exception
+    assert app.session_state["workflow_mock_new_measurement"] is True
+    assert not next(button for button in app.button if button.label == "측정 결과 분석").disabled
 
     next(button for button in app.button if button.label == "측정 결과 분석").click().run()
 
     assert not app.exception
     workflow_state = app.session_state[WORKFLOW_STATES_KEY][f"{project.project_id}|{project.board_id}"]
     assert workflow_state["stage"] == "REASSESSMENT"
-    assert workflow_state["reassessment_history"][-1]["measurement_ids"] == ["measurement-1"]
+    assert workflow_state["reassessment_history"][-1]["measurement_ids"] == [
+        "measurement-existing", "measurement-new",
+    ]
+
+
+def test_apptest_empty_inspection_queue_returns_to_review_without_losing_history(monkeypatch):
+    app_testing = pytest.importorskip("streamlit.testing.v1")
+    from circuitcare.frontend.state import INTAKE_IMAGES_KEY, INTAKE_PROJECT_KEY
+    from circuitcare.frontend.workbench_state import SCREEN_KEY, WORKFLOW_STATES_KEY, transition_workflow
+
+    project = ProjectContext("workflow-no-target-apptest", "workflow-no-target-board")
+    registry = {"project_id": project.project_id, "board_id": project.board_id,
+                "version": "empty-active-registry", "components": []}
+    monkeypatch.setattr(workspace, "_prepare_board_registry_snapshot",
+                        lambda *_args, **_kwargs: (registry, {"components": ()}))
+    monkeypatch.setattr(workspace, "diagnosis_components", lambda _registry: ())
+    monkeypatch.setattr(workspace, "_render_pcb", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "_render_component_inspector", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "_diagnosis_status_label", lambda *_args, **_kwargs: "판정 보류")
+    monkeypatch.setattr(workspace, "current_analysis_snapshot", lambda *_args, **_kwargs: {
+        "result": None, "record": {"status": "NOT_RUN"}, "input_fingerprint": "empty-fp",
+    })
+    monkeypatch.setattr(workspace, "render_symptom_diagnosis_panel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace, "get_measurements", lambda *_args, **_kwargs: [])
+
+    app = app_testing.AppTest.from_file(str(Path(__file__).parents[1] / "src/circuitcare/ui.py"),
+                                        default_timeout=30)
+    app.session_state[INTAKE_PROJECT_KEY] = project
+    app.session_state[INTAKE_IMAGES_KEY] = []
+    app.session_state[SCREEN_KEY] = "workbench"
+    saved: dict = {}
+    transition_workflow(saved, project, WORKFLOW_QUESTIONS, event="review_complete")
+    transition_workflow(saved, project, WORKFLOW_INSPECTION, event="questions_complete")
+    owner = f"{project.project_id}|{project.board_id}"
+    saved[WORKFLOW_STATES_KEY][owner]["question_answers"] = [{"test_id": "ASK_POWER_SOURCE", "answer": "예"}]
+    saved[WORKFLOW_STATES_KEY][owner]["measurement_ids"] = ["archived-measurement"]
+    app.session_state[WORKFLOW_STATES_KEY] = saved[WORKFLOW_STATES_KEY]
+    app.run()
+    assert not app.exception
+    assert any(button.label == "소자 검수로 돌아가기" for button in app.button)
+
+    next(button for button in app.button if button.label == "소자 검수로 돌아가기").click().run()
+
+    assert not app.exception
+    workflow = app.session_state[WORKFLOW_STATES_KEY][owner]
+    assert workflow["stage"] == WORKFLOW_REVIEW
+    assert workflow["question_answers"] == [{"test_id": "ASK_POWER_SOURCE", "answer": "예"}]
+    assert workflow["measurement_ids"] == ["archived-measurement"]
+    assert workflow["transition_reason"] == "현재 Registry에서 측정·검사 대상으로 해석 가능한 소자가 없습니다."

@@ -28,7 +28,7 @@ WORKFLOW_STAGES = (WORKFLOW_REVIEW, WORKFLOW_QUESTIONS, WORKFLOW_INSPECTION,
 _WORKFLOW_TRANSITIONS = {
     WORKFLOW_REVIEW: {WORKFLOW_QUESTIONS},
     WORKFLOW_QUESTIONS: {WORKFLOW_REVIEW, WORKFLOW_INSPECTION},
-    WORKFLOW_INSPECTION: {WORKFLOW_QUESTIONS, WORKFLOW_REASSESSMENT},
+    WORKFLOW_INSPECTION: {WORKFLOW_REVIEW, WORKFLOW_QUESTIONS, WORKFLOW_REASSESSMENT},
     WORKFLOW_REASSESSMENT: {WORKFLOW_INSPECTION, WORKFLOW_COMPLETE},
     WORKFLOW_COMPLETE: {WORKFLOW_INSPECTION},
 }
@@ -54,6 +54,7 @@ def get_workflow_state(state: MutableMapping[str, Any], project: ProjectContext)
             "stage_completion": {stage: False for stage in WORKFLOW_STAGES},
             "symptom_scope": None,
             "question_answers": [],
+            "question_plan": None,
             "candidate_ids": [],
             "inspection_targets": [],
             "selected_target_id": None,
@@ -61,6 +62,10 @@ def get_workflow_state(state: MutableMapping[str, Any], project: ProjectContext)
             "selected_test_id": None,
             "measurement_ids": [],
             "reassessment_history": [],
+            "inspection_history": [],
+            "inspection_cycle": None,
+            "inspection_observations": [],
+            "transition_reason": None,
             "analysis_fingerprint": None,
             "viewer_focus_id": None,
             "pending_left_status": None,
@@ -72,7 +77,7 @@ def get_workflow_state(state: MutableMapping[str, Any], project: ProjectContext)
 
 def transition_workflow(
     state: MutableMapping[str, Any], project: ProjectContext, next_stage: str, *,
-    event: str = "user", left_status: str | None = None,
+    event: str = "user", left_status: str | None = None, reason: str | None = None,
 ) -> dict[str, Any]:
     """Apply a valid explicit workflow transition without clearing prior inputs."""
     if next_stage not in WORKFLOW_STAGES:
@@ -89,6 +94,7 @@ def transition_workflow(
     workflow["stage_completion"] = completion
     workflow["stage"] = next_stage
     workflow["transition_status"] = "READY"
+    workflow["transition_reason"] = reason
     workflow["stage_history"] = [
         *workflow.get("stage_history", []),
         {"from": current_stage, "to": next_stage, "event": event},
