@@ -44,7 +44,7 @@ from circuitcare.dashboard.views.inspection_panel import (
     _diagnosis_status_label,
 )
 from circuitcare.dashboard.views.symptom_diagnosis_panel import (
-    current_analysis_snapshot, render_symptom_diagnosis_panel,
+    candidate_rows_for_strategy, current_analysis_snapshot, render_symptom_diagnosis_panel,
 )
 from circuitcare.dashboard.views.measurement_panel import render_measurement_panel
 from circuitcare.dashboard.views.diagnosis_panel import render_diagnosis_panel
@@ -1234,14 +1234,27 @@ def _render_cause_dashboard(
         else:
             st.info("증상 입력 탭에서 증상을 기록하고 원인 분석을 실행하세요.")
         return
-    candidates = result.get("component_candidates", [])
+    strategy_key = f"cc_candidate_strategy_{project.project_id}"
+    strategy_options = ["baseline", "evidence_v1"]
+    if isinstance(result.get("candidate_fusion"), dict):
+        strategy_options.append("candidate_fusion_v1")
+    strategy_labels = {"baseline": "Baseline 규칙 순위", "evidence_v1": "evidence_v1 실험 순위",
+                       "candidate_fusion_v1": "Qwen 통합 실험 순위"}
+    current_strategy = st.session_state.get(strategy_key, "baseline")
+    if current_strategy not in strategy_options:
+        current_strategy = "baseline"
+    st.selectbox("후보 표시 전략", strategy_options, key=strategy_key,
+                 index=strategy_options.index(current_strategy), format_func=strategy_labels.get,
+                 help="증상 분석 탭과 같은 전략을 사용합니다.")
+    selected_strategy = st.session_state.get(strategy_key, "baseline")
+    candidates = candidate_rows_for_strategy(result, selected_strategy)
     groups = result.get("hypothesis_groups", {})
     next_tests = result.get("next_tests", [])
     next_action = next((row for row in next_tests if row.get("type") != "question"), None)
     if next_action is None:
         next_action = next(iter(next_tests), None)
     with st.container(border=True):
-        st.markdown("**소자 고장 의심 후보 · Top 3**")
+        st.markdown(f"**소자 검사 후보 · {strategy_labels.get(selected_strategy, selected_strategy)} · Top 3**")
         if candidates:
             status_labels = {"SUSPECTED": "검사 전 의심", "FAULT_SUPPORTED": "특정 가설 지지",
                              "FAULT_REFUTED": "특정 가설 반박", "CONFLICTED": "근거 충돌",
@@ -1251,7 +1264,13 @@ def _render_cause_dashboard(
                 fault_id = str(candidate.get("fault_hypothesis") or candidate.get("fault_id") or "")
                 status = str(candidate.get("visual_status") or candidate.get("status") or "SUSPECTED")
                 st.markdown(f"**{index}. `{component_id or '소자 미특정'}` · {candidate.get('component_type', '종류 미확정')}**")
-                st.caption(f"{candidate.get('fault_title', fault_id or '원인 후보')} · {status_labels.get(status, '미확정')} · 상대 점수는 확률이 아닙니다.")
+                source_labels = candidate.get("candidate_source", [])
+                source_text = ("규칙 기반" if "RULE_BASELINE" in source_labels else
+                               "Qwen 미검증" if "QWEN_UNVERIFIED" in source_labels else
+                               "사용자 의심 단서" if "USER_SUSPICION" in source_labels else
+                               str(candidate.get("verification_status", "미확정")))
+                verification = (" · 소자 확인 필요" if candidate.get("verification_status") == "NEEDS_COMPONENT_REVIEW" else "")
+                st.caption(f"{candidate.get('fault_title', fault_id or '원인 후보')} · {status_labels.get(status, '미확정')} · {source_text}{verification} · 순위는 검사 우선순위이지 고장 확률이 아닙니다.")
                 supporting = candidate.get("supporting_evidence") or candidate.get("evidence", [])
                 if supporting:
                     st.caption("지지 · " + " · ".join(supporting[:3]))
@@ -1276,6 +1295,18 @@ def _render_cause_dashboard(
                         st.rerun()
         else:
             st.info("확인된 소자 후보가 없습니다. 증상·검수 결과를 확인하고 기판·납땜 또는 외부 시스템 원인을 살펴보세요.")
+        if selected_strategy == "candidate_fusion_v1":
+            additional = result.get("candidate_fusion", {}).get("additional_qwen_candidates", [])
+            if additional:
+                with st.expander(f"추가 확인 후보 · Qwen 미검증 {len(additional)}개", expanded=False):
+                    for candidate in additional:
+                        cid = str(candidate.get("board_component_id") or candidate.get("component_id") or "")
+                        st.caption(f"{cid} · {candidate.get('fault_title', candidate.get('fault_id'))} · 미검증")
+                        if candidate.get("qwen_reason"):
+                            st.caption(candidate["qwen_reason"])
+                        if cid and st.button("PCB 위치 보기", key=f"cc_qwen_extra_{project.project_id}_{cid}"):
+                            _focus_board_registry_component(st, project, board_registry, cid)
+                            st.rerun()
         if next_action:
             st.info("다음 검사 · " + str(next_action.get("label") or next_action.get("name") or next_action.get("question") or next_action.get("test_id") or "추가 확인"))
 

@@ -28,6 +28,21 @@ def _token_estimate(value: Any) -> int:
     return max(1, math.ceil(len(json.dumps(value, ensure_ascii=False, default=str)) / 3.2))
 
 
+def normalize_review_status(component: dict[str, Any]) -> str:
+    """Normalize registry and viewer labels without treating tentative as confirmed."""
+    labels = {str(component.get(key) or "").strip().upper() for key in
+              ("presence_status", "review_status", "component_review_status")}
+    if labels & {"EXCLUDED", "EXCLUDE", "RETIRED"}:
+        return "EXCLUDED"
+    if labels & {"STALE", "STALE_OR_UNRESOLVED", "UNRESOLVED", "RECONFIRMATION_REQUIRED"}:
+        return "STALE_OR_UNRESOLVED"
+    if labels & {"CONFIRMED", "USER_CONFIRMED"}:
+        return "USER_CONFIRMED"
+    if labels & {"DETECTED_UNVERIFIED", "UNCONFIRMED", "UNVERIFIED", "UNKNOWN"}:
+        return "DETECTED_UNVERIFIED"
+    return "STALE_OR_UNRESOLVED"
+
+
 def build_pcb_context(
     *, components: list[dict[str, Any]], photo_records: tuple[Any, ...] | list[Any],
     diagnosis: dict[str, Any], suspected_components: list[dict[str, Any]] | None = None,
@@ -79,22 +94,75 @@ def build_pcb_context(
                              str(component.get("board_component_id") or "")}
             if suspect_ids & component_ids:
                 suspect_by_id[str(component.get("component_id"))] = suspect
+    # Registry snapshots can expose the same board identity through more than
+    # one photo row. Keep one analysis component while retaining every source.
+    local_photos: dict[str, set[str]] = {}
+    for source_row in components:
+        if not isinstance(source_row, dict) or source_row.get("board_component_id"):
+            continue
+        local_id = str(source_row.get("component_id") or "")
+        photo_id = str(source_row.get("photo_id") or "")
+        if local_id and photo_id:
+            local_photos.setdefault(local_id, set()).add(photo_id)
+    unique_components: dict[str, dict[str, Any]] = {}
+    source_rows_by_id: dict[str, list[dict[str, Any]]] = {}
+    excluded_component_count = 0
+    for source_row in components:
+        if not isinstance(source_row, dict):
+            continue
+        board_identity = str(source_row.get("board_component_id") or "")
+        local_identity = str(source_row.get("component_id") or "")
+        source_photo = str(source_row.get("photo_id") or "")
+        identity = board_identity or local_identity
+        # A repeated local detector ID across photos is not proof of a shared
+        # board component; keep those observations separate unless Registry IDs confirm it.
+        if not board_identity and local_identity and source_photo and len(local_photos.get(local_identity, ())) > 1:
+            identity = f"photo:{source_photo}:{local_identity}"
+        if not identity:
+            continue
+        status = normalize_review_status(source_row)
+        if status in {"EXCLUDED", "STALE_OR_UNRESOLVED"}:
+            excluded_component_count += 1
+            continue
+        source_rows_by_id.setdefault(identity, []).append(source_row)
+        previous = unique_components.get(identity)
+        if previous is None or (status == "USER_CONFIRMED" and normalize_review_status(previous) != "USER_CONFIRMED"):
+            unique_components[identity] = dict(source_row)
+        elif previous is not None:
+            for field in ("source_photo_ids", "source_backend_photo_ids", "photo_ids"):
+                values = list(previous.get(field) or [])
+                values.extend(source_row.get(field) or [])
+                if values:
+                    previous[field] = list(dict.fromkeys(str(value) for value in values if value))
+            known_types = list(previous.get("candidate_component_types") or [])
+            known_types.extend(source_row.get("candidate_component_types") or [])
+            if known_types:
+                previous["candidate_component_types"] = list(dict.fromkeys(known_types))
+            if not previous.get("ocr_marking") and source_row.get("ocr_marking"):
+                previous["ocr_marking"] = source_row["ocr_marking"]
+
     details: list[dict[str, Any]] = []
     type_counts: dict[str, int] = {}
     tentative_type_counts: dict[str, int] = {}
-    photo_counts: dict[str, int] = {}
-    for row in components:
-        component_id = str(row.get("component_id") or "")
+    photo_observations: dict[str, set[str]] = {}
+    for identity, source_rows in source_rows_by_id.items():
+        for source_row in source_rows:
+            photo_ids = source_row.get("source_backend_photo_ids", source_row.get(
+                "source_photo_ids", source_row.get("photo_ids", []))) or []
+            if source_row.get("photo_id"):
+                photo_ids = [*photo_ids, source_row["photo_id"]]
+            local_id = str(source_row.get("photo_local_component_id") or source_row.get("component_id") or identity)
+            for source_photo_id in dict.fromkeys(str(value) for value in photo_ids if value):
+                photo_observations.setdefault(source_photo_id, set()).add(local_id)
+    for component_id, row in unique_components.items():
         if not component_id:
             continue
+        status = normalize_review_status(row)
         kind = str(row.get("component_type", row.get("type")) or "unknown")
         type_counts[kind] = type_counts.get(kind, 0) + 1
         source_ids = row.get("source_backend_photo_ids", row.get("source_photo_ids", row.get("photo_ids", []))) or []
         photo_id = str(row.get("photo_id") or (source_ids[0] if len(source_ids) == 1 else ""))
         photo = photos.get(photo_id, {})
-        for source_photo_id in dict.fromkeys([*(str(value) for value in source_ids if value), photo_id] if photo_id else
-                                              [str(value) for value in source_ids if value]):
-            photo_counts[source_photo_id] = photo_counts.get(source_photo_id, 0) + 1
         bbox = _box(row)
         width, height = photo.get("width"), photo.get("height")
         normalized = None
@@ -156,13 +224,7 @@ def build_pcb_context(
         for tentative_type in candidate_types:
             if tentative_type != "unknown":
                 tentative_type_counts[tentative_type] = tentative_type_counts.get(tentative_type, 0) + 1
-        review_state = str(row.get("presence_status", "UNCONFIRMED")).upper()
-        if review_state == "EXCLUDED":
-            review_state = "EXCLUDED"
-        elif review_state == "CONFIRMED":
-            review_state = "USER_CONFIRMED"
-        else:
-            review_state = "DETECTED_UNVERIFIED"
+        review_state = status
         confirmed_source_markings = [str(source.get("ocr_marking")) for source in raw_sources
                                      if source.get("ocr_marking") and str(source.get("review_status", "")).casefold()
                                      in {"user_confirmed", "confirmed"}]
@@ -178,12 +240,15 @@ def build_pcb_context(
             "bbox_xyxy": bbox,
             "normalized_geometry": normalized,
             "type": kind, "detection_confidence": row.get("detection_confidence"),
+            "type_evidence_status": "CONFIRMED" if review_state == "USER_CONFIRMED" else "TENTATIVE",
             "identification_status": row.get("identification_status", row.get("identity_status", row.get("presence_status", "UNKNOWN"))),
             "review_status": review_state,
             "component_review_status": review_state,
             "component_type_status": row.get("component_type_status", "UNCONFIRMED"),
             "candidate_component_types": candidate_types,
-            "ocr_marking": ocr_marking, "possible_part_number": row.get("possible_part_number"),
+            "ocr_marking": ocr_marking,
+            "ocr_evidence_status": "CONFIRMED" if review_state == "USER_CONFIRMED" and ocr_marking else "TENTATIVE",
+            "possible_part_number": row.get("possible_part_number"),
             "ocr_candidates": list(dict.fromkeys(str(item) for source in raw_sources
                                                    for item in (source.get("ocr_candidates") or []) if item)),
             "silkscreen_hints": [item for item in diagnosis.get("silkscreen_labels", [])
@@ -204,9 +269,12 @@ def build_pcb_context(
     for row in details:
         row["nearby_components"] = spatial.get(row["component_id"], [])
     by_id = {row["component_id"]: row for row in details}
-    confirmed = [row for row in details if row["review_status"] == "CONFIRMED"]
+    confirmed = [row for row in details if row["review_status"] == "USER_CONFIRMED"]
+    photo_counts = {photo_id: len(observation_ids) for photo_id, observation_ids in photo_observations.items()}
     summaries = {
         "component_count": len(details), "confirmed_component_count": len(confirmed),
+        "tentative_component_count": sum(row["review_status"] == "DETECTED_UNVERIFIED" for row in details),
+        "excluded_or_stale_component_count": excluded_component_count,
         "types": dict(sorted(type_counts.items())),
         "tentative_types": dict(sorted(tentative_type_counts.items())),
         "photos": dict(sorted(photo_counts.items())),
@@ -231,10 +299,10 @@ def build_pcb_context(
         cid = str(candidate.get("component_id") or "")
         if cid in by_id and cid not in focus_ids:
             focus_ids.append(cid)
+    focus_ids.extend(row["component_id"] for row in confirmed if row["component_id"] not in focus_ids)
     for row in details:
         if row["functional_roles"] and row["component_id"] not in focus_ids:
             focus_ids.append(row["component_id"])
-    focus_ids.extend(row["component_id"] for row in confirmed if row["component_id"] not in focus_ids)
     focus_ids.extend(row["component_id"] for row in details if row["component_id"] not in focus_ids)
 
     symptom_codes = diagnosis.get("symptom_codes", diagnosis.get("symptoms", []))

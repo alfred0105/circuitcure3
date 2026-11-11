@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from circuitcare.local_llm import LocalLLMError, OllamaClient
+from circuitcare.symptom_diagnosis.pcb_context import normalize_review_status
 
 
 def suggest_pcb_fault_candidates(
@@ -13,21 +14,33 @@ def suggest_pcb_fault_candidates(
     diagnosis: dict[str, Any], knowledge: dict[str, Any],
 ) -> dict[str, Any]:
     """Return schema-bounded Qwen proposals, separate from deterministic ranks."""
-    components = {str(row.get("component_id")): row for row in pcb_context.get("focus_components", [])
-                  if isinstance(row, dict) and row.get("component_id")}
+    raw_components = pcb_context.get("focus_components", [])
+    components = {str(row.get("component_id")): row for row in raw_components
+                  if isinstance(row, dict) and isinstance(row.get("component_id"), (str, int))
+                  and str(row.get("component_id")).strip()}
+    eligible_states = {"USER_CONFIRMED", "DETECTED_UNVERIFIED"}
     eligible_ids = sorted(cid for cid, row in components.items()
-                          if row.get("review_status") in {"USER_CONFIRMED", "CONFIRMED", "DETECTED_UNVERIFIED"}
-                          and row.get("review_status") not in {"EXCLUDED", "STALE_OR_UNRESOLVED"})
-    fault_modes = knowledge.get("fault_modes", {}).get("fault_modes", {})
+                          if normalize_review_status(row) in eligible_states
+                          and str(row.get("identity_status") or "").upper() not in {
+                              "STALE", "UNRESOLVED", "STALE_OR_UNRESOLVED", "RECONFIRMATION_REQUIRED"})
+    raw_faults = knowledge.get("fault_modes", {})
+    fault_modes = raw_faults.get("fault_modes", {}) if isinstance(raw_faults, dict) else {}
+    if not isinstance(fault_modes, dict):
+        fault_modes = {}
     modes = sorted(fault_modes)
     if not modes or not eligible_ids:
         return {"proposals": [], "model": model, "status": "NO_ELIGIBLE_COMPONENTS"}
     block_values = sorted({"power", "input", "control", "control_input", "control_timing",
                            "driver", "output", "protection", "thermal", "buzzer", "relay"})
-    evidence_values = {str(key) for key in pcb_context.get("observations", {})}
-    evidence_values.update(str(row.get("id")) for row in diagnosis.get("matched_rules", []) if row.get("id"))
-    evidence_values.update(f"measurement:{row.get('measurement_id')}" for row in pcb_context.get("measurement_evidence", [])
-                           if row.get("measurement_id"))
+    raw_observations = pcb_context.get("observations", {})
+    evidence_values = ({str(key) for key in raw_observations}
+                       if isinstance(raw_observations, dict) else set())
+    for row in diagnosis.get("matched_rules", []) if isinstance(diagnosis.get("matched_rules"), list) else []:
+        if isinstance(row, dict) and row.get("id"):
+            evidence_values.add(str(row["id"]))
+    for row in pcb_context.get("measurement_evidence", []) if isinstance(pcb_context.get("measurement_evidence"), list) else []:
+        if isinstance(row, dict) and row.get("measurement_id"):
+            evidence_values.add(f"measurement:{row['measurement_id']}")
     evidence_options = sorted(evidence_values) or ["__none__"]
     schema = {
         "type": "object", "additionalProperties": False, "required": ["proposals"],
@@ -58,6 +71,7 @@ def suggest_pcb_fault_candidates(
     response = client.chat_json(model, [
         {"role": "system", "content": (
             "PCB 진단 보조자다. 확인된 소자는 진단 후보로, DETECTED_UNVERIFIED 소자는 검수 필요 검사 후보로만 제안한다. "
+            "type_evidence_status와 ocr_evidence_status가 CONFIRMED인 정보만 확인 사실로 사용한다. TENTATIVE 표시는 검수 단서일 뿐이다. "
             "미검수 소자의 종류는 잠정값이므로 확정 사실처럼 말하지 않는다. 입력 JSON의 허용 고장 유형과 증거만 사용한다. "
             "사용자 의심은 미검증 단서다. 존재하지 않는 측정·배선·핀·연결·소자·증거를 만들지 않는다. "
             "근거가 부족하면 후보를 생략하거나 INCONCLUSIVE로 제안한다. Qwen 제안만으로 고장을 확정하거나 "
@@ -66,29 +80,52 @@ def suggest_pcb_fault_candidates(
         )},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
     ], output_schema=schema)
+    if not isinstance(response, dict):
+        raise LocalLLMError("Qwen candidate response must be an object")
     if response.get("done_reason") in {"length", "max_tokens"}:
         raise LocalLLMError("Qwen candidate JSON response was truncated by the output token limit.")
-    rows = response.get("content", {}).get("proposals", [])
+    response_content = response.get("content")
+    if not isinstance(response_content, dict) or not isinstance(response_content.get("proposals"), list):
+        return {"proposals": [], "model": response.get("model", model),
+                "status": "FAILED", "failure_category": "INVALID_SCHEMA",
+                "rejected_proposal_count": 0}
+    rows = response_content["proposals"]
     validated = []
-    for row in rows if isinstance(rows, list) else []:
+    rejected = 0
+    for row in rows[:3] if isinstance(rows, list) else []:
         if not isinstance(row, dict):
+            rejected += 1
             continue
-        cid, fault_id = str(row.get("component_id") or ""), str(row.get("suspected_fault_id") or "")
+        raw_cid, raw_fault_id = row.get("component_id"), row.get("suspected_fault_id")
+        if not isinstance(raw_cid, (str, int)) or not isinstance(raw_fault_id, str):
+            rejected += 1
+            continue
+        cid, fault_id = str(raw_cid).strip(), raw_fault_id.strip()
+        if cid not in eligible_ids or not fault_id:
+            rejected += 1
+            continue
         mode = fault_modes.get(fault_id)
         component = components.get(cid)
-        review_status = str(component.get("review_status") or "")
-        if (not component or review_status not in {"USER_CONFIRMED", "CONFIRMED", "DETECTED_UNVERIFIED"}
-                or not isinstance(mode, dict)):
+        if not isinstance(component, dict):
             continue
-        accepted_types = {str(value).lower() for value in mode.get("candidate_component_types", [])}
-        actual_types = {str(value).lower() for value in component.get("candidate_component_types", [])
-                        if str(value).lower() != "unknown"}
-        actual_type = str(component.get("type") or "unknown").lower()
+        review_status = normalize_review_status(component)
+        if review_status not in eligible_states or not isinstance(mode, dict):
+            rejected += 1
+            continue
+        raw_accepted_types = mode.get("candidate_component_types", [])
+        raw_actual_types = component.get("candidate_component_types", [])
+        accepted_types = {str(value).casefold() for value in raw_accepted_types
+                          if isinstance(value, str)} if isinstance(raw_accepted_types, list) else set()
+        actual_types = {str(value).casefold() for value in raw_actual_types
+                        if isinstance(value, str) and value.casefold() != "unknown"} \
+            if isinstance(raw_actual_types, list) else set()
+        actual_type = str(component.get("type") or "unknown").casefold()
         if actual_type != "unknown":
             actual_types.add(actual_type)
         aliases = {"integrated_circuit": "ic", "ic": "integrated_circuit"}
         if not accepted_types or not any(kind in accepted_types or aliases.get(kind) in accepted_types
                                          for kind in actual_types):
+            rejected += 1
             continue
         raw_supports = row.get("supporting_evidence_ids", [])
         raw_opposes = row.get("opposing_evidence_ids", [])
@@ -102,6 +139,8 @@ def suggest_pcb_fault_candidates(
         reason = row.get("reason") if isinstance(row.get("reason"), str) else ""
         next_action = row.get("recommended_next_action") if isinstance(row.get("recommended_next_action"), str) else ""
         proposed_block = row.get("functional_block")
+        if not isinstance(proposed_block, str):
+            proposed_block = "UNKNOWN"
         validated.append({
             "component_id": cid, "suspected_fault_id": fault_id,
             "board_component_id": cid,
@@ -127,7 +166,9 @@ def suggest_pcb_fault_candidates(
             "usage": {key: response.get(key) for key in (
                 "prompt_eval_count", "eval_count", "total_duration_ns", "load_duration_ns",
                 "prompt_eval_duration_ns", "eval_duration_ns")},
-            "status": "LOCAL_LLM_PROPOSED_UNVERIFIED"}
+            "status": "LOCAL_LLM_PROPOSED_UNVERIFIED" if unique else "NO_VALID_PROPOSALS",
+            "failure_category": "INVALID_SCHEMA" if rejected and not unique else None,
+            "rejected_proposal_count": rejected}
 
 
 def select_follow_up_question(client: OllamaClient, model: str, *, pcb_context: dict[str, Any],

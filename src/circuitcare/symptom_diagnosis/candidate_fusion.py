@@ -19,6 +19,10 @@ def fuse_inspection_candidates(
     proposals and user suspicions are appended as review tasks with no score.
     This is an opt-in comparison strategy and never mutates the baseline result.
     """
+    if not isinstance(rule_candidates, list):
+        rule_candidates = []
+    if not isinstance(qwen_proposals, list):
+        qwen_proposals = []
     component_by_id: dict[str, dict[str, Any]] = {}
     for component in components:
         if not isinstance(component, dict):
@@ -43,8 +47,10 @@ def fuse_inspection_candidates(
         fault = str(row.get("fault_hypothesis") or row.get("fault_id") or "")
         if not cid or not fault:
             continue
-        component = component_by_id.get(cid, {})
-        presence = str(component.get("presence_status") or component.get("review_status") or "UNKNOWN").upper()
+        component = component_by_id.get(cid)
+        if not cid or not fault or not component:
+            continue
+        presence = _presence(component)
         if presence in _EXCLUDED_STATES:
             continue
         key = (cid, fault)
@@ -68,16 +74,16 @@ def fuse_inspection_candidates(
             continue
         cid = str(proposal.get("board_component_id") or proposal.get("component_id") or "")
         fault = str(proposal.get("suspected_fault_id") or proposal.get("fault_id") or "")
-        component = component_by_id.get(cid, {})
-        presence = str(component.get("presence_status") or proposal.get("component_review_status") or "UNKNOWN").upper()
-        if not cid or not fault or presence in _EXCLUDED_STATES:
+        component = component_by_id.get(cid)
+        presence = _presence(component or {}, proposal.get("component_review_status"))
+        if not cid or not fault or not component or presence in _EXCLUDED_STATES:
             continue
         key = (cid, fault)
         candidate = fused.get(key)
         if candidate is None:
             candidate = {
                 "component_id": cid, "board_component_id": cid,
-                "component_type": proposal.get("component_type", component.get("component_type", "unknown")),
+                "component_type": proposal.get("component_type", component.get("component_type", component.get("type", "unknown"))),
                 "fault_id": fault,
                 "fault_hypothesis": fault,
                 "fault_title": proposal.get("fault_title", fault),
@@ -87,7 +93,7 @@ def fuse_inspection_candidates(
                 "measurement_status": "INCONCLUSIVE",
                 "evidence": [], "supporting_evidence": [], "opposing_evidence": [],
                 "candidate_source": [], "evidence_status": "UNVERIFIED",
-                "verification_status": "NEEDS_COMPONENT_REVIEW" if presence != "CONFIRMED"
+                "verification_status": "NEEDS_COMPONENT_REVIEW" if presence != "USER_CONFIRMED"
                     else "NEEDS_MEASUREMENT_OR_INSPECTION",
                 "score_semantics": "none; review ordering only",
                 "rank_strategy": "candidate_fusion_v1",
@@ -113,7 +119,7 @@ def fuse_inspection_candidates(
                                         else "UNVERIFIED")
         # A proposal can never upgrade a measurement/verdict state.
         if candidate.get("measurement_verdict") not in {"supports", "refutes", "conflicted"}:
-            candidate["verification_status"] = ("NEEDS_COMPONENT_REVIEW" if presence != "CONFIRMED"
+            candidate["verification_status"] = ("NEEDS_COMPONENT_REVIEW" if presence != "USER_CONFIRMED"
                                                   else "NEEDS_MEASUREMENT_OR_INSPECTION")
 
     # User suspicion creates a review task only for an explicitly selected, KB fault.
@@ -135,7 +141,7 @@ def fuse_inspection_candidates(
                 "status": "SUSPECTED", "visual_status": "SUSPECTED",
                 "measurement_verdict": "non_diagnostic", "measurement_status": "INCONCLUSIVE",
                 "candidate_source": [], "evidence_status": "UNVERIFIED",
-                "verification_status": "NEEDS_COMPONENT_REVIEW" if component.get("presence_status") != "CONFIRMED"
+                "verification_status": "NEEDS_COMPONENT_REVIEW" if _presence(component) != "USER_CONFIRMED"
                     else "NEEDS_MEASUREMENT_OR_INSPECTION",
                 "rank_strategy": "candidate_fusion_v1", "score_semantics": "none; review ordering only",
                 "supporting_evidence_ids": [], "opposing_evidence_ids": [],
@@ -151,19 +157,48 @@ def fuse_inspection_candidates(
     rows = list(fused.values())
     rows.sort(key=lambda row: (
         0 if row.get("measurement_verdict") == "supports" else
-        4 if row.get("measurement_verdict") in {"refutes", "conflicted"} else
-        1 if "RULE_BASELINE" in row.get("candidate_source", []) else
-        2 if row.get("user_suspected") else 3,
+        2 if "RULE_BASELINE" in row.get("candidate_source", [])
+          and row.get("measurement_verdict") not in {"refutes", "conflicted"} else
+        3 if row.get("user_suspected") else 4,
         row.get("_rule_order", 10**9), row["component_id"], row["fault_id"],
     ))
     for rank, row in enumerate(rows, start=1):
         row["candidate_rank"] = rank
         row.pop("_rule_order", None)
+    # The Top 3 is an inspection queue, not an assertion ranking. A refuted or
+    # conflicted measurement stays in the audit trail but cannot occupy a slot
+    # labelled as a leading fault candidate. Qwen-only rows remain explicitly
+    # available even when rule rows fill the queue.
+    primary_rows = [row for row in rows if row.get("measurement_verdict") not in {"refutes", "conflicted"}]
+    top_candidates = primary_rows[:max(0, int(top_k))]
+    top_keys = {(row["component_id"], row["fault_id"]) for row in top_candidates}
+    additional_qwen = [row for row in rows
+                       if "QWEN_UNVERIFIED" in row.get("candidate_source", [])
+                       and "RULE_BASELINE" not in row.get("candidate_source", [])
+                       and (row["component_id"], row["fault_id"]) not in top_keys]
     return {
         "strategy": "candidate_fusion_v1",
         "status": "AVAILABLE" if rows else "NO_CANDIDATES",
         "baseline_preserved": True,
         "score_semantics": "uncalibrated rule scores are preserved; Qwen and user suspicion add no score",
         "candidates": rows,
-        "top_candidates": rows[:max(0, int(top_k))],
+        "top_candidates": top_candidates,
+        "additional_qwen_candidates": additional_qwen,
     }
+
+
+def _presence(component: dict[str, Any], fallback: Any = None) -> str:
+    # Registry state is authoritative. Proposal metadata may not upgrade a
+    # detected/unresolved component into a user-confirmed one.
+    labels = {str(component.get("presence_status") or "").upper(),
+              str(component.get("review_status") or "").upper()}
+    labels.discard("")
+    if not labels and fallback:
+        labels.add(str(fallback).upper())
+    if labels & _EXCLUDED_STATES:
+        return "EXCLUDED"
+    if labels & {"CONFIRMED", "USER_CONFIRMED"}:
+        return "USER_CONFIRMED"
+    if labels & {"UNCONFIRMED", "DETECTED_UNVERIFIED", "UNVERIFIED"}:
+        return "DETECTED_UNVERIFIED"
+    return "UNKNOWN"
