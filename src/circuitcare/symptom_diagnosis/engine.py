@@ -6,6 +6,7 @@ from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 import yaml
@@ -18,6 +19,7 @@ from circuitcare.symptom_diagnosis.fault_hypothesis_validator import (
     summarize_measurement_verdict, validate_component_hypothesis,
 )
 from circuitcare.symptom_diagnosis.measurement_evaluator import evaluate_component_measurements
+from circuitcare.symptom_diagnosis.measurement_validation import verified_measurements_for_inference
 
 KNOWLEDGE_DIR = Path(__file__).with_name("knowledge")
 FAILURE_FUNCTION = {
@@ -310,6 +312,7 @@ def diagnose(
     _simulate_questions: bool = True,
 ) -> dict[str, Any]:
     """Generate ranked, explicitly unverified causes from normalized evidence."""
+    diagnosis_started = time.perf_counter()
     kb = knowledge or load_knowledge()
     ontology = kb["symptom_ontology"]["symptoms"]
     observed_facts, provenance, evidence_conflicts = _normalize_observations(observations)
@@ -374,10 +377,16 @@ def diagnose(
         for row in (measurements or []) if isinstance(row, dict)
         and str(row.get("component_id") or "") in confirmed_part_by_id
     ]
+    measurement_started = time.perf_counter()
     scoped_measurements = evaluate_component_measurements(
         contextual_measurements,
         profiles=kb.get("component_test_profiles", {}), current_context=current_context,
     )
+    ranking_measurements = verified_measurements_for_inference(
+        contextual_measurements, profiles=kb.get("component_test_profiles", {}),
+        current_context=current_context,
+    )
+    measurement_validation_ms = (time.perf_counter() - measurement_started) * 1000
     generated.update(fault_id for (_component_id, fault_id, _test, _target, _condition), assessment in scoped_measurements.items()
                      if assessment.get("status") in {"TEST_NORMAL", "TEST_ABNORMAL"}
                      and fault_id in modes)
@@ -439,6 +448,9 @@ def diagnose(
         return {"status": "NEEDS_SYMPTOMS", "symptom_codes": [], "observations": facts,
                 "evidence_conflicts": evidence_conflicts,
                 "matched_rules": [], "hypotheses": [], "functional_blocks": [], "next_tests": [],
+                "processing_timings_ms": {"measurement_validation": round(measurement_validation_ms, 3),
+                                           "candidate_ranking": 0.0, "recommendation_generation": 0.0,
+                                           "total": round((time.perf_counter() - diagnosis_started) * 1000, 3)},
                 "message": "증상을 확인해야 원인 후보를 좁힐 수 있습니다."}
 
     ranked = []
@@ -546,10 +558,11 @@ def diagnose(
                        "status": "UNVERIFIED_CANDIDATE"})
     level_priority = {"component": 0, "functional_block": 1, "board": 2, "system": 3}
     ranked.sort(key=lambda row: (level_priority.get(row["level"], 4), -row["score"], row["title"]))
+    rule_ranking_started = time.perf_counter()
     ranked_component_evidence = rank_component_candidates(
         hypotheses=ranked, components=normalized_parts, functional_blocks=functional_blocks,
         observations=(observations if isinstance(observations, list) else []),
-        measurements=contextual_measurements,
+        measurements=ranking_measurements,
         confirmed_component_ids=confirmed_ids, profiles=kb.get("component_test_profiles", {}),
         current_context=current_context, knowledge=kb,
         limit=max(3, len(normalized_parts) * max(1, len(ranked))),
@@ -560,13 +573,14 @@ def diagnose(
     component_candidates = rank_component_candidates(
         hypotheses=ranked, components=normalized_parts, functional_blocks=functional_blocks,
         observations=(observations if isinstance(observations, list) else []),
-        measurements=contextual_measurements,
+        measurements=ranking_measurements,
         confirmed_component_ids=confirmed_ids, profiles=kb.get("component_test_profiles", {}),
         current_context=current_context, knowledge=kb, limit=3, include_refuted=False,
     )
     joint_candidates = rank_joint_candidates(
         hypotheses=ranked, component_candidates=component_candidates, observations=facts,
     )
+    candidate_ranking_ms = (time.perf_counter() - rule_ranking_started) * 1000
 
     tests = kb["test_catalog"]["tests"]
     shortlist = ranked[:5]
@@ -623,6 +637,7 @@ def diagnose(
     if not _simulate_questions:
         recommended = []
     recommended.sort(key=lambda row: (-row["utility"], row["risk_level"] != "none", row["name"]))
+    recommendation_ms = (time.perf_counter() - rule_ranking_started) * 1000 - candidate_ranking_ms
 
     status = "CANDIDATES_AVAILABLE" if ranked and selected else "ABSTAIN_INSUFFICIENT_EVIDENCE"
     hypothesis_groups = {
@@ -640,6 +655,7 @@ def diagnose(
         "measurement_id": row.get("measurement_id"),
         "component_id": row.get("component_id"),
         "test_id": row.get("test_id"),
+        "observed_at": (row.get("measured_at") or row.get("created_at") or row.get("timestamp")),
         "measurement_type": row.get("measurement_type"),
         "value": row.get("value"), "unit": row.get("unit"),
         "source": row.get("source"),
@@ -686,6 +702,12 @@ def diagnose(
             "joint_candidates": joint_candidates,
             "measurement_evidence": measurement_evidence,
             "next_tests": recommended[:5], "connectivity_status": connectivity_status,
+            "processing_timings_ms": {
+                "measurement_validation": round(measurement_validation_ms, 3),
+                "candidate_ranking": round(candidate_ranking_ms, 3),
+                "recommendation_generation": round(max(0.0, recommendation_ms), 3),
+                "total": round((time.perf_counter() - diagnosis_started) * 1000, 3),
+            },
             "verified_connectivity_evidence_count": len(verified_edges) if connectivity_status in {"verified", "partial_verified"} else 0,
             "message": ("후보 원인을 정리했습니다. 순위 점수는 확률이 아니며 검증 전 후보입니다."
                         if status == "CANDIDATES_AVAILABLE" else "정보가 부족해 진단을 보류합니다. 추가 증상이나 확인 결과를 입력해 주세요.")}

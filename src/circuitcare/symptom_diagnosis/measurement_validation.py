@@ -86,3 +86,17 @@ def measurement_verification_gaps(
             if fault not in test_profile.get("fault_relations", {}):
                 gaps.append("이 검사 항목은 선택한 고장 가설을 판별하지 않습니다.")
     return list(dict.fromkeys(gaps))
+
+
+def verified_measurements_for_inference(
+    rows: list[dict[str, Any]] | None, *, profiles: dict[str, Any] | None = None,
+    current_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Exclude structurally unverified readings before candidate ranking.
+
+    Range-valid contradictions stay in the list so the evaluator can mark them
+    CONFLICTED as a group. Incomplete records remain visible as diagnostic
+    evidence explanations, but cannot alter rankings.
+    """
+    return [row for row in rows or [] if isinstance(row, dict)
+            and not measurement_verification_gaps(row, profiles=profiles, current_context=current_context)]

@@ -13,6 +13,9 @@ from circuitcare.frontend.measurement_models import create_measurement_record
 from circuitcare.dashboard.views.measurement_panel import _measurement_verification_gaps
 from circuitcare.symptom_diagnosis.measurement_evaluator import evaluate_component_measurements
 from circuitcare.symptom_diagnosis.measurement_validation import measurement_verification_gaps
+from circuitcare.symptom_diagnosis.evidence_strategy import (
+    optimize_safe_tests, rank_by_verified_evidence,
+)
 
 
 def _profile():
@@ -106,7 +109,7 @@ def test_mock_model_stages_are_separate_and_llm_failure_keeps_rule_diagnosis():
         llm=lambda _result: (_ for _ in ()).throw(RuntimeError("offline")))
     assert run["status"] != "PIPELINE_FAILED"
     assert run["llm"]["status"] == "FAILED_RULES_RETAINED"
-    assert [step["stage"] for step in run["stage_trace"]][:2] == ["yolo_detection", "component_review"]
+    assert [step["stage"].split(":", 1)[0] for step in run["stage_trace"]][:2] == ["yolo_detection", "component_review"]
 
 
 def test_top3_scoring_and_detection_metrics_require_adjudicated_labels():
@@ -124,3 +127,134 @@ def test_top3_scoring_and_detection_metrics_require_adjudicated_labels():
     assert metrics["detection_precision_recall_f1"]["f1"] == 1
     assert metrics["top3_hit_rate"]["n"] == 1
     assert metrics["top1_accuracy"]["confidence_interval_95_wilson"] is not None
+
+
+def test_fault_type_component_and_joint_topk_are_scored_independently_with_ties_and_dedup():
+    case = _case()
+    case["case_kind"] = "REAL_CONFIRMED"
+    case["photo_paths"] = ["unused-in-test.png"]
+    case["reference"] = {"adjudication_status": "CONFIRMED", "fault_type_ids": ["F_SHORT"],
+        "faulty_board_component_ids": ["bc-R7"], "fault_pairs": [
+            {"fault_type_id": "F_SHORT", "board_component_id": "bc-R7"}],
+        "evidence_sources": ["repair_record"]}
+    run = {"case_id": case["case_id"], "execution_mode": "REAL_MODEL", "status": "CANDIDATES_AVAILABLE",
+        "hypotheses": [{"fault_id": "F_OPEN", "score": 2}, {"fault_id": "F_SHORT", "score": 1}],
+        "top_candidates": [
+            {"fault_hypothesis": "F_OPEN", "component_id": "bc-R7", "score": 4},
+            {"fault_hypothesis": "F_SHORT", "component_id": "bc-R7", "score": 3},
+            {"fault_hypothesis": "F_SHORT", "component_id": "bc-R7", "score": 2}],
+        "detections": [], "measurement_evidence": []}
+    score = score_run(case, run)
+    assert score["fault_type_top1_hit"] is False and score["fault_type_top3_hit"] is True
+    assert score["component_top1_hit"] is True
+    assert score["joint_top1_hit"] is False and score["joint_top3_hit"] is True
+    report = evaluate_runs([case], [run])
+    assert report["fault_type_top1"]["n"] == 1
+    assert report["joint_top3"]["value"] == 1
+
+
+def test_topk_cutoff_includes_all_equal_score_ties_without_duplicate_ids():
+    case = _case()
+    case["reference"] = {"adjudication_status": "CONFIRMED", "fault_type_ids": ["F2"],
+                         "evidence_sources": ["repair_record"]}
+    run = {"execution_mode": "MOCK", "hypotheses": [
+        {"fault_id": "F1", "score": 1}, {"fault_id": "F2", "score": 1},
+        {"fault_id": "F2", "score": 1}], "top_candidates": [], "detections": []}
+    score = score_run(case, run)
+    assert score["fault_type_top1_hit"] is True
+    assert score["fault_type_top3_hit"] is True
+
+
+def test_non_component_fault_does_not_score_component_location():
+    case = _case()
+    case["case_kind"] = "REAL_NON_COMPONENT"
+    case["photo_paths"] = ["unused-in-test.png"]
+    case["reference"] = {"adjudication_status": "CONFIRMED", "fault_type_ids": ["SOLDER_OPEN"],
+                         "faulty_board_component_ids": ["must-not-be-scored"],
+                         "evidence_sources": ["repair_record"]}
+    run = {"execution_mode": "REAL_MODEL", "hypotheses": [{"fault_id": "SOLDER_OPEN"}],
+           "top_candidates": [{"component_id": "must-not-be-scored", "score": 99}], "detections": []}
+    score = score_run(case, run)
+    assert score["fault_type_top1_hit"] is True
+    assert score["component_metrics_status"] == "NOT_APPLICABLE"
+    assert score["component_top1_hit"] is None
+
+
+def test_real_cases_are_not_scored_from_mock_or_synthetic_execution():
+    case = _case()
+    case["case_kind"] = "REAL_CONFIRMED"
+    case["photo_paths"] = ["unused-in-test.png"]
+    case["reference"] = {"adjudication_status": "CONFIRMED", "fault_type_ids": ["F1"],
+                         "evidence_sources": ["repair_record"]}
+    assert score_run(case, {"execution_mode": "MOCK"})["status"] == "NOT_EVALUATED"
+
+
+def test_evidence_strategy_deduplicates_measurement_and_ignores_conflict_and_llm_guess():
+    baseline = {"hypotheses": [{"fault_id": "F1", "score": 8, "evidence_details": [
+        {"code": "NO_POWER", "source": "user_report", "status": "observed", "weight": 2},
+        {"code": "NO_POWER", "source": "user_report", "status": "observed", "weight": 2},
+        {"code": "LLM_FAULT_GUESS", "source": "qwen_suggestion", "status": "observed", "weight": 99}]}],
+        "component_candidates": [], "measurement_evidence": [
+            {"measurement_id": "m1", "fault_hypothesis": "F1", "component_id": "bc1",
+             "verdict": "supports", "assessment": "SUPPORTED"},
+            {"measurement_id": "m1", "fault_hypothesis": "F1", "component_id": "bc1",
+             "verdict": "supports", "assessment": "SUPPORTED"},
+            {"measurement_id": "m2", "fault_hypothesis": "F1", "component_id": "bc1",
+             "verdict": "conflicted", "assessment": "CONFLICTED"}],
+        "functional_blocks": []}
+    result = rank_by_verified_evidence(baseline, components=[], measurements=[], observations=None)
+    assert result["hypotheses"][0]["score"] == 1.9
+    assert result["hypotheses"][0]["baseline_score"] == 8
+    assert result["score_semantics"].endswith("not a probability")
+    assert len(result["hypotheses"][0]["evidence_details"]) == 2
+
+
+def test_safe_test_order_excludes_unsafe_completed_duplicate_and_unmet_prerequisite():
+    tests = [
+        {"test_id": "safe", "risk_level": "none", "answer_score_simulation": {
+            "yes": [("F1", 2)], "no": [("F2", 1)]}, "expected_duration_seconds": 30},
+        {"test_id": "unsafe", "risk_level": "high", "answer_score_simulation": {}},
+        {"test_id": "poweroff", "risk_level": "low", "requires_power_off": True,
+         "answer_score_simulation": {"yes": [("F1", 2)], "no": [("F2", 1)]}},
+        {"test_id": "done", "risk_level": "none", "answer_score_simulation": {"yes": [], "no": []}},
+        {"test_id": "safe", "risk_level": "none", "answer_score_simulation": {"yes": [], "no": []}},
+    ]
+    ranked = optimize_safe_tests(tests, observations={"POWER_OFF_CONFIRMED": False},
+                                 measurements=[{"test_id": "done"}])
+    assert [row["test_id"] for row in ranked] == ["safe"]
+    assert ranked[0]["separation_score"] == 1
+
+
+def test_shared_registry_projection_keeps_only_matching_photo_observation_active():
+    snapshot = {"version": "map-v1", "image_fingerprint": "photo-sha", "review_version": "r1",
+        "registry_components": [{"component_id": "R1", "component_type": "resistor",
+            "bbox_xyxy": [1, 2, 20, 30], "identification_status": "USER_CONFIRMED",
+            "presence_status": "CONFIRMED", "component_type_status": "USER_CONFIRMED"}]}
+    registry = build_board_component_registry({}, project_id="p", board_id="b", photo_snapshots={"front": snapshot})
+    fp = current_source_observation_fingerprint(registry, photo_id="front", component_id="R1")
+    row = {**_measurement(), "component_id": "R1", "source_component_id": "R1",
+        "source_photo_id": "front", "source_photo_fingerprint": "photo-sha",
+        "source_observation_fingerprint": fp, "component_map_version": "map-v1"}
+    from circuitcare.frontend.board_component_registry import project_measurements_to_registry
+    history, current = project_measurements_to_registry([row], registry)
+    assert len(history) == len(current) == 1
+    assert current[0]["board_component_id"] == registry["components"][0]["board_component_id"]
+    stale = {**row, "source_observation_fingerprint": "old-fingerprint"}
+    archived, active = project_measurements_to_registry([stale], registry)
+    assert len(archived) == 1 and active == []
+
+
+def test_multi_photo_harness_builds_registry_from_each_photo_snapshot(tmp_path):
+    photos = [tmp_path / "front.jpg", tmp_path / "detail.jpg"]
+    for path in photos:
+        path.write_bytes(path.name.encode())
+    case = _case()
+    case["photo_paths"] = [{"photo_id": "front", "path": str(photos[0])},
+                           {"photo_id": "detail", "path": str(photos[1])}]
+    case["inference_input"]["components"] = [{"component_id": "R1", "component_type": "resistor",
+        "bbox_xyxy": [1, 2, 20, 30], "presence_status": "CONFIRMED"}]
+    run = run_case(case, execution_mode="MOCK", detector=lambda inputs: {
+        "detections": [{"component_id": "R1", "class_name": "resistor", "bbox_xyxy": [1, 2, 20, 30]}]})
+    detection_stages = [row for row in run["stage_trace"] if row["stage"].startswith("yolo_detection:")]
+    assert len(detection_stages) == 2
+    assert run["registry_component_count"] == 2

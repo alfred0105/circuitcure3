@@ -7,7 +7,7 @@ used to join detections from different coordinate frames.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from typing import Any
@@ -152,6 +152,49 @@ def resolve_measurement_board_component(
             return None, "RECONFIRMATION_REQUIRED"
         return alias, "VERIFIED_UNIQUE_LEGACY_ALIAS"
     return None, "UNRESOLVED"
+
+
+def project_measurements_to_registry(
+    measurements: list[Any], registry: dict[str, Any],
+) -> tuple[list[Any], list[Any]]:
+    """Resolve stored readings against current photo observations once for UI and engine.
+
+    Returns (all projected records for history, current verified records for diagnosis).
+    Records with changed/missing source-observation fingerprints remain in the first
+    list but are never passed as current evidence.
+    """
+    board_version = str(registry.get("version") or "")
+    projected: list[Any] = []
+    active: list[Any] = []
+
+    def get(row: Any, name: str, default: Any = None) -> Any:
+        return row.get(name, default) if isinstance(row, dict) else getattr(row, name, default)
+
+    for row in measurements:
+        source_photo = get(row, "source_photo_id")
+        source_local = get(row, "source_component_id") or get(row, "component_id")
+        board_id, resolution = resolve_measurement_board_component(
+            registry, photo_id=source_photo, component_id=str(source_local or ""),
+            photo_fingerprint=get(row, "source_photo_fingerprint"),
+            observation_fingerprint=get(row, "source_observation_fingerprint"),
+            component_map_version=(get(row, "component_map_version")
+                                   if not get(row, "source_photo_fingerprint") else None),
+        )
+        values = {
+            "component_id": str(board_id or ""),
+            "board_component_id": str(board_id) if board_id else None,
+            "component_map_version": board_version if board_id else get(row, "component_map_version"),
+            "source_photo_id": source_photo,
+            "source_component_id": source_local,
+            "identity_resolution_status": resolution,
+            "component_identity_status": (get(row, "component_identity_status")
+                                           if board_id else "IDENTITY_AMBIGUOUS"),
+        }
+        projected_row = ({**row, **values} if isinstance(row, dict) else replace(row, **values))
+        projected.append(projected_row)
+        if board_id and resolution.startswith(("VERIFIED_", "USER_RECONFIRMED_")):
+            active.append(projected_row)
+    return projected, active
 
 
 def _owner(project_id: str, board_id: str | None) -> str:

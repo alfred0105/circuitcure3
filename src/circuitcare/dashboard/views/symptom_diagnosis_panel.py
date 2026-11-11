@@ -111,53 +111,10 @@ def current_analysis_snapshot(
         st.session_state, project_id=project.project_id, board_id=project.board_id or "",
     )
     if isinstance(board_registry, dict):
-        from circuitcare.frontend.board_component_registry import resolve_measurement_board_component
-        board_version = str(board_registry.get("version") or "")
-        projected = []
-        known_board_ids = {str(item.get("board_component_id"))
-                           for item in board_registry.get("components", [])}
-        for row in measurements:
-            source_photo = getattr(row, "source_photo_id", None)
-            source_local = getattr(row, "source_component_id", None) or row.component_id
-            if getattr(row, "board_component_id", None):
-                resolved = row.board_component_id
-                resolution = "VERIFIED_SOURCE_IDENTITY"
-                if source_photo:
-                    actual, status = resolve_measurement_board_component(
-                        board_registry, photo_id=source_photo, component_id=source_local,
-                        photo_fingerprint=getattr(row, "source_photo_fingerprint", None),
-                        observation_fingerprint=getattr(row, "source_observation_fingerprint", None),
-                        component_map_version=(row.component_map_version
-                                               if not getattr(row, "source_photo_fingerprint", None)
-                                               else None))
-                    if actual is None:
-                        resolved, resolution = None, "UNRESOLVED"
-                    else:
-                        # A confirmed merge or split may change the current board ID;
-                        # the immutable photo/local source identity remains authoritative.
-                        resolved = actual
-                        resolution = status
-                elif not source_photo or resolved not in known_board_ids or not source_local:
-                    resolved, resolution = None, "UNRESOLVED"
-            else:
-                resolved, resolution = resolve_measurement_board_component(
-                    board_registry, photo_id=source_photo, component_id=source_local,
-                    photo_fingerprint=getattr(row, "source_photo_fingerprint", None),
-                    observation_fingerprint=getattr(row, "source_observation_fingerprint", None),
-                    component_map_version=row.component_map_version)
-            projected.append(replace(
-                row, component_id=str(resolved or ""),
-                component_map_version=board_version if resolved else row.component_map_version,
-                board_component_id=str(resolved) if resolved else None,
-                source_photo_id=source_photo,
-                source_component_id=source_local,
-                identity_resolution_status=resolution,
-                component_identity_status=(row.component_identity_status if resolved else "IDENTITY_AMBIGUOUS"),
-            ))
+        from circuitcare.frontend.board_component_registry import project_measurements_to_registry
+        projected, measurements = project_measurements_to_registry(measurements, board_registry)
         # Unresolved/retired identities stay in the measurement archive and UI,
         # but are not evidence for the current diagnosis.
-        measurements = [row for row in projected
-                        if str(row.identity_resolution_status).startswith(("VERIFIED_", "USER_RECONFIRMED_"))]
     elif component_id_aliases is not None:
         measurements = [replace(
             row, component_id=component_id_aliases.get(row.component_id) or "",
