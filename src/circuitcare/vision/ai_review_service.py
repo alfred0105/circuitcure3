@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import math
+from copy import deepcopy
 from typing import Any
 
 from PIL import Image, ImageDraw
@@ -89,7 +90,15 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 
-_SYSTEM = """Review the PCB images independently of YOLO. For each detection first decide whether the crop shows a physical electronic component, a relevant non-component board feature, or an uncertain/non-relevant object. Preserve the detector's class as evidence but do not copy it as your answer; an IC detector proposal may be a connector or socket. Choose a base class from the existing 18 detector classes when it applies; otherwise use other_component for a physical part, board_feature for a PCB structure, unknown when unclear, or not_component only for a clear false positive. These Qwen-only classes do not change YOLO labels. Set proposed_class equal to proposed_base_class for compatibility. Propose a subtype only when visually distinctive; otherwise use null. IC socket is an other_component subtype, not an installed IC. Explain visible body/package/pin/housing evidence, compare body OCR separately from nearby silkscreen, and do not infer a class solely from U3/J1/CN1. OCR/designator conflicts should be recorded in conflicting_evidence and require user review, but a weak nearby designator must not override clear visual evidence. Confidence is an uncalibrated model score, never a probability. Retain alternatives and uncertainty. Do not claim identity, electrical rating, pinout, or datasheet facts not visible or independently verified. Existing detections are ID-scoped; use only supplied IDs. Assess duplicate pairs only in supplied paired crops; do not delete anything. For group candidates, distinguish multiple separate bodies from a single package, connector, pins, or internal structure. Reuse listed child IDs and only suggest missing boxes as unverified. Return only the requested JSON object."""
+DUPLICATE_REVIEW_SCHEMA = deepcopy(REVIEW_SCHEMA)
+DUPLICATE_REVIEW_SCHEMA["properties"]["class_reviews"]["maxItems"] = 0
+DUPLICATE_REVIEW_SCHEMA["properties"]["group_reviews"]["maxItems"] = 0
+DUPLICATE_REVIEW_SCHEMA["properties"]["missed_component_candidates"]["maxItems"] = 0
+DUPLICATE_REVIEW_SCHEMA["properties"]["notes"]["maxItems"] = 0
+
+_SYSTEM = """Review the PCB images independently of YOLO. For each detection first decide whether the crop shows a physical electronic component, a relevant non-component board feature, or an uncertain/non-relevant object. Preserve the detector's class as evidence but do not copy it as your answer; an IC detector proposal may be a connector or socket. Choose a base class from the existing 18 detector classes when it applies; otherwise use other_component for a physical part, board_feature for a PCB structure, unknown when unclear, or not_component only for a clear false positive. These Qwen-only classes do not change YOLO labels. Set proposed_class equal to proposed_base_class for compatibility. Propose a subtype only when visually distinctive; otherwise use null. IC socket is an other_component subtype, not an installed IC. Explain visible body/package/pin/housing evidence, compare body OCR separately from nearby silkscreen, and do not infer a class solely from U3/J1/CN1. OCR/designator conflicts should be recorded in conflicting_evidence and require user review, but a weak nearby designator must not override clear visual evidence. Confidence is an uncalibrated model score, never a probability. Retain alternatives and uncertainty. Do not claim identity, electrical rating, pinout, or datasheet facts not visible or independently verified. Existing detections are ID-scoped; use only supplied IDs. Assess duplicate pairs only in supplied paired crops; do not delete anything. For group candidates, distinguish multiple separate bodies from a single package, connector, pins, or internal structure. Reuse listed child IDs and only suggest missing boxes as unverified. Keep evidence to one concise sentence and only populate optional arrays/fields when they add useful evidence. Return only the requested JSON object."""
+
+_DUPLICATES_ONLY_SYSTEM = """Assess only whether each supplied pair of detection boxes depicts the same physical component or two distinct components. Use the paired crops and supplied IDs. Pay attention to connector housing/pins, IC package structure, and nearby separate parts; pins or contacts within one connector/IC are not separate PCB components. Do not classify components, propose boxes, or recommend deletion. Use decision uncertain when the crop does not settle identity. Keep evidence to one concise sentence. Return empty arrays for class_reviews, group_reviews, missed_component_candidates, and notes, and return exactly one duplicate_reviews object for every supplied pair. Every duplicate object must include detection_ids with the exact pair IDs, decision, numeric confidence from 0 to 1, and evidence. Confidence is uncalibrated and never authorizes deletion. Return only schema-valid JSON."""
 
 
 def _review_images(
@@ -97,6 +106,7 @@ def _review_images(
     group_candidates: list[dict[str, Any]] | None = None,
     duplicate_pair_candidates: list[dict[str, Any]] | None = None,
     review_diagnostics: list[dict[str, Any]] | None = None, max_crop_count: int = 10,
+    include_full_image: bool = True,
 ) -> tuple[list[bytes], tuple[int, int], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     with Image.open(io.BytesIO(image_bytes)) as source_image:
         image = source_image.convert("RGB")
@@ -119,8 +129,9 @@ def _review_images(
         color = "#ff9d2e" if detection_id in ids_to_crop else "#77d8ff"
         painter.rectangle((x1, y1, x2, y2), outline=color, width=3)
         painter.text((x1 + 2, max(0, y1 - 14)), detection_id, fill="white", stroke_width=2, stroke_fill="black")
-    images = [guide]
-    manifest = [{"image_index": 0, "kind": "annotated_full_image", "bbox_xyxy": [0, 0, width, height]}]
+    images = [guide] if include_full_image else []
+    manifest = ([{"image_index": 0, "kind": "annotated_full_image", "bbox_xyxy": [0, 0, width, height]}]
+                if include_full_image else [])
     for row in ordered:
         box = row.get("bbox_xyxy")
         if not isinstance(box, (list, tuple)) or len(box) != 4:
@@ -138,7 +149,7 @@ def _review_images(
 
     # Add overlapping native-resolution views so small parts remain visible to Qwen.
     tile_size, overlap, max_tiles = 1024, 0.25, 16
-    if width > tile_size or height > tile_size:
+    if include_full_image and (width > tile_size or height > tile_size):
         step = int(tile_size * (1 - overlap))
         def positions(length: int) -> list[int]:
             if length <= tile_size:
@@ -308,6 +319,7 @@ def review_components_with_qwen(
     detections: list[dict[str, Any]],
     ocr_records: list[dict[str, Any]],
     *, duplicate_pair_candidates: list[dict[str, Any]] | None = None,
+    duplicate_pairs_only: bool = False,
 ) -> dict[str, Any]:
     """Request suggestions and validate every ID and normalized box before display."""
     identified = []
@@ -328,14 +340,26 @@ def review_components_with_qwen(
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
             image_size = source.size
-        group_candidates = find_group_box_candidates(identified, image_size=image_size,
-                                                     diagnostics=candidate_diagnostics)
+        group_candidates = ([] if duplicate_pairs_only else
+                            find_group_box_candidates(identified, image_size=image_size,
+                                                      diagnostics=candidate_diagnostics))
+        if duplicate_pair_candidates is not None:
+            identified_by_id = {row["detection_id"]: row for row in identified}
+            normalized_pairs = []
+            for pair in duplicate_pair_candidates:
+                ids = [str(row.get("detection_id") or row.get("component_id") or "")
+                       for row in pair.get("detections", ())]
+                if len(ids) == 2 and all(value in identified_by_id for value in ids):
+                    normalized_pairs.append({**pair, "detections": tuple(identified_by_id[value] for value in ids)})
+            duplicate_pair_candidates = normalized_pairs
         for group in group_candidates[8:]:
             candidate_diagnostics.append({"stage": "candidate_search", "component_id": group["parent"]["detection_id"],
                                           "status": "deferred", "reason": "group_crop_limit"})
         images, (width, height), image_manifest, pair_manifest, group_manifest = _review_images(
             image_bytes, identified, group_candidates=group_candidates,
             duplicate_pair_candidates=duplicate_pair_candidates,
+            max_crop_count=0 if duplicate_pairs_only else 10,
+            include_full_image=not duplicate_pairs_only,
             review_diagnostics=candidate_diagnostics)
     except Exception as exc:
         raise AIReviewStageError("candidate_search", str(exc)) from exc
@@ -355,11 +379,34 @@ def review_components_with_qwen(
                                        for row in ocr_records[:120]],
         "coordinate_rule": "For each missed candidate, provide image_index and bbox_norm_999=[x1,y1,x2,y2] normalized 0..999 within that exact image.",
     }
+    if duplicate_pairs_only:
+        allowed_ids = {str(value) for pair in pair_manifest for value in pair.get("detection_ids", [])}
+        payload = {
+            "image_coordinates_px": {"width": width, "height": height},
+            "duplicate_pair_crops": pair_manifest,
+            "detector_proposals": [row for row in payload["detector_proposals"]
+                                   if str(row.get("detection_id")) in allowed_ids],
+        }
+    response_schema = REVIEW_SCHEMA
+    if duplicate_pairs_only:
+        response_schema = deepcopy(DUPLICATE_REVIEW_SCHEMA)
+        expected_pair_count = len(pair_manifest)
+        response_schema["properties"]["duplicate_reviews"]["minItems"] = expected_pair_count
+        response_schema["properties"]["duplicate_reviews"]["maxItems"] = expected_pair_count
+    user_prompt = (
+        "For each pair shown in duplicate_pair_crops, return exactly one duplicate_reviews item using those two IDs. "
+        "Include detection_ids, decision, numeric confidence, and evidence in each item. "
+        "If the evidence cannot distinguish them, use decision=uncertain; do not omit a pair. Do not return class, group, "
+        "or missed-component analysis.\n" + json.dumps(payload, ensure_ascii=False)
+        if duplicate_pairs_only else
+        "Review the PCB image, YOLO proposals, and OCR evidence. Return conservative candidate findings.\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
     try:
         response = client.chat_json(
-            model, [{"role": "system", "content": _SYSTEM},
-                    {"role": "user", "content": "Review the PCB image, YOLO proposals, and OCR evidence. Return conservative candidate findings.\n" + json.dumps(payload, ensure_ascii=False)}],
-            output_schema=REVIEW_SCHEMA, images=images,
+            model, [{"role": "system", "content": (_DUPLICATES_ONLY_SYSTEM if duplicate_pairs_only else _SYSTEM)},
+                    {"role": "user", "content": user_prompt}],
+            output_schema=response_schema, images=images,
         )
         content = response["content"]
     except Exception as exc:
@@ -450,6 +497,13 @@ def review_components_with_qwen(
         seen_pairs.add(pair)
         duplicate_reviews.append({**row, "detection_ids": list(pair), "confidence": float(confidence),
                                   "evidence": str(row.get("evidence", ""))[:500]})
+    if duplicate_pairs_only:
+        expected_pairs = {tuple(sorted(item["detection_ids"])) for item in pair_manifest}
+        returned_pairs = {tuple(sorted(item["detection_ids"])) for item in duplicate_reviews}
+        missing_pairs = sorted(expected_pairs - returned_pairs)
+        if missing_pairs:
+            raise AIReviewStageError("qwen_validation",
+                                     f"Qwen duplicate review omitted {len(missing_pairs)} requested pair(s).")
     allowed_groups = {group["parent_id"]: set(group["child_ids"])
                       for group in group_manifest}
     group_reviews = []
@@ -554,10 +608,13 @@ def review_components_with_qwen(
                                       "status": "candidate", "reason": "validated_image_box"})
     qwen_diagnostic_items = [item for item in candidate_diagnostics
                              if item.get("stage") in {"qwen_candidate_validation", "qwen_group_validation"}]
+    notes = content.get("notes", [])
+    if not isinstance(notes, list):
+        notes = []
     return {"class_reviews": class_reviews, "duplicate_reviews": duplicate_reviews,
             "group_reviews": group_reviews,
             "missed_component_candidates": missed,
-            "notes": [str(note)[:300] for note in content.get("notes", [])[:10]],
+            "notes": [str(note)[:300] for note in notes[:10]],
             "model": response.get("model", model), "image_size_px": [width, height],
             "review_image_count": len(images), "review_tiles": sum(item["kind"] == "native_resolution_tile" for item in image_manifest),
             "duplicate_pair_crop_count": len(pair_manifest),

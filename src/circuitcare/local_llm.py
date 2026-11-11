@@ -116,6 +116,12 @@ class OllamaClient:
             if parsed is None:
                 reason = response.get("done_reason")
                 detail = "; response may have been truncated at the output token limit" if reason == "length" else ""
+                diagnostics = ", ".join(
+                    f"{key}={response.get(key)}" for key in
+                    ("done_reason", "eval_count", "prompt_eval_count") if response.get(key) is not None
+                )
+                if diagnostics:
+                    detail += f"; Ollama generation diagnostics: {diagnostics}"
                 raise LocalLLMError(
                     f"Ollama returned invalid JSON content: {exc}{detail}; response starts {content[:240]!r}"
                 ) from exc

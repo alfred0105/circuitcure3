@@ -23,7 +23,7 @@ from circuitcare.vision.component_recognition_panel import (
     CLASS_OPTIONS, _legacy_secondary_scope, _migrate_legacy_review_state, _review_fingerprint,
     _run_ai_review_workflow, duplicate_exclusion_enabled, invalidate_qwen_review, review_aux_keys,
     review_keys, review_scope, _review_detection_batches, _marking_ocr_targets,
-    _make_group_child_row,
+    _make_group_child_row, continue_duplicate_pair_review,
 )
 from circuitcare.component_taxonomy import (
     COMPONENT_CLASSES, COMPONENT_LABELS, QWEN_REVIEW_CLASSES, QWEN_SUBTYPE_DEFINITIONS, QWEN_SUBTYPES,
@@ -263,6 +263,8 @@ def test_large_board_review_batches_cover_every_detection_once():
     assert [len(batch) for batch in batches] == [24, 24, 5]
     assert [row["detection_id"] for batch in batches for row in batch] == [
         row["detection_id"] for row in detections]
+    compact_batches = _review_detection_batches(detections)
+    assert [len(batch) for batch in compact_batches] == [6, 6, 6, 6, 6, 6, 6, 6, 5]
 
 
 def test_duplicate_candidate_search_can_include_pairs_across_review_batches():
@@ -298,6 +300,126 @@ def test_qwen_duplicate_pair_override_uses_crops_for_cross_batch_ids():
     result = review_components_with_qwen(PairClient(), "qwen3.5:9b", _png(), detections, [],
                                          duplicate_pair_candidates=candidates)
     assert result["duplicate_reviews"][0]["detection_ids"] == ["d0", "d24"]
+
+
+def test_duplicate_only_review_uses_pair_crops_without_repeating_class_or_tile_review():
+    class PairOnlyClient:
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            payload = json.loads(_messages[1]["content"].split("\n", 1)[1])
+            assert "do not omit a pair" in _messages[1]["content"]
+            assert output_schema["properties"]["class_reviews"]["maxItems"] == 0
+            assert output_schema["properties"]["missed_component_candidates"]["maxItems"] == 0
+            assert output_schema["properties"]["duplicate_reviews"]["minItems"] == 1
+            assert output_schema["properties"]["duplicate_reviews"]["maxItems"] == 1
+            assert len(payload["duplicate_pair_crops"]) == 1
+            assert len(images) == 1  # Only the focused pair crop; no full-board tiles or OCR rerun.
+            assert set(payload) == {"image_coordinates_px", "duplicate_pair_crops", "detector_proposals"}
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [{"detection_ids": ["a", "b"],
+                    "decision": "different_components", "confidence": .8, "evidence": "Distinct bodies."}],
+                "group_reviews": [], "missed_component_candidates": [], "notes": [],
+            }}
+
+    detections = [{"component_id": "a", "class_name": "resistor", "bbox_xyxy": [5, 5, 25, 20]},
+                  {"component_id": "b", "class_name": "resistor", "bbox_xyxy": [7, 6, 27, 21]}]
+    pairs = _duplicate_pair_candidates(detections, limit=None)
+    result = review_components_with_qwen(PairOnlyClient(), "qwen3.5:9b", _png(), detections,
+                                         [{"text": "R1"}], duplicate_pair_candidates=pairs,
+                                         duplicate_pairs_only=True)
+    assert result["class_reviews"] == []
+    assert result["duplicate_reviews"][0]["decision"] == "different_components"
+
+
+def test_duplicate_only_review_cannot_mark_empty_model_response_as_reviewed():
+    class EmptyPairClient:
+        def chat_json(self, *_args, **_kwargs):
+            return {"model": "qwen3.5:9b", "content": {"class_reviews": [], "duplicate_reviews": [],
+                "group_reviews": [], "missed_component_candidates": [], "notes": []}}
+
+    detections = [{"component_id": "a", "class_name": "resistor", "bbox_xyxy": [5, 5, 25, 20]},
+                  {"component_id": "b", "class_name": "resistor", "bbox_xyxy": [7, 6, 27, 21]}]
+    pairs = _duplicate_pair_candidates(detections, limit=None)
+    with pytest.raises(AIReviewStageError, match="omitted 1 requested pair"):
+        review_components_with_qwen(EmptyPairClient(), "qwen3.5:9b", _png(), detections, [],
+                                    duplicate_pair_candidates=pairs, duplicate_pairs_only=True)
+
+
+def test_duplicate_review_continuation_only_calls_remaining_pair_queue(monkeypatch):
+    from circuitcare.vision import component_recognition_panel as panel
+
+    rows = [{"component_id": f"d{i}", "소자 종류": "resistor", "상태": "검수 필요",
+             "x1": i, "y1": 0, "x2": i + 10, "y2": 10} for i in range(30)]
+    candidates = [{"detections": ({"detection_id": f"d{i}", "bbox_xyxy": [i, 0, i + 10, 10]},
+                                   {"detection_id": f"d{i + 15}", "bbox_xyxy": [i + 1, 0, i + 11, 10]})}
+                  for i in range(15)]
+    monkeypatch.setattr(panel, "_duplicate_pair_candidates", lambda *_args, **_kwargs: candidates)
+    monkeypatch.setattr(panel, "_ollama_review_client", lambda: SimpleNamespace(
+        model_supports_vision=lambda _model: True))
+    calls = []
+
+    def review(_client, _model, _image, detections, ocr, *, duplicate_pair_candidates, **_kwargs):
+        calls.append((len(detections), len(ocr), len(duplicate_pair_candidates)))
+        return {"duplicate_reviews": [{
+            "detection_ids": [row["detection_id"] for row in detections],
+            "decision": "different_components", "confidence": 0.8,
+            "evidence": "The two visible bodies are distinct.",
+        }], "review_image_count": 1}
+
+    monkeypatch.setattr("circuitcare.vision.ai_review_service.review_components_with_qwen", review)
+    state = {review_aux_keys("scope")[1]: {"duplicate_reviews": [], "review_diagnostics": {},
+                                               "verification_status": "AI_SUGGESTIONS_ONLY"}}
+    api = SimpleNamespace(session_state=state)
+    progress = SimpleNamespace(write=lambda *_args: None,
+                               update=lambda **_kwargs: None)
+    first = continue_duplicate_pair_review(api, image_bytes=_png(), scope="scope", rows=rows,
+                                           ocr_result={"records": []}, progress=progress)
+    assert (first["reviewed"], first["deferred"], first["complete"]) == (12, 3, False)
+    assert len(calls) == 12 and all(call[2] == 1 for call in calls)
+    second = continue_duplicate_pair_review(api, image_bytes=_png(), scope="scope", rows=rows,
+                                            ocr_result={"records": []}, progress=progress)
+    assert (second["reviewed"], second["complete"]) == (15, True)
+    assert len(calls) == 15 and all(call[2] == 1 for call in calls)
+    assert continue_duplicate_pair_review(api, image_bytes=_png(), scope="scope", rows=rows,
+                                          ocr_result={"records": []}, progress=progress)["complete"]
+    assert len(calls) == 15  # Completed pair results are reused; no repeated Qwen call.
+
+
+def test_duplicate_review_failed_queue_page_can_be_retried(monkeypatch):
+    from circuitcare.vision import component_recognition_panel as panel
+
+    rows = [{"component_id": f"d{i}", "소자 종류": "resistor", "상태": "검수 필요",
+             "x1": i, "y1": 0, "x2": i + 10, "y2": 10} for i in range(4)]
+    candidates = [{"detections": ({"detection_id": f"d{i}", "bbox_xyxy": [i, 0, i + 10, 10]},
+                                   {"detection_id": f"d{i + 1}", "bbox_xyxy": [i + 1, 0, i + 11, 10]})}
+                  for i in range(3)]
+    monkeypatch.setattr(panel, "_duplicate_pair_candidates", lambda *_args, **_kwargs: candidates)
+    monkeypatch.setattr(panel, "_ollama_review_client", lambda: SimpleNamespace(
+        model_supports_vision=lambda _model: True))
+    attempts = [0]
+
+    def review(*_args, **_kwargs):
+        attempts[0] += 1
+        if attempts[0] == 1:
+            raise TimeoutError("temporary Qwen timeout")
+        detections = _args[3]
+        return {"duplicate_reviews": [{
+            "detection_ids": [row["detection_id"] for row in detections],
+            "decision": "different_components", "confidence": 0.8,
+            "evidence": "The visible bodies are distinct.",
+        }]}
+
+    monkeypatch.setattr("circuitcare.vision.ai_review_service.review_components_with_qwen", review)
+    state = {}
+    api = SimpleNamespace(session_state=state)
+    progress = SimpleNamespace(write=lambda *_args: None,
+                               update=lambda **_kwargs: None)
+    failed = continue_duplicate_pair_review(api, image_bytes=_png(), scope="retry", rows=rows,
+                                            progress=progress)
+    assert failed["failed"] == 1 and failed["reviewed"] == 2
+    retried = continue_duplicate_pair_review(api, image_bytes=_png(), scope="retry", rows=rows,
+                                             progress=progress)
+    assert retried["failed"] == 0 and retried["reviewed"] == 3
+    assert attempts[0] == 4
 
 
 def test_marking_ocr_targets_prioritize_ic_and_passives_and_skip_excluded_rows():

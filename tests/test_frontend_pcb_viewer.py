@@ -22,6 +22,8 @@ from circuitcare.vision.component_recognition_panel import (
     record_box_exclusion, review_keys, restore_review_row, undo_last_box_exclusion, update_review_row,
     qwen_cleanup_disposition,
     _pending_duplicate_pair_candidates,
+    _sync_duplicate_pair_queue, _duplicate_pair_queue_summary, _claim_duplicate_pair_page,
+    _duplicate_pair_id,
 )
 
 
@@ -378,11 +380,95 @@ def test_unvalidated_qwen_cleanup_never_auto_excludes_and_protects_user_confirme
     assert qwen_cleanup_disposition({"decision": "same_component"}, geometry_valid=False)[0] == "REVIEW_REQUIRED"
     assert qwen_cleanup_disposition({"decision": "different_components"})[0] == "KEEP"
     assert qwen_cleanup_disposition({"decision": "same_component"}, protected=True)[0] == "USER_CONFIRMED"
-    validated = {"validated": True, "policy_version": "measured-v1"}
+    validated = {"validated": True, "policy_version": "measured-v1",
+                 "independent_dataset_fingerprint": "sha256:fixture", "evaluation_mode": "REAL_LABELED_PCB",
+                 "metrics": {"sample_count": 1000, "duplicate_precision_lower_bound": .999,
+                             "normal_component_exclusion_rate_upper_bound": 0,
+                             "group_or_connector_false_exclusion_rate_upper_bound": 0}}
     assert qwen_cleanup_disposition({"decision": "suggest", "proposed_class": "resistor"},
                                     validation=validated)[0] == "REVIEW_REQUIRED"
     assert qwen_cleanup_disposition({"decision": "same_component"}, geometry_valid=True,
-                                    validation=validated)[0] == "AUTO_EXCLUDED"
+                                    validation=validated)[0] == "REVIEW_REQUIRED"
+    assert qwen_cleanup_disposition({"decision": "same_component", "evidence": "same package body"},
+                                    geometry_valid=True, validation=validated)[0] == "AUTO_EXCLUDED"
+
+
+def test_duplicate_queue_has_stable_ids_bounded_pages_retry_and_explicit_completion():
+    candidates = [{"detections": ({"detection_id": f"a{i}", "bbox_xyxy": [i, 0, i + 10, 10]},
+                                   {"detection_id": f"b{i}", "bbox_xyxy": [i + 1, 0, i + 11, 10]})}
+                  for i in range(27)]
+    queue = _sync_duplicate_pair_queue(candidates, {}, image_fingerprint="photo-v1")
+    first = _claim_duplicate_pair_page(candidates, queue, limit=12)
+    assert len(first) == 12
+    assert _duplicate_pair_queue_summary(queue)["running"] == 12
+    assert _duplicate_pair_queue_summary(queue)["deferred"] == 15
+    for pair in first:
+        queue["pairs"][_duplicate_pair_id(pair)]["status"] = "REVIEWED"
+    second = _claim_duplicate_pair_page(candidates, queue, limit=12)
+    assert len(second) == 12
+    assert all(queue["pairs"][_duplicate_pair_id(pair)]["status"] == "RUNNING" for pair in second)
+    for pair in second:
+        queue["pairs"][_duplicate_pair_id(pair)]["status"] = "FAILED"
+    retry = _claim_duplicate_pair_page(candidates, queue, limit=12)
+    assert len(retry) == 12  # Failed candidates are retried before deferred candidates.
+    for pair in retry:
+        queue["pairs"][_duplicate_pair_id(pair)]["status"] = "REVIEWED"
+    assert _duplicate_pair_queue_summary(queue)["complete"] is False
+    final_page = _claim_duplicate_pair_page(candidates, queue, limit=12)
+    assert len(final_page) == 3
+    for pair in final_page:
+        queue["pairs"][_duplicate_pair_id(pair)]["status"] = "REVIEWED"
+    assert _duplicate_pair_queue_summary(queue)["complete"] is True
+    assert _claim_duplicate_pair_page(candidates, queue, limit=12) == []
+
+
+def test_duplicate_queue_marks_changed_pair_stale_and_preserves_unaffected_review():
+    candidates = [
+        {"detections": ({"detection_id": "a", "bbox_xyxy": [0, 0, 20, 20]},
+                        {"detection_id": "b", "bbox_xyxy": [1, 1, 21, 21]})},
+        {"detections": ({"detection_id": "c", "bbox_xyxy": [30, 0, 50, 20]},
+                        {"detection_id": "d", "bbox_xyxy": [31, 1, 51, 21]})},
+    ]
+    queue = _sync_duplicate_pair_queue(candidates, {}, image_fingerprint="same-photo")
+    queue["pairs"]["a|b"].update(status="REVIEWED", proposal={"decision": "different_components"})
+    queue["pairs"]["c|d"].update(status="REVIEWED", proposal={"decision": "different_components"})
+    changed = [{"detections": ({"detection_id": "a", "bbox_xyxy": [0, 0, 24, 24]},
+                                {"detection_id": "b", "bbox_xyxy": [1, 1, 21, 21]})}, candidates[1]]
+    updated = _sync_duplicate_pair_queue(changed, queue, image_fingerprint="same-photo")
+    assert updated["pairs"]["a|b"]["status"] == "PENDING"
+    assert updated["pairs"]["a|b"]["history"][-1]["status"] == "STALE"
+    assert updated["pairs"]["c|d"]["status"] == "REVIEWED"
+
+
+def test_duplicate_queue_retries_failed_candidates_before_deferred_candidates():
+    candidates = [{"detections": ({"detection_id": f"d{i}", "bbox_xyxy": [i, 0, i + 10, 10]},
+                                   {"detection_id": f"d{i+1}", "bbox_xyxy": [i + 1, 0, i + 11, 10]})}
+                  for i in range(14)]
+    queue = _sync_duplicate_pair_queue(candidates, {}, image_fingerprint="p")
+    for pair in candidates[:12]:
+        queue["pairs"][_duplicate_pair_id(pair)]["status"] = "DEFERRED"
+    failed_pair = candidates[-1]
+    queue["pairs"][_duplicate_pair_id(failed_pair)]["status"] = "FAILED"
+    retry = _claim_duplicate_pair_page(candidates, queue, limit=1)
+    assert retry == [failed_pair]
+    assert queue["pairs"][_duplicate_pair_id(failed_pair)]["status"] == "RUNNING"
+
+
+def test_duplicate_cleanup_policy_requires_visual_geometry_no_conflict_and_independent_metrics():
+    policy = {"validated": True, "policy_version": "v3", "independent_dataset_fingerprint": "sha256:eval",
+              "evaluation_mode": "REAL_LABELED_PCB", "metrics": {
+                  "sample_count": 5000, "duplicate_precision_lower_bound": .999,
+                  "normal_component_exclusion_rate_upper_bound": .0001,
+                  "group_or_connector_false_exclusion_rate_upper_bound": .0001}}
+    proposal = {"decision": "same_component", "evidence": "same component outline"}
+    assert qwen_cleanup_disposition(proposal, geometry_valid=True, validation=policy)[0] == "AUTO_EXCLUDED"
+    assert qwen_cleanup_disposition(proposal, geometry_valid=False, validation=policy)[0] == "REVIEW_REQUIRED"
+    assert qwen_cleanup_disposition(proposal, geometry_valid=True, has_conflict=True, validation=policy)[0] == "REVIEW_REQUIRED"
+    assert qwen_cleanup_disposition(proposal, geometry_valid=True, is_group=True, validation=policy)[0] == "REVIEW_REQUIRED"
+    assert qwen_cleanup_disposition(proposal, geometry_valid=True, protected=True, validation=policy)[0] == "USER_CONFIRMED"
+    weak_policy = {**policy, "metrics": {**policy["metrics"],
+                                          "normal_component_exclusion_rate_upper_bound": .01}}
+    assert qwen_cleanup_disposition(proposal, geometry_valid=True, validation=weak_policy)[0] == "REVIEW_REQUIRED"
 
 
 def test_deferred_duplicate_pairs_are_paged_and_not_dropped():
@@ -471,6 +557,21 @@ def test_all_exclusion_sources_share_undo_snapshot_and_preserve_reason():
     assert row["상태"] == "제외" and row["duplicate_of"] == "c0"
     assert undo_last_box_exclusion(state, scope="scope", rows=[row]) == "c1"
     assert row["상태"] == "확인" and "duplicate_of" not in row
+
+
+def test_auto_excluded_box_remains_reversible_and_keeps_review_metadata():
+    row = {"component_id": "auto1", "소자 종류": "resistor", "상태": "검수 필요",
+           "x1": 1, "y1": 2, "x2": 10, "y2": 12,
+           "ai_review": {"decision": "same_component", "evidence": "same physical body"},
+           "duplicate_of": "canonical1"}
+    state = {}
+    record_box_exclusion(state, scope="scope", row=row, reason="AUTO_EXCLUDED_VALIDATED_POLICY",
+                         review=row["ai_review"], duplicate_of="canonical1")
+    assert row["상태"] == "제외"
+    restore_review_row(row)
+    assert row["상태"] == "검수 필요"
+    assert row["component_id"] == "auto1"
+    assert row["ai_review"]["decision"] == "same_component"
 
 
 def test_hover_identity_status_is_user_facing_korean_and_unknown_is_preserved():

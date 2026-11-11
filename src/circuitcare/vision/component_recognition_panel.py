@@ -119,7 +119,7 @@ def review_aux_keys(scope: str) -> tuple[str, str]:
     return f"cc_component_ocr_{scope}", f"cc_component_qwen_review_{scope}"
 
 
-def _review_detection_batches(detections: list[dict], batch_size: int = 24) -> list[list[dict]]:
+def _review_detection_batches(detections: list[dict], batch_size: int = 6) -> list[list[dict]]:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     return [detections[index:index + batch_size]
@@ -144,6 +144,139 @@ def _pending_duplicate_pair_candidates(
     return pending
 
 
+def _duplicate_pair_id(pair: dict) -> str:
+    ids = sorted(str(row.get("detection_id") or row.get("component_id") or "")
+                 for row in pair.get("detections", ()))
+    return "|".join(ids) if len(ids) == 2 and ids[0] and ids[1] and ids[0] != ids[1] else ""
+
+
+def _duplicate_pair_input_fingerprint(pair: dict, *, image_fingerprint: str,
+                                      model: str, schema_version: str) -> str:
+    rows = sorted(({
+        "id": str(row.get("detection_id") or row.get("component_id") or ""),
+        "box": row.get("bbox_xyxy", [row.get(key) for key in ("x1", "y1", "x2", "y2")]),
+        "class": row.get("class_name", row.get("소자 종류", "unknown")),
+    } for row in pair.get("detections", ())), key=lambda item: item["id"])
+    payload = {"image": image_fingerprint, "detections": rows, "model": model,
+               "schema": schema_version}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                     default=str).encode()).hexdigest()
+
+
+def _sync_duplicate_pair_queue(
+    candidates: list[dict], queue: Any, *, image_fingerprint: str,
+    model: str = "qwen3.5:9b", schema_version: str = "qwen-review-v2-board-pairs",
+) -> dict:
+    """Reconcile board-wide pair candidates with versioned, resumable review states."""
+    if not isinstance(queue, dict) or queue.get("version") != 2:
+        queue = {"version": 2, "pairs": {}, "candidate_ids": []}
+    else:
+        queue = deepcopy(queue)
+    pairs = queue.setdefault("pairs", {})
+    current = {}
+    for candidate in candidates:
+        pair_id = _duplicate_pair_id(candidate)
+        if not pair_id:
+            continue
+        fingerprint = _duplicate_pair_input_fingerprint(
+            candidate, image_fingerprint=image_fingerprint, model=model,
+            schema_version=schema_version)
+        current[pair_id] = fingerprint
+        previous = pairs.get(pair_id)
+        if not isinstance(previous, dict):
+            pairs[pair_id] = {"fingerprint": fingerprint, "status": "PENDING",
+                              "attempts": 0, "proposal": None, "error": None,
+                              "history": []}
+        elif previous.get("fingerprint") != fingerprint:
+            history = list(previous.get("history", []))
+            history.append({"status": "STALE", "fingerprint": previous.get("fingerprint")})
+            pairs[pair_id] = {"fingerprint": fingerprint, "status": "PENDING",
+                              "attempts": 0, "proposal": None, "error": None,
+                              "history": history[-10:]}
+        elif previous.get("status") == "RUNNING":
+            # A Streamlit rerun/process interruption must not strand a claimed job.
+            previous["status"] = "PENDING"
+    for pair_id, previous in pairs.items():
+        if pair_id not in current and previous.get("status") in {
+                "PENDING", "RUNNING", "DEFERRED", "FAILED"}:
+            previous["status"] = "STALE"
+            previous["error"] = "박스 후보가 현재 입력에서 사라졌습니다."
+    queue["candidate_ids"] = sorted(current)
+    return queue
+
+
+def _duplicate_pair_queue_summary(queue: dict) -> dict[str, Any]:
+    active = [queue.get("pairs", {}).get(pair_id, {}) for pair_id in queue.get("candidate_ids", [])]
+    counts = {status.lower(): sum(row.get("status") == status for row in active)
+              for status in ("PENDING", "RUNNING", "REVIEWED", "FAILED", "DEFERRED", "STALE")}
+    counts["total"] = len(active)
+    counts["confirmed_duplicate"] = sum(
+        row.get("status") == "REVIEWED" and isinstance(row.get("proposal"), dict)
+        and row["proposal"].get("decision") == "same_component" for row in active)
+    counts["complete"] = bool(active) and counts["reviewed"] == counts["total"]
+    return counts
+
+
+def _claim_duplicate_pair_page(candidates: list[dict], queue: dict, *, limit: int = 12) -> list[dict]:
+    """Claim a bounded page; leave all unclaimed candidates resumable as DEFERRED."""
+    records = queue.setdefault("pairs", {})
+    selected = []
+    retryable = [candidate for candidate in candidates
+                 if records.get(_duplicate_pair_id(candidate), {}).get("status") == "FAILED"]
+    deferred = [candidate for candidate in candidates
+                if records.get(_duplicate_pair_id(candidate), {}).get("status") in {"PENDING", "DEFERRED"}]
+    ordered_candidates = [*retryable, *deferred]
+    for candidate in ordered_candidates:
+        pair_id = _duplicate_pair_id(candidate)
+        record = records.get(pair_id, {})
+        if record.get("status") not in {"PENDING", "DEFERRED", "FAILED"}:
+            continue
+        if len(selected) >= max(0, limit):
+            if record.get("status") in {"PENDING", "DEFERRED"}:
+                record["status"] = "DEFERRED"
+            continue
+        record["status"] = "RUNNING"
+        record["attempts"] = int(record.get("attempts", 0)) + 1
+        selected.append(candidate)
+    selected_ids = {_duplicate_pair_id(candidate) for candidate in selected}
+    for candidate in candidates:
+        pair_id = _duplicate_pair_id(candidate)
+        record = records.get(pair_id, {})
+        if pair_id not in selected_ids and record.get("status") in {"PENDING", "DEFERRED"}:
+            record["status"] = "DEFERRED"
+    return selected
+
+
+def _review_duplicate_pair_page(client: Any, *, image_bytes: bytes, detections: list[dict],
+                                pairs: list[dict], ocr_records: list[dict] | None = None,
+                                progress: Any = None) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Review pair crops one at a time so a valid answer cannot be omitted in a large JSON response."""
+    from circuitcare.vision.ai_review_service import DEFAULT_REVIEW_MODEL, review_components_with_qwen
+
+    indexed = {str(row.get("detection_id") or row.get("component_id")): row for row in detections}
+    completed, failed = {}, {}
+    for index, pair in enumerate(pairs, start=1):
+        pair_id = _duplicate_pair_id(pair)
+        ids = sorted(pair_id.split("|")) if pair_id else []
+        if len(ids) != 2 or any(item not in indexed for item in ids):
+            failed[pair_id] = {"stage": "qwen_validation", "error": "중복 후보 ID가 현재 탐지 목록에 없습니다."}
+            continue
+        _write_analysis_status(progress, f"Qwen 중복 후보 검토 · {index}/{len(pairs)}쌍")
+        try:
+            result = review_components_with_qwen(
+                client, DEFAULT_REVIEW_MODEL, image_bytes, [indexed[item] for item in ids],
+                ocr_records or [], duplicate_pair_candidates=[pair], duplicate_pairs_only=True,
+            )
+            proposal = next((item for item in result.get("duplicate_reviews", [])
+                            if sorted(map(str, item.get("detection_ids", []))) == ids), None)
+            if not isinstance(proposal, dict):
+                raise RuntimeError("Qwen duplicate response did not include the requested pair.")
+            completed[pair_id] = proposal
+        except Exception as exc:
+            failed[pair_id] = {"stage": getattr(exc, "stage", "qwen"), "error": str(exc)[:500]}
+    return completed, failed
+
+
 def _marking_ocr_targets(rows: list[dict], limit: int = 12) -> list[dict]:
     eligible = [row for row in rows if row.get("상태") != "제외"
                 and row.get("소자 종류") in {"ic", "resistor", "transistor", "diode", "connector"}]
@@ -164,7 +297,9 @@ def _write_analysis_status(progress: Any, message: str) -> None:
 def _ollama_review_client() -> Any:
     """Reuse the local Ollama transport across reruns and review batches."""
     from circuitcare.local_llm import OllamaClient
-    return OllamaClient(timeout_seconds=300, num_predict=4096)
+    # Structured per-box fields, OCR evidence and split proposals can exceed a
+    # 4096-token completion even for a six-box batch on Qwen3.5 9B.
+    return OllamaClient(timeout_seconds=300, num_predict=8192)
 
 
 def invalidate_qwen_review(state: Any, scope: str) -> None:
@@ -316,11 +451,37 @@ def qwen_cleanup_disposition(
         return "REVIEW_REQUIRED", "지원하지 않는 정리 판정"
     if decision == "not_component" and proposal.get("proposed_class") != "not_component":
         return "REVIEW_REQUIRED", "오탐으로 확인된 종류 제안이 아님"
-    if isinstance(validation, dict) and validation.get("validated") is True:
-        # Explicitly versioned, externally measured policy is required before
-        # this branch can be enabled; it is intentionally unset in this repo.
+    if not str(proposal.get("visual_evidence") or proposal.get("evidence") or "").strip():
+        return "REVIEW_REQUIRED", "박스 자체의 시각 근거가 기록되지 않음"
+    if isinstance(validation, dict) and _cleanup_validation_passes(validation, decision):
         return "AUTO_EXCLUDED", "검증된 자동 정리 정책 통과"
     return "REVIEW_REQUIRED", "실제 데이터로 검증된 자동 정리 기준이 없어 사용자 확인 필요"
+
+
+def _cleanup_validation_passes(validation: dict, decision: str) -> bool:
+    """Require an independently measured, versioned safety policy for auto-exclusion."""
+    if (validation.get("validated") is not True
+            or not str(validation.get("policy_version") or "").strip()
+            or not str(validation.get("independent_dataset_fingerprint") or "").strip()
+            or validation.get("evaluation_mode") != "REAL_LABELED_PCB"):
+        return False
+    metrics = validation.get("metrics")
+    if not isinstance(metrics, dict) or int(metrics.get("sample_count", 0) or 0) < 1:
+        return False
+    def metric(name: str, default: float) -> float:
+        try:
+            return float(metrics[name])
+        except (KeyError, TypeError, ValueError):
+            return default
+    if decision == "same_component":
+        return (metric("duplicate_precision_lower_bound", 0) >= .995
+                and metric("normal_component_exclusion_rate_upper_bound", 1) <= .001
+                and metric("group_or_connector_false_exclusion_rate_upper_bound", 1) <= .001)
+    if decision == "not_component":
+        return (metric("false_positive_precision_lower_bound", 0) >= .995
+                and metric("normal_component_exclusion_rate_upper_bound", 1) <= .001
+                and metric("ocr_conflict_false_exclusion_rate_upper_bound", 1) <= .001)
+    return False
 
 
 @st.cache_resource(show_spinner=False)
@@ -543,7 +704,7 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                       "review_batches": []}
             batch_cache_key = f"cc_component_qwen_batches_{scope}"
             batch_cache = st_api.session_state.setdefault(batch_cache_key, {})
-            batches = _review_detection_batches(detections)
+            batches = _review_detection_batches(detections, batch_size=6)
             failed_batches = []
             for batch_index, batch in enumerate(batches, start=1):
                 _write_analysis_status(progress, f"Qwen 소자 검수 · {batch_index}/{len(batches)} 배치 진행 중")
@@ -589,55 +750,68 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                 "|".join(sorted(map(str, row.get("detection_ids", []))))
                 for row in review["duplicate_reviews"] if len(row.get("detection_ids", [])) == 2
             }
-            pair_fingerprint = hashlib.sha256(json.dumps({
-                "image": image_fingerprint, "pairs": [
-                    [sorted(str(row.get("detection_id")) for row in pair["detections"]),
-                     [row.get("bbox_xyxy") for row in pair["detections"]]]
-                    for pair in all_pairs],
-                "model": DEFAULT_REVIEW_MODEL, "schema": "qwen-review-v2-board-pairs",
-            }, sort_keys=True, default=str).encode()).hexdigest()
-            pair_cache = st_api.session_state.setdefault(f"cc_component_qwen_pair_queue_{scope}", {})
-            pair_state = pair_cache.setdefault(pair_fingerprint, {"reviewed_pair_ids": [], "reviews": []})
-            reviewed_pair_ids = set(pair_state.get("reviewed_pair_ids", []))
-            pending_pairs = _pending_duplicate_pair_candidates(
-                all_pairs, reviewed_pair_ids | batch_reviewed_pair_ids, limit=12,
+            pair_queue_key = f"cc_component_qwen_pair_queue_{scope}"
+            pair_queue = _sync_duplicate_pair_queue(
+                all_pairs, st_api.session_state.get(pair_queue_key),
+                image_fingerprint=image_fingerprint, model=DEFAULT_REVIEW_MODEL,
             )
+            for candidate in all_pairs:
+                pair_id = _duplicate_pair_id(candidate)
+                if pair_id in batch_reviewed_pair_ids:
+                    record = pair_queue["pairs"].get(pair_id, {})
+                    record.update({"status": "REVIEWED", "proposal": next((row for row in review["duplicate_reviews"]
+                        if _duplicate_pair_id({"detections": tuple({"detection_id": item}
+                                                                    for item in row.get("detection_ids", []))})
+                        == pair_id), None), "error": None})
+            pair_records = pair_queue["pairs"]
+            pending_pairs = _claim_duplicate_pair_page(all_pairs, pair_queue, limit=12)
             pair_error = None
             if pending_pairs:
-                try:
-                    pair_detection_ids = {str(row.get("detection_id"))
-                                          for pair in pending_pairs for row in pair["detections"]}
-                    pair_detections = [row for row in indexed_detections
-                                       if str(row.get("detection_id")) in pair_detection_ids]
-                    pair_review = review_components_with_qwen(
-                        ollama, DEFAULT_REVIEW_MODEL, image_bytes, pair_detections,
-                        (ocr_result or {}).get("records", []), duplicate_pair_candidates=pending_pairs,
-                    )
-                    for proposal in pair_review.get("duplicate_reviews", []):
-                        pair_id = "|".join(sorted(map(str, proposal.get("detection_ids", []))))
-                        if pair_id:
-                            pair_state["reviewed_pair_ids"].append(pair_id)
-                            pair_state["reviews"].append(proposal)
-                    pair_state["reviewed_pair_ids"] = sorted(set(pair_state["reviewed_pair_ids"]))
-                    pair_cache[pair_fingerprint] = pair_state
-                    st_api.session_state[f"cc_component_qwen_pair_queue_{scope}"] = pair_cache
-                except Exception as pair_exc:
-                    pair_error = str(pair_exc)[:500]
-                    failed_batches.append({"batch": "board-wide duplicate pairs", "detection_ids": [],
-                        "status": "failed", "stage": "qwen", "error": pair_error})
-            review["duplicate_reviews"].extend(pair_state.get("reviews", []))
+                reviewed_pairs, failed_pairs = _review_duplicate_pair_page(
+                    ollama, image_bytes=image_bytes, detections=indexed_detections,
+                    pairs=pending_pairs, ocr_records=(ocr_result or {}).get("records", []),
+                    progress=progress,
+                )
+                for candidate in pending_pairs:
+                    pair_id = _duplicate_pair_id(candidate)
+                    record = pair_records[pair_id]
+                    if pair_id in reviewed_pairs:
+                        record.update({"status": "REVIEWED", "proposal": reviewed_pairs[pair_id],
+                                       "error": None, "error_stage": None})
+                    else:
+                        failure = failed_pairs.get(pair_id, {"stage": "qwen", "error": "Qwen pair review failed."})
+                        record.update({"status": "FAILED", "error": failure["error"],
+                                       "error_stage": failure["stage"]})
+                if failed_pairs:
+                    pair_error = f"{len(failed_pairs)}개 중복 후보 검토 실패"
+                    failed_batches.extend({"batch": "board-wide duplicate pairs", "detection_ids": pair_id.split("|"),
+                        "status": "failed", "stage": failure["stage"], "error": failure["error"]}
+                        for pair_id, failure in failed_pairs.items())
+            st_api.session_state[pair_queue_key] = pair_queue
+            pair_summary = _duplicate_pair_queue_summary(pair_queue)
+            pair_reviews = [record["proposal"] for pair_id, record in pair_records.items()
+                            if pair_id in pair_queue.get("candidate_ids", [])
+                            and record.get("status") == "REVIEWED" and isinstance(record.get("proposal"), dict)]
+            merged_duplicate_reviews = {"|".join(sorted(map(str, row.get("detection_ids", [])))): row
+                                        for row in [*review["duplicate_reviews"], *pair_reviews]}
+            review["duplicate_reviews"] = list(merged_duplicate_reviews.values())
             cross_batch_count = sum(
                 membership.get(str(pair["detections"][0].get("detection_id")))
                 != membership.get(str(pair["detections"][1].get("detection_id")))
                 for pair in all_pairs
             )
-            all_reviewed_pair_ids = (set(pair_state.get("reviewed_pair_ids", []))
-                                     | batch_reviewed_pair_ids)
             review["review_diagnostics"]["cross_batch_duplicate_search"] = {
-                "status": "failed" if pair_error else "complete",
+                "status": ("failed" if pair_error or pair_summary["failed"] else
+                           "complete" if pair_summary["complete"] else "pending"),
                 "candidate_count": len(all_pairs), "cross_batch_candidate_count": cross_batch_count,
-                "reviewed_count": len(all_reviewed_pair_ids),
-                "deferred_count": max(0, len(all_pairs) - len(all_reviewed_pair_ids)),
+                "reviewed_count": pair_summary["reviewed"],
+                "pending_count": pair_summary["pending"],
+                "running_count": pair_summary["running"],
+                "failed_count": pair_summary["failed"],
+                "deferred_count": pair_summary["deferred"],
+                "stale_count": pair_summary["stale"],
+                "confirmed_duplicate_count": pair_summary["confirmed_duplicate"],
+                "complete": pair_summary["complete"],
                 "error": pair_error,
             }
             review["failed_batches"] = failed_batches
@@ -658,7 +832,7 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                 "duplicate_pair_search": {"status": "complete",
                                           "pair_count": sum(row["duplicate_pair_crop_count"]
                                                             for row in review["review_batches"])
-                                                      + len(pair_state.get("reviews", [])),
+                                                      + pair_summary["reviewed"],
                                           "items": duplicate_items[:240]},
                 "qwen": {"status": ("failed" if any(row.get("stage") in {"qwen", "qwen_validation"}
                                                         for row in failed_batches)
@@ -732,6 +906,113 @@ def ensure_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
         return "failed" if result.get("verification_status") in {
             "AI_REVIEW_FAILED", "AI_REVIEW_PARTIAL"} else "complete"
     return "unavailable"
+
+
+def continue_duplicate_pair_review(st_api: Any, *, image_bytes: bytes, scope: str,
+                                   rows: list[dict], ocr_result: dict | None = None,
+                                   progress: Any = None) -> dict[str, Any]:
+    """Review the next bounded duplicate-pair page without rerunning OCR or class review."""
+    from circuitcare.vision.ai_review_service import DEFAULT_REVIEW_MODEL, review_components_with_qwen
+
+    image_fingerprint = hashlib.sha256(image_bytes).hexdigest()
+    indexed = [dict(row, detection_id=str(row.get("component_id") or row.get("detection_id")))
+               for row in rows if row.get("상태") != "제외"]
+    candidates = _duplicate_pair_candidates(indexed, limit=None)
+    queue_key = f"cc_component_qwen_pair_queue_{scope}"
+    queue = _sync_duplicate_pair_queue(candidates, st_api.session_state.get(queue_key),
+                                       image_fingerprint=image_fingerprint,
+                                       model=DEFAULT_REVIEW_MODEL)
+    records = queue["pairs"]
+    pending = _claim_duplicate_pair_page(candidates, queue, limit=12)
+    if not pending:
+        st_api.session_state[queue_key] = queue
+        return _duplicate_pair_queue_summary(queue)
+
+    status = progress or st_api.status("Qwen 중복 후보 검토 중", expanded=True)
+    status.write(f"중복 후보 추가 배치 처리 중 · {len(pending)}쌍")
+    client_error = None
+    client = None
+    try:
+        client = _ollama_review_client()
+        vision_check = getattr(client, "model_supports_vision", None)
+        if callable(vision_check) and not vision_check(DEFAULT_REVIEW_MODEL):
+            raise RuntimeError(f"{DEFAULT_REVIEW_MODEL} 모델이 Ollama에서 vision 기능을 선언하지 않았습니다.")
+    except Exception as exc:
+        client_error = {"stage": getattr(exc, "stage", "qwen"), "error": str(exc)[:500]}
+    if client_error:
+        reviewed_pairs, failed_pairs = {}, {_duplicate_pair_id(pair): client_error for pair in pending}
+    else:
+        reviewed_pairs, failed_pairs = _review_duplicate_pair_page(
+            client, image_bytes=image_bytes, detections=indexed, pairs=pending,
+            ocr_records=(ocr_result or {}).get("records", []), progress=status,
+        )
+    for pair in pending:
+        pair_id = _duplicate_pair_id(pair)
+        if pair_id in reviewed_pairs:
+            records[pair_id].update({"status": "REVIEWED", "proposal": reviewed_pairs[pair_id],
+                                     "error": None, "error_stage": None})
+        else:
+            failure = failed_pairs.get(pair_id, {"stage": "qwen", "error": "Qwen pair review failed."})
+            records[pair_id].update({"status": "FAILED", "error": failure["error"],
+                                     "error_stage": failure["stage"]})
+    if failed_pairs:
+        status.write(f"중복 후보 검토 실패 · {len(failed_pairs)}쌍 · 실패 항목은 재시도할 수 있습니다.")
+    st_api.session_state[queue_key] = queue
+    summary = _duplicate_pair_queue_summary(queue)
+    qwen_key = review_aux_keys(scope)[1]
+    review = st_api.session_state.get(qwen_key)
+    if isinstance(review, dict):
+        valid_pair_ids = set(queue["candidate_ids"])
+        previous = [proposal for proposal in review.get("duplicate_reviews", [])
+                    if _duplicate_pair_id({"detections": tuple({"detection_id": item}
+                        for item in proposal.get("detection_ids", []))}) in valid_pair_ids]
+        merged = {"|".join(sorted(map(str, proposal.get("detection_ids", [])))): proposal
+                  for proposal in previous}
+        for pair_id in queue["candidate_ids"]:
+            proposal = records[pair_id].get("proposal")
+            if records[pair_id].get("status") == "REVIEWED" and isinstance(proposal, dict):
+                merged[pair_id] = proposal
+        review["duplicate_reviews"] = list(merged.values())
+        review.setdefault("review_diagnostics", {})["cross_batch_duplicate_search"] = {
+            "status": "complete" if summary["complete"] else "failed" if summary["failed"] else "pending",
+            "candidate_count": summary["total"],
+            "reviewed_count": summary["reviewed"], "pending_count": summary["pending"],
+            "running_count": summary["running"], "failed_count": summary["failed"],
+            "deferred_count": summary["deferred"], "stale_count": summary["stale"],
+            "confirmed_duplicate_count": summary["confirmed_duplicate"],
+            "complete": summary["complete"],
+            "failed_items": [{"pair_id": pair_id, "stage": records[pair_id].get("error_stage", "qwen"),
+                              "error": records[pair_id].get("error")}
+                             for pair_id in queue["candidate_ids"]
+                             if records[pair_id].get("status") == "FAILED"][:12],
+        }
+        pair_failure_batch = {"batch": "board-wide duplicate pairs", "detection_ids": [],
+                              "status": "failed", "stage": "qwen",
+                              "error": "Qwen 중복 후보 응답을 검증하지 못했습니다."}
+        existing_failed = [row for row in review.get("failed_batches", [])
+                           if row.get("batch") != "board-wide duplicate pairs"]
+        if summary["failed"]:
+            first_failed = next((records[pair_id] for pair_id in queue["candidate_ids"]
+                                 if records[pair_id].get("status") == "FAILED"), {})
+            pair_failure_batch.update({"stage": first_failed.get("error_stage", "qwen"),
+                                       "error": first_failed.get("error") or pair_failure_batch["error"]})
+            review["failed_batches"] = [*existing_failed, pair_failure_batch]
+            review["verification_status"] = "AI_REVIEW_PARTIAL"
+        else:
+            review["failed_batches"] = existing_failed
+            review["verification_status"] = "AI_REVIEW_PARTIAL" if existing_failed else "AI_SUGGESTIONS_ONLY"
+        st_api.session_state[qwen_key] = review
+    if summary["failed"]:
+        status.update(label="중복 후보 일부 검토 실패 · 실패 항목을 다시 시도할 수 있습니다.",
+                      state="error", expanded=True)
+    elif summary["complete"]:
+        status.update(label=f"중복 후보 검토 완료 · {summary['reviewed']}/{summary['total']}쌍",
+                      state="complete", expanded=False)
+    else:
+        status.update(label=(f"중복 후보 추가 배치 완료 · 검토 {summary['reviewed']}/{summary['total']}쌍 · "
+                             f"대기 {summary['pending'] + summary['deferred']}쌍"),
+                      state="complete", expanded=False)
+    return summary
 
 
 def _make_group_child_row(scope: str, parent_id: str, index: int, proposal: dict,
@@ -808,8 +1089,20 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
     st_api.caption(f"박스 {len(rows)}개 · 확인 {sum(row.get('상태') == '확인' for row in rows)}개 · 제외 {sum(row.get('상태') == '제외' for row in rows)}개")
     ocr_key, qwen_key = review_aux_keys(scope)
     if st_api.button("AI 소자 검수", key=f"cc_component_ai_review_{scope}", type="primary"):
-        _run_ai_review_workflow(st_api, image_bytes=image_bytes, scope=scope, rows=rows,
-            records_key=records_key, ocr_key=ocr_key, qwen_key=qwen_key)
+        with st_api.status("AI 소자 검수 중", expanded=True) as progress:
+            _run_ai_review_workflow(st_api, image_bytes=image_bytes, scope=scope, rows=rows,
+                records_key=records_key, ocr_key=ocr_key, qwen_key=qwen_key, progress=progress)
+            qwen_result = st_api.session_state.get(qwen_key, {})
+            failed = bool(qwen_result.get("failed_batches"))
+            duplicate_state = qwen_result.get("review_diagnostics", {}).get("cross_batch_duplicate_search", {})
+            if failed:
+                progress.update(label="AI 소자 검수 일부 실패 · 성공한 결과와 사용자 기록은 보존됩니다.",
+                                state="error", expanded=True)
+            elif duplicate_state.get("complete") is False and duplicate_state.get("candidate_count", 0):
+                progress.update(label="소자 검수 완료 · 중복 후보 추가 배치 검토가 남아 있습니다.",
+                                state="complete", expanded=True)
+            else:
+                progress.update(label="AI 소자 검수 완료", state="complete", expanded=False)
         st_api.rerun()
     with st_api.expander("개별 실행 · 고급", expanded=False):
         st_api.caption("OCR와 Qwen 결과는 제안으로만 저장합니다. 소자 종류 수정·박스 추가·중복 제외는 사용자가 선택해야 합니다.")
@@ -889,8 +1182,35 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         st_api.caption(f"{item.get('stage')} · {item.get('component_id', item.get('parent_id', ''))} · {item.get('reason')}")
             st_api.caption(f"제안 모델 · {qwen_review.get('model', 'Qwen Vision')} · 상태 {qwen_review.get('verification_status', 'AI_SUGGESTIONS_ONLY')} · {len(qwen_review.get('review_batches', []))}개 배치 · 1024px 고해상도 타일 {qwen_review.get('review_tiles', 0)}개 · 모든 AI 제안은 미확인")
             cross_batch = diagnostics.get("cross_batch_duplicate_search", {})
-            if cross_batch.get("candidate_count"):
-                st_api.caption(f"보드 전체 중복 후보 {cross_batch.get('candidate_count')} · 배치 경계 {cross_batch.get('cross_batch_candidate_count')} · 검토 {cross_batch.get('reviewed_count')} · 다음 검수 대기 {cross_batch.get('deferred_count')}")
+            pair_queue = st_api.session_state.get(f"cc_component_qwen_pair_queue_{scope}", {})
+            pair_summary = _duplicate_pair_queue_summary(pair_queue) if pair_queue.get("version") == 2 else {
+                "total": int(cross_batch.get("candidate_count", 0)),
+                "reviewed": int(cross_batch.get("reviewed_count", 0)),
+                "pending": int(cross_batch.get("pending_count", 0)),
+                "running": int(cross_batch.get("running_count", 0)),
+                "failed": int(cross_batch.get("failed_count", 0)),
+                "deferred": int(cross_batch.get("deferred_count", 0)),
+                "confirmed_duplicate": int(cross_batch.get("confirmed_duplicate_count", 0)),
+                "complete": bool(cross_batch.get("complete", False)),
+            }
+            if pair_summary["total"] or cross_batch.get("candidate_count"):
+                pair_label = ("전체 중복 후보 검토 완료" if pair_summary["complete"] else
+                              "중복 후보 검토 실패" if pair_summary["failed"] else "중복 후보 검토 진행 중")
+                st_api.caption(f"{pair_label} · 후보 {pair_summary['total']}쌍 · 검토 완료 {pair_summary['reviewed']} · "
+                               f"대기 {pair_summary['pending'] + pair_summary['deferred']} · 실패 {pair_summary['failed']} · "
+                               f"중복 제안 {pair_summary['confirmed_duplicate']} · 배치 경계 {cross_batch.get('cross_batch_candidate_count', 0)}")
+                for failed_pair in cross_batch.get("failed_items", [])[:4]:
+                    st_api.caption(f"중복 후보 검토 실패 · {failed_pair.get('pair_id')} · "
+                                   f"{failed_pair.get('stage')} · {failed_pair.get('error')}")
+                remaining = pair_summary["pending"] + pair_summary["deferred"] + pair_summary["failed"]
+                if remaining and st_api.button(
+                        f"{'실패 포함 ' if pair_summary['failed'] else ''}남은 중복 후보 검토 · {remaining}쌍",
+                        key=f"cc_component_continue_duplicate_review_{scope}"):
+                    with st_api.status("Qwen 중복 후보 검토 중", expanded=True) as duplicate_progress:
+                        continue_duplicate_pair_review(
+                            st_api, image_bytes=image_bytes, scope=scope, rows=rows,
+                            ocr_result=ocr_result, progress=duplicate_progress)
+                    st_api.rerun()
             false_positive_count = sum(row.get("proposed_class") == "not_component"
                                         for row in qwen_review.get("class_reviews", []))
             duplicate_count = sum(row.get("decision") == "same_component"
@@ -995,8 +1315,18 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 if not geometric_duplicate:
                     st_api.warning("박스 위치·크기 관계가 중복 근거와 맞지 않습니다. Qwen 제안만으로는 제외할 수 없습니다.")
                 protected = any(row.get("상태") == "확인" or row.get("user_edited") for row in pair_rows)
+                group_member_ids = set()
+                for group in qwen_review.get("group_reviews", []):
+                    group_member_ids.add(str(group.get("parent_id") or ""))
+                    group_member_ids.update(str(value) for value in group.get("child_ids", []))
+                is_group_pair = any(str(component_id) in group_member_ids for component_id in ids)
+                has_conflict = any(bool(row.get("qwen_conflicting_evidence")
+                                       or row.get("ocr_conflicts")
+                                       or (row.get("ai_review") or {}).get("conflicting_evidence"))
+                                   for row in pair_rows)
                 cleanup_status, cleanup_reason = qwen_cleanup_disposition(
                     proposal, protected=protected, geometry_valid=geometric_duplicate,
+                    has_conflict=has_conflict, is_group=is_group_pair,
                 )
                 st_api.caption(f"중복 정리 상태 · {cleanup_status} · {cleanup_reason}")
                 can_exclude = duplicate_exclusion_enabled(proposal, left_box, right_box, protected=protected)
