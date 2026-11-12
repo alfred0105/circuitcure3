@@ -165,6 +165,13 @@ def render_component_viewer(
                     and viewer_status.get("image_size_px") == list(image_size_px)
                     and isinstance(viewer_status.get("event_id"), str)
                     and bool(viewer_status.get("event_id"))):
+                ready_event_key = f"{mount_status_key}_last_event"
+                if st.session_state.get(ready_event_key) != viewer_status["event_id"]:
+                    st.session_state[ready_event_key] = viewer_status["event_id"]
+                    events = st.session_state.setdefault("cc_performance_events", [])
+                    events.append({"stage": "viewer_image_ready", "status": "complete",
+                                   "asset_key_hash": hashlib.sha256(expected_asset_key.encode()).hexdigest()[:12]})
+                    del events[:-50]
                 st.session_state[mount_status_key] = "READY"
         event = None
         if isinstance(result, dict):
@@ -295,9 +302,12 @@ def render_component_viewer(
     )
     result_processed = handle_selection_change(result)
     if result_processed:
-        LOGGER.info("pcb_selection stage=python_render_apply viewer=%s forcing_panel_rerender=true",
+        # Components v2 setStateValue()/setTriggerValue() already schedule a
+        # Streamlit rerun. Apply the returned value as a late-callback fallback,
+        # but do not force another full rerun here; doing so flashes the page
+        # and remounts the Viewer after every click.
+        LOGGER.info("pcb_selection stage=python_render_apply viewer=%s rerun_source=component_state",
                     viewer_key)
-        st.rerun()
     current = st.session_state.get(SELECTION_KEY)
     LOGGER.debug("pcb_selection stage=render_result viewer=%s result_type=%s selected_state=%s",
                  viewer_key, type(result).__name__, getattr(current, "selected_component", None))

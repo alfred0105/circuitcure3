@@ -150,33 +150,63 @@ export default function(component) {
     tooltip.style.top = `${Math.max(8, event.clientY - rect.top + 12)}px`;
   };
   const renderRegions = () => {
-    layer.replaceChildren();
-    const fragment = document.createDocumentFragment();
-    for (const item of data.components || []) {
-      const [x1,y1,x2,y2] = item.bbox_xyxy;
-      const shape = svgElement("rect", { x:x1, y:y1, width:x2-x1, height:y2-y1,
-        class:`cc-pcb-component${item.component_id === (state.selectedComponentId !== undefined ? state.selectedComponentId : data.selected_component_id) ? " cc-selected" : ""}${item.overlay_status === "EXCLUDED" ? " cc-excluded" : ""}${item.overlay_source === "qwen_suggestion" ? " cc-ai-suggested" : item.overlay_source === "yolo_second_pass" ? " cc-second-pass" : item.overlay_source === "manual" ? " cc-manual-box" : ""}${item.fault_candidate_status === "SUSPECTED_FAULT" ? " cc-fault-suspected" : item.fault_candidate_status === "RELATED_COMPONENT" ? " cc-fault-related" : item.fault_candidate_status === "CONFIRMED_FAULT" ? " cc-fault-confirmed" : item.fault_candidate_status === "FAULT_SUPPORTED" ? " cc-fault-supported" : item.fault_candidate_status === "FAULT_REFUTED" ? " cc-fault-refuted" : item.fault_candidate_status === "INCONCLUSIVE" ? " cc-fault-inconclusive" : ""}`,
-        "data-component-id":item.component_id, tabindex:"0", role:"button",
-        "aria-label":`${item.display_label || item.component_type} 부품 선택` });
-      shape.classList.toggle("cc-fault-conflicted", item.fault_candidate_status === "CONFLICTED");
-      fragment.appendChild(shape);
-      if (item.fault_candidate_status === "CONFLICTED") {
-        const conflict = svgElement("text", { x:x1+4, y:y1+14, class:"cc-pcb-conflict-icon" });
-        conflict.textContent = "⚠";
-        fragment.appendChild(conflict);
-      }
-      if (item.display_label) {
-        const label = svgElement("text", { x:(x1+x2)/2, y:Math.max(12,y1-4), class:"cc-pcb-label" });
-        label.textContent = item.display_label; fragment.appendChild(label);
+    const components = data.components || [];
+    const selectedId = state.selectedComponentId !== undefined
+      ? state.selectedComponentId : data.selected_component_id;
+    if (!state.regionNodes) state.regionNodes = new Map();
+    const desired = new Set(components.map((item) => item.component_id));
+    for (const [id, entry] of state.regionNodes) {
+      if (!desired.has(id)) {
+        for (const node of entry.nodes) node.remove();
+        state.regionNodes.delete(id);
       }
     }
-    layer.appendChild(fragment);
+    for (const item of components) {
+      const id = item.component_id;
+      const [x1,y1,x2,y2] = item.bbox_xyxy;
+      const visualKey = JSON.stringify([item.bbox_xyxy, item.display_label, item.component_type,
+        item.overlay_status, item.overlay_source, item.fault_candidate_status]);
+      let entry = state.regionNodes.get(id);
+      if (!entry) {
+        const shape = svgElement("rect", { "data-component-id":id, tabindex:"0", role:"button" });
+        const label = svgElement("text", { class:"cc-pcb-label" });
+        const conflict = svgElement("text", { class:"cc-pcb-conflict-icon" });
+        layer.append(shape, label, conflict);
+        entry = { nodes:[shape,label,conflict], shape, label, conflict, visualKey:null };
+        state.regionNodes.set(id, entry);
+      }
+      if (entry.visualKey !== visualKey) {
+        const shape = entry.shape;
+        shape.setAttribute("x", String(x1)); shape.setAttribute("y", String(y1));
+        shape.setAttribute("width", String(x2-x1)); shape.setAttribute("height", String(y2-y1));
+        shape.setAttribute("aria-label", `${item.display_label || item.component_type} 부품 선택`);
+        const classes = ["cc-pcb-component"];
+        if (item.overlay_status === "EXCLUDED") classes.push("cc-excluded");
+        if (item.overlay_source === "qwen_suggestion") classes.push("cc-ai-suggested");
+        if (item.overlay_source === "yolo_second_pass") classes.push("cc-second-pass");
+        if (item.overlay_source === "manual") classes.push("cc-manual-box");
+        const faultClass = { SUSPECTED_FAULT:"cc-fault-suspected", RELATED_COMPONENT:"cc-fault-related",
+          CONFIRMED_FAULT:"cc-fault-confirmed", FAULT_SUPPORTED:"cc-fault-supported",
+          FAULT_REFUTED:"cc-fault-refuted", INCONCLUSIVE:"cc-fault-inconclusive" }[item.fault_candidate_status];
+        if (faultClass) classes.push(faultClass);
+        if (item.fault_candidate_status === "CONFLICTED") classes.push("cc-fault-conflicted");
+        shape.setAttribute("class", classes.join(" "));
+        entry.label.setAttribute("x", String((x1+x2)/2));
+        entry.label.setAttribute("y", String(Math.max(12,y1-4)));
+        entry.label.textContent = item.display_label || "";
+        entry.conflict.setAttribute("x", String(x1+4));
+        entry.conflict.setAttribute("y", String(y1+14));
+        entry.conflict.textContent = item.fault_candidate_status === "CONFLICTED" ? "⚠" : "";
+        entry.visualKey = visualKey;
+      }
+      entry.shape.classList.toggle("cc-selected", id === selectedId);
+    }
     const statusLabel = root.querySelector("[data-status-label]");
     if (statusLabel) {
-      const selected = (data.components || []).find((item) => item.component_id === data.selected_component_id);
+      const selected = components.find((item) => item.component_id === selectedId);
       statusLabel.textContent = selected
         ? `선택 ${selected.display_label || selected.component_type} · ${selected.component_id}`
-        : `박스 ${(data.components || []).length}개 · 클릭하여 선택`;
+        : `박스 ${components.length}개 · 클릭하여 선택`;
     }
   };
   const setImage = () => {

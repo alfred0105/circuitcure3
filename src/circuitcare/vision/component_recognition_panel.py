@@ -4,10 +4,12 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from functools import lru_cache
 import importlib.util
 import io
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,7 @@ from circuitcare.vision.ai_review_service import (
 from circuitcare.frontend.measurement_state import invalidate_legacy_diagnosis
 from circuitcare.analysis.models import AnalysisScope
 from circuitcare.analysis.state_manager import invalidate_analysis
+from circuitcare.vision.ai_review_jobs import submit_ai_review
 from circuitcare.frontend.workbench_state import ACTIVE_PHOTO_KEY
 
 APP_DIR = Path(__file__).resolve().parents[3] / "apps" / "pcb-component-recognition"
@@ -293,9 +296,15 @@ def _write_analysis_status(progress: Any, message: str) -> None:
         progress.write(message)
 
 
-@st.cache_resource(show_spinner=False)
+def _record_vision_metric(state: Any, stage: str, duration_ms: float, status: str) -> None:
+    events = state.setdefault("cc_performance_events", [])
+    events.append({"stage": stage, "duration_ms": round(duration_ms, 2), "status": status})
+    del events[:-50]
+
+
+@lru_cache(maxsize=1)
 def _ollama_review_client() -> Any:
-    """Reuse the local Ollama transport across reruns and review batches."""
+    """Reuse the thread-safe local transport without invoking Streamlit in workers."""
     from circuitcare.local_llm import OllamaClient
     # Structured per-box fields, OCR evidence and split proposals can exceed a
     # 4096-token completion even for a six-box batch on Qwen3.5 9B.
@@ -542,11 +551,14 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
     if cleaned_rows != old_rows:
         st_api.session_state[records_key] = cleaned_rows
     if result_key in st_api.session_state:
+        _record_vision_metric(st_api.session_state, "yolo_detection", 0.0, "cache_hit")
         _write_analysis_status(progress, "YOLO 소자 탐지 · 재사용")
         return st_api.session_state[result_key], None
     if error_key in st_api.session_state:
+        _record_vision_metric(st_api.session_state, "yolo_detection", 0.0, "cached_failure")
         _write_analysis_status(progress, "YOLO 소자 탐지 · 이전 실행 실패")
         return None, st_api.session_state[error_key]
+    started = time.perf_counter()
     try:
         _write_analysis_status(progress, "YOLO 소자 탐지 · 진행 중")
         with st_api.spinner("선택한 PCB 사진에서 소자를 자동 탐지하고 있습니다…"):
@@ -565,9 +577,13 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
                                     x2 * scale_x, y2 * scale_y]
         st_api.session_state[result_key] = result
         _store_predictions(st_api.session_state, records_key, result)
+        _record_vision_metric(st_api.session_state, "yolo_detection",
+                              (time.perf_counter() - started) * 1000, "complete")
         _write_analysis_status(progress, f"YOLO 소자 탐지 · 완료 · {len(result.get('detections', []))}개")
         return result, None
     except Exception as exc:
+        _record_vision_metric(st_api.session_state, "yolo_detection",
+                              (time.perf_counter() - started) * 1000, "failed")
         st_api.session_state[error_key] = str(exc)
         _write_analysis_status(progress, f"YOLO 소자 탐지 · 실패 · {exc}")
         return None, str(exc)
@@ -735,7 +751,8 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                     str(row.get("component_id") or row.get("detection_id")) for row in batch], "status": "complete",
                     "image_count": partial.get("review_image_count", 0),
                     "review_tiles": partial.get("review_tiles", 0),
-                    "duplicate_pair_crop_count": partial.get("duplicate_pair_crop_count", 0)})
+                    "duplicate_pair_crop_count": partial.get("duplicate_pair_crop_count", 0),
+                    "ollama_metrics": partial.get("ollama_metrics", {})})
                 review["review_diagnostics"][f"batch_{batch_index}"] = partial.get("review_diagnostics", {})
             # Search the complete active detection set before considering batch
             # boundaries. Cross-batch pairs receive their own focused paired crops.
@@ -849,6 +866,12 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
             review["review_tiles"] = sum(row["review_tiles"] for row in review["review_batches"])
             review["duplicate_pair_crop_count"] = sum(row["duplicate_pair_crop_count"]
                                                        for row in review["review_batches"])
+            metric_names = ("total_duration_ns", "load_duration_ns", "prompt_eval_count",
+                            "prompt_eval_duration_ns", "eval_count", "eval_duration_ns")
+            review["ollama_metrics"] = {name: sum(
+                (row.get("ollama_metrics", {}).get(name) or 0) for row in review["review_batches"]
+                if isinstance(row.get("ollama_metrics", {}).get(name), (int, float)))
+                for name in metric_names}
         review["source_fingerprint"] = _review_fingerprint(rows, ocr_result)
         st_api.session_state[qwen_key] = review
         if failed_batches:
@@ -906,6 +929,39 @@ def ensure_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
         return "failed" if result.get("verification_status") in {
             "AI_REVIEW_FAILED", "AI_REVIEW_PARTIAL"} else "complete"
     return "unavailable"
+
+
+def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
+                              rows: list[dict], records_key: str,
+                              owner: str | None = None) -> tuple[str | None, str, str]:
+    """Queue OCR/Qwen review using only an allowlisted snapshot of session data."""
+    import secrets
+
+    state = st_api.session_state
+    session_owner_key = "cc_ai_review_session_owner"
+    token = state.setdefault(session_owner_key, secrets.token_urlsafe(20))
+    project_id = str(state.get("circuitcare_v2_current_project_id", "unknown-project"))
+    job_owner = owner or f"{token}|{project_id}"
+    fingerprint = _review_fingerprint(rows, None)
+    ocr_key, qwen_key = review_aux_keys(scope)
+    cached = state.get(qwen_key)
+    if isinstance(cached, dict) and cached.get("source_fingerprint") == _review_fingerprint(
+            rows, state.get(ocr_key)):
+        return None, "", "COMPLETE"
+    allowed = (records_key, ocr_key, qwen_key, f"cc_component_marking_ocr_{scope}",
+               f"cc_component_qwen_batches_{scope}", f"cc_component_qwen_pair_queue_{scope}")
+    worker_state = {key: deepcopy(state[key]) for key in allowed if key in state}
+    worker_state.pop(f"cc_ai_review_run_{scope}", None)
+    job_id, status = submit_ai_review(
+        owner=job_owner, scope=scope, fingerprint=fingerprint, image_bytes=image_bytes,
+        rows=rows, records_key=records_key, state_snapshot=worker_state,
+    )
+    if job_id:
+        state[f"cc_ai_review_job_{scope}"] = job_id
+        state[f"cc_ai_review_job_owner_{scope}"] = job_owner
+        state[f"cc_ai_review_job_fingerprint_{scope}"] = fingerprint
+        state[f"cc_ai_review_job_status_{scope}"] = status
+    return job_id, job_owner, status
 
 
 def continue_duplicate_pair_review(st_api: Any, *, image_bytes: bytes, scope: str,
@@ -1089,20 +1145,11 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
     st_api.caption(f"박스 {len(rows)}개 · 확인 {sum(row.get('상태') == '확인' for row in rows)}개 · 제외 {sum(row.get('상태') == '제외' for row in rows)}개")
     ocr_key, qwen_key = review_aux_keys(scope)
     if st_api.button("AI 소자 검수", key=f"cc_component_ai_review_{scope}", type="primary"):
-        with st_api.status("AI 소자 검수 중", expanded=True) as progress:
-            _run_ai_review_workflow(st_api, image_bytes=image_bytes, scope=scope, rows=rows,
-                records_key=records_key, ocr_key=ocr_key, qwen_key=qwen_key, progress=progress)
-            qwen_result = st_api.session_state.get(qwen_key, {})
-            failed = bool(qwen_result.get("failed_batches"))
-            duplicate_state = qwen_result.get("review_diagnostics", {}).get("cross_batch_duplicate_search", {})
-            if failed:
-                progress.update(label="AI 소자 검수 일부 실패 · 성공한 결과와 사용자 기록은 보존됩니다.",
-                                state="error", expanded=True)
-            elif duplicate_state.get("complete") is False and duplicate_state.get("candidate_count", 0):
-                progress.update(label="소자 검수 완료 · 중복 후보 추가 배치 검토가 남아 있습니다.",
-                                state="complete", expanded=True)
-            else:
-                progress.update(label="AI 소자 검수 완료", state="complete", expanded=False)
+        token = st_api.session_state.setdefault("cc_ai_review_session_owner", os.urandom(20).hex())
+        queue_ai_component_review(
+            st_api, image_bytes=image_bytes, scope=scope, rows=rows,
+            records_key=records_key, owner=f"{token}|{project_id}",
+        )
         st_api.rerun()
     with st_api.expander("개별 실행 · 고급", expanded=False):
         st_api.caption("OCR와 Qwen 결과는 제안으로만 저장합니다. 소자 종류 수정·박스 추가·중복 제외는 사용자가 선택해야 합니다.")

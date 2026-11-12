@@ -190,7 +190,7 @@ def test_exclusion_then_new_box_click_updates_local_and_board_selection_before_r
     assert state[BOARD_COMPONENT_SELECTION_KEY] == "bc-c2"
 
 
-def test_component_result_is_applied_even_when_callback_session_view_is_late(monkeypatch):
+def test_component_result_is_applied_without_forcing_a_second_rerun(monkeypatch):
     import circuitcare.dashboard.components.pcb_workspace as workspace
 
     reruns = []
@@ -215,7 +215,35 @@ def test_component_result_is_applied_even_when_callback_session_view_is_late(mon
         frame_id="photo1", selected_component_id=None, map_cache_key="map1", image_mode="원본 사진",
     )
     assert streamlit.session_state[SELECTION_KEY].selected_component == "c1"
-    assert reruns == [True]
+    assert reruns == []
+
+
+def test_ai_progress_slot_never_clears_the_pcb_viewer():
+    from circuitcare.dashboard.views.unified_workspace import _LeftProgressSlot
+
+    class _Slot:
+        def __init__(self):
+            self.cleared = False
+            self.container_value = object()
+
+        def empty(self):
+            self.cleared = True
+
+        def container(self):
+            return self.container_value
+
+    status_slot, viewer_slot = _Slot(), _Slot()
+    assert _LeftProgressSlot(status_slot, viewer_slot).container() is status_slot.container_value
+    assert viewer_slot.cleared is False
+
+
+def test_viewer_updates_regions_incrementally_without_replacing_svg_layer():
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "src/circuitcare/dashboard/components/assets/pcb_viewer.js").read_text()
+    assert "layer.replaceChildren()" not in source
+    assert "state.regionNodes = new Map()" in source
+    assert "entry.shape.classList.toggle(\"cc-selected\", id === selectedId)" in source
 
 
 def test_pcb_viewer_uses_shared_hit_test_from_real_click_and_does_not_capture_plain_click():
@@ -327,9 +355,11 @@ def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(mon
     state = {"circuitcare_v2_active_photo_id": "photo-1",
              "circuitcare_v2_photo_choice": "photo-1"}
     st = SimpleNamespace(session_state=state, status=lambda *_args, **_kwargs: _ProgressStub())
+    detection_calls = []
 
     def fake_detection(st_api, *, image_bytes, project_id, photo_id,
                        review_image_bytes=None, review_image_size=None, progress=None):
+        detection_calls.append(photo_id)
         scope = unified_workspace.component_review_scope(review_image_bytes, project_id, photo_id)
         _result_key, rows_key, _error_key = review_keys(scope)
         component_id = "R1" if photo_id == "photo-1" else "C1"
@@ -345,8 +375,8 @@ def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(mon
 
     from circuitcare.dashboard.views import unified_workspace
     monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
-    monkeypatch.setattr(unified_workspace, "ensure_ai_component_review",
-                        lambda *_args, **_kwargs: "complete")
+    monkeypatch.setattr(unified_workspace, "queue_ai_component_review",
+                        lambda *_args, **_kwargs: (None, "", "COMPLETE"))
     photos = [{"image_id": "photo-1", "data": image_bytes[0]},
               {"image_id": "photo-2", "data": image_bytes[1]}]
     first = _prepare_photo_component_snapshot(st, project, photos)
@@ -487,7 +517,7 @@ def test_deferred_duplicate_pairs_are_paged_and_not_dropped():
     assert not second_ids & third_ids
 
 
-def test_board_registry_prepares_every_photo_and_keeps_each_local_snapshot(monkeypatch):
+def test_board_registry_prioritizes_selected_photo_and_reuses_processed_snapshots(monkeypatch):
     image_bytes = []
     for color in ("red", "blue", "green"):
         output = io.BytesIO()
@@ -503,9 +533,11 @@ def test_board_registry_prepares_every_photo_and_keeps_each_local_snapshot(monke
     state = {"circuitcare_v2_active_photo_id": "front",
              "circuitcare_v2_photo_choice": "front"}
     st = SimpleNamespace(session_state=state, status=lambda *_args, **_kwargs: _ProgressStub())
+    detection_calls = []
 
     def fake_detection(st_api, *, image_bytes, project_id, photo_id,
                        review_image_bytes=None, review_image_size=None, progress=None):
+        detection_calls.append(photo_id)
         scope = unified_workspace.component_review_scope(review_image_bytes, project_id, photo_id)
         _result_key, rows_key, _error_key = review_keys(scope)
         st_api.session_state[rows_key] = [{
@@ -517,8 +549,8 @@ def test_board_registry_prepares_every_photo_and_keeps_each_local_snapshot(monke
 
     from circuitcare.dashboard.views import unified_workspace
     monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
-    monkeypatch.setattr(unified_workspace, "ensure_ai_component_review",
-                        lambda *_args, **_kwargs: "complete")
+    monkeypatch.setattr(unified_workspace, "queue_ai_component_review",
+                        lambda *_args, **_kwargs: (None, "", "COMPLETE"))
     photos = [{"image_id": photo_id, "data": data}
               for photo_id, data in zip(photo_ids, image_bytes)]
 
@@ -527,7 +559,8 @@ def test_board_registry_prepares_every_photo_and_keeps_each_local_snapshot(monke
     assert selected["photo_id"] == "front"
     assert {item["photo_id"] for item in registry["photos"]} == set(photo_ids)
     assert {source["photo_id"] for row in registry["components"]
-            for source in row["source_components"]} == set(photo_ids)
+            for source in row["source_components"]} == {"front"}
+    assert detection_calls == ["front"]
     assert len(state["circuitcare_v6_photo_component_snapshots"]) == 3
     assert {item["photo_id"] for item in state["circuitcare_v7_photo_snapshots_by_id"].values()} == set(photo_ids)
 

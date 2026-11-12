@@ -86,6 +86,41 @@ def test_chat_json_uses_configured_output_token_budget_and_reports_truncation(mo
     assert calls[0]["options"]["num_predict"] == 4096
 
 
+def test_chat_json_keeps_model_warm_and_exposes_ollama_performance_metrics(monkeypatch):
+    client = OllamaClient(num_predict=8192, keep_alive="10m")
+    monkeypatch.setattr(client, "model_info", lambda _name: {"name": "test:latest"})
+    calls = []
+    monkeypatch.setattr(client, "_request", lambda _method, _path, payload: (
+        calls.append(payload) or {**_response(), "total_duration": 2_000_000,
+        "load_duration": 250_000, "prompt_eval_count": 12,
+        "prompt_eval_duration": 500_000, "eval_count": 5, "eval_duration": 750_000}
+    ))
+    result = client.chat_json("test:latest", [{"role": "user", "content": "review"}], output_budget=700)
+    assert calls[0]["keep_alive"] == "10m"
+    assert calls[0]["options"]["num_predict"] == 700
+    assert result["total_duration_ns"] == 2_000_000
+    assert result["prompt_eval_count"] == 12
+    assert result["eval_count"] == 5
+
+
+def test_model_metadata_is_cached_for_the_configured_ttl(monkeypatch):
+    client = OllamaClient(metadata_ttl_seconds=30)
+    model_calls = []
+    show_calls = []
+    monkeypatch.setattr(client, "list_models", lambda: (
+        model_calls.append(1) or [{"name": "test:latest", "digest": "same"}]
+    ))
+    monkeypatch.setattr(client, "_request", lambda *_args: (
+        show_calls.append(1) or {"capabilities": ["vision"]}
+    ))
+    assert client.model_info("test:latest")["digest"] == "same"
+    assert client.model_info("test:latest")["digest"] == "same"
+    assert client.model_supports_vision("test:latest") is True
+    assert client.model_supports_vision("test:latest") is True
+    assert len(model_calls) == 1
+    assert len(show_calls) == 1
+
+
 def _raise(value):
     if isinstance(value, Exception):
         raise value

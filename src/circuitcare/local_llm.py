@@ -3,6 +3,8 @@
 import base64
 import json
 import re
+import threading
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -14,7 +16,7 @@ class LocalLLMError(RuntimeError):
 
 class OllamaClient:
     def __init__(self, base_url: str = "http://127.0.0.1:11434", timeout_seconds: int = 180,
-                 num_predict: int = 1300):
+                 num_predict: int = 1300, keep_alive: str = "10m", metadata_ttl_seconds: float = 30):
         parsed = urlparse(base_url)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Ollama must use a local loopback HTTP URL")
@@ -23,6 +25,10 @@ class OllamaClient:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.num_predict = num_predict
+        self.keep_alive = keep_alive
+        self.metadata_ttl_seconds = max(0.0, float(metadata_ttl_seconds))
+        self._metadata_lock = threading.RLock()
+        self._metadata_cache: dict[str, tuple[float, Any]] = {}
 
     def list_models(self) -> list[dict]:
         response = self._request("GET", "/api/tags")
@@ -33,7 +39,8 @@ class OllamaClient:
 
     def show_model(self, model_name: str) -> dict:
         """Return Ollama /api/show metadata, including declared model capabilities."""
-        return self._request("POST", "/api/show", {"model": model_name})
+        return self._cached_metadata(f"show:{model_name}",
+                                     lambda: self._request("POST", "/api/show", {"model": model_name}))
 
     def model_supports_vision(self, model_name: str) -> bool:
         metadata = self.show_model(model_name)
@@ -41,7 +48,7 @@ class OllamaClient:
         return isinstance(capabilities, list) and "vision" in capabilities
 
     def model_info(self, model_name: str) -> dict:
-        models = self.list_models()
+        models = self._cached_metadata("tags", self.list_models)
         match = next((item for item in models if item.get("name") == model_name or item.get("model") == model_name), None)
         if match is None and ":" not in model_name:
             match = next((item for item in models if item.get("name", "").split(":", 1)[0] == model_name), None)
@@ -50,9 +57,26 @@ class OllamaClient:
             raise LocalLLMError(f"Model {model_name!r} is not installed locally (available: {available})")
         return match
 
+    def invalidate_model_metadata(self) -> None:
+        """Clear cached model capabilities after the local Ollama service changes."""
+        with self._metadata_lock:
+            self._metadata_cache.clear()
+
+    def _cached_metadata(self, key: str, loader):
+        now = time.monotonic()
+        with self._metadata_lock:
+            cached = self._metadata_cache.get(key)
+            if cached and now - cached[0] < self.metadata_ttl_seconds:
+                return cached[1]
+        value = loader()
+        with self._metadata_lock:
+            self._metadata_cache[key] = (time.monotonic(), value)
+        return value
+
     def chat_json(self, model_name: str, messages: list[dict], *,
                   output_schema: dict | None = None,
-                  images: list[bytes | str] | None = None) -> dict:
+                  images: list[bytes | str] | None = None,
+                  output_budget: int | None = None) -> dict:
         model_info = self.model_info(model_name)
         request_messages = [dict(message) for message in messages]
         if images:
@@ -84,8 +108,11 @@ class OllamaClient:
             "messages": request_messages,
             "stream": False,
             "think": False,
+            "keep_alive": self.keep_alive,
             "format": output_schema or "json",
-            "options": {"temperature": 0.1, "num_predict": self.num_predict},
+            "options": {"temperature": 0.1,
+                        "num_predict": output_budget if type(output_budget) is int and output_budget > 0
+                        else self.num_predict},
         }
         json_mode = True
         fallback_reason = None

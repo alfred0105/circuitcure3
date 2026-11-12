@@ -6,6 +6,9 @@ import hashlib
 import base64
 import io
 import json
+import secrets
+import time
+from functools import lru_cache
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -56,7 +59,7 @@ from circuitcare.dashboard.views.report_panel import render_report_panel
 from circuitcare.reporting.report_builder import build_pcb_diagnostic_snapshot
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
-    _review_fingerprint, ensure_ai_component_review, ensure_component_detection, render_component_recognition_panel,
+    _review_fingerprint, ensure_component_detection, queue_ai_component_review, render_component_recognition_panel,
     review_aux_keys, review_keys, review_scope as component_review_scope,
 )
 from circuitcare.vision.box_reconciliation import board_visible_review_rows, same_component_box_pair
@@ -76,6 +79,110 @@ from circuitcare.schematic.exporter import export_schematic
 from circuitcare.schematic.geometry import read_svg_view_box
 from circuitcare.schematic.viewer import render_interactive_viewer
 from circuitcare.vision.image_loader import ImageLoadError, load_board_image
+from circuitcare.vision.ai_review_jobs import get_ai_review_job
+
+
+def _review_job_owner(st: Any, project_id: str) -> str:
+    key = "cc_ai_review_session_owner"
+    token = st.session_state.setdefault(key, secrets.token_urlsafe(20))
+    return f"{token}|{project_id}"
+
+
+def _queue_ai_review(st: Any, *, project: ProjectContext, image_bytes: bytes,
+                     scope: str, rows: list[dict[str, Any]], records_key: str) -> tuple[str, str]:
+    """Queue the full OCR/Qwen workflow from a session-owned immutable snapshot."""
+    owner = _review_job_owner(st, project.project_id)
+    job_id, _job_owner, status = queue_ai_component_review(
+        st, image_bytes=image_bytes, scope=scope, rows=rows,
+        records_key=records_key, owner=owner,
+    )
+    return job_id or "", status
+
+
+def _commit_review_job(st: Any, *, scope: str) -> bool:
+    state = st.session_state
+    job_id = state.get(f"cc_ai_review_job_{scope}")
+    owner = state.get(f"cc_ai_review_job_owner_{scope}")
+    if not job_id or not owner:
+        return False
+    job = get_ai_review_job(owner=owner, job_id=job_id)
+    if not job or job.get("status") in {"RUNNING", "PENDING"}:
+        return False
+    if state.get(f"cc_ai_review_job_committed_{scope}") == job_id:
+        return False
+    fingerprint = state.get(f"cc_ai_review_job_fingerprint_{scope}")
+    records_key = review_keys(scope)[1]
+    current_rows = state.get(records_key, [])
+    if job.get("fingerprint") != fingerprint or _review_fingerprint(current_rows, None) != fingerprint:
+        state[f"cc_ai_review_job_status_{scope}"] = "STALE"
+        state[f"cc_ai_review_job_committed_{scope}"] = job_id
+        return True
+    result_state = job.get("state", {})
+    allowed = (records_key, *review_aux_keys(scope), f"cc_component_marking_ocr_{scope}",
+               f"cc_component_qwen_batches_{scope}", f"cc_component_qwen_pair_queue_{scope}",
+               f"cc_ai_review_run_{scope}")
+    for key in allowed:
+        if key in result_state:
+            state[key] = result_state[key]
+    # The source fingerprint is checked above before replacing any session data.
+    state[f"cc_ai_review_job_status_{scope}"] = job.get("status", "FAILED")
+    state[f"cc_ai_review_job_result_ms_{scope}"] = job.get("duration_ms")
+    state[f"cc_ai_review_job_messages_{scope}"] = job.get("messages", [])
+    state[f"cc_ai_review_job_committed_{scope}"] = job_id
+    metrics = state.setdefault("cc_performance_events", [])
+    metrics.append({"stage": "ocr_qwen_review", "duration_ms": job.get("duration_ms"),
+                    "status": job.get("status"), "image_bytes": None,
+                    "scope_hash": hashlib.sha256(scope.encode()).hexdigest()[:12]})
+    del metrics[:-50]
+    return True
+
+
+try:
+    import streamlit as _streamlit
+
+    @_streamlit.fragment(run_every="1s", key="cc_ai_review_progress_fragment")
+    def _render_ai_review_progress(st: Any, project_id: str, scope: str | None) -> None:
+        if not scope:
+            return
+        job_id = st.session_state.get(f"cc_ai_review_job_{scope}")
+        owner = st.session_state.get(f"cc_ai_review_job_owner_{scope}")
+        if not job_id or not owner:
+            return
+        job = get_ai_review_job(owner=owner, job_id=job_id)
+        if job is None:
+            return
+        if job.get("status") == "RUNNING":
+            st.caption(f"RapidOCR · Qwen 검수 진행 중 · {job.get('elapsed_ms', 0) / 1000:.0f}초")
+            return
+        if _commit_review_job(st, scope=scope):
+            status = st.session_state.get(f"cc_ai_review_job_status_{scope}")
+            if status == "STALE":
+                st.info("입력 박스가 변경되어 오래된 AI 결과를 적용하지 않았습니다. AI 소자 검수를 다시 실행할 수 있습니다.")
+            elif status == "FAILED":
+                st.warning(job.get("error") or "AI 검수 작업이 실패했습니다. 기존 탐지·검수 기록은 보존됩니다.")
+            else:
+                st.caption("RapidOCR · Qwen 검수 완료 · 제안은 사용자 확인 전까지 미확정")
+            _streamlit.rerun()
+        else:
+            st.caption("RapidOCR · Qwen 검수 완료")
+except (ImportError, AttributeError):  # Older Streamlit remains usable without live polling.
+    _render_ai_review_progress = None
+
+
+@lru_cache(maxsize=4)
+def _cached_photo_pixels(raw: bytes) -> tuple[Any, tuple[int, int], tuple[int, int], bytes]:
+    """Decode/normalize a photo once; callers receive a safe copy of the PIL image."""
+    loaded = load_board_image(raw)
+    output = io.BytesIO()
+    loaded.image.save(output, format="PNG")
+    return loaded.image.copy(), loaded.original_size, loaded.processed_size, output.getvalue()
+
+
+def _record_perf(state: Any, stage: str, started: float, *, status: str = "complete") -> None:
+    events = state.setdefault("cc_performance_events", [])
+    events.append({"stage": stage, "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                   "status": status})
+    del events[:-50]
 
 
 def _style(st: Any) -> None:
@@ -218,10 +325,7 @@ def _prepare_photo_component_snapshot(
         update_selection(st.session_state, project=project, active_photo_id=photo_id)
     image_data = next(item["data"] for item in valid if item["image_id"] == photo_id)
     try:
-        loaded = load_board_image(image_data)
-        image_buffer = io.BytesIO()
-        loaded.image.save(image_buffer, format="PNG")
-        detector_image_bytes = image_buffer.getvalue()
+        _cached_image, _source_size, processed_size, detector_image_bytes = _cached_photo_pixels(image_data)
     except (ImageLoadError, ValueError):
         return {"photo_id": photo_id, "components": (), "review_scope": None,
                 "error": "PCB 이미지 로드 실패"}
@@ -233,40 +337,25 @@ def _prepare_photo_component_snapshot(
         progress.write("이미지 준비 · 완료")
     auto_result, auto_error = ensure_component_detection(
         st, image_bytes=image_data, project_id=project.project_id, photo_id=photo_id,
-        review_image_bytes=detector_image_bytes, review_image_size=loaded.processed_size,
+        review_image_bytes=detector_image_bytes, review_image_size=processed_size,
         progress=progress,
     )
     rows = list(st.session_state.get(records_key, []))
     review_state = "unavailable"
     if (auto_result is not None and not auto_error
             and auto_result.get("image_width") and auto_result.get("image_height")):
-        ocr_key, qwen_key = review_aux_keys(review_scope)
-        ai_fingerprint = _review_fingerprint(rows, st.session_state.get(ocr_key))
-        cached_qwen = st.session_state.get(qwen_key)
-        ai_run_key = f"cc_ai_review_run_{review_scope}"
-        ai_needs_run = (not isinstance(cached_qwen, dict)
-                        or cached_qwen.get("source_fingerprint") != ai_fingerprint)
-        ai_needs_run = ai_needs_run and st.session_state.get(ai_run_key) != ai_fingerprint
-        if progress is None and ai_needs_run:
-            progress = st.status("PCB 분석 중", expanded=True)
-            progress.write("이미지 준비 · 완료")
-            progress.write("YOLO 소자 탐지 · 재사용")
-        if progress is not None:
-            progress.write("소자 종류·OCR 입력 확인 · 완료")
-        review_state = ensure_ai_component_review(
-            st, image_bytes=detector_image_bytes, scope=review_scope,
-            rows=rows, records_key=records_key, progress=progress,
+        _job_id, job_state = _queue_ai_review(
+            st, project=project, image_bytes=detector_image_bytes, scope=review_scope,
+            rows=rows, records_key=records_key,
         )
-        rows = list(st.session_state.get(records_key, []))
-        if progress is not None:
-            progress.write("Registry 및 소자 정보 통합 · 완료")
-            qwen_failure = review_state == "failed"
-            progress.update(
-                label=("일부 분석 실패 · 사용 가능한 결과로 계속 진행" if qwen_failure
-                       else f"분석 완료 · 탐지된 소자 {len(rows)}개 · 확인이 필요한 소자 "
-                            f"{sum(row.get('상태') != '확인' and row.get('상태') != '제외' for row in rows)}개"),
-                state="error" if qwen_failure else "complete", expanded=False,
-            )
+        if job_state == "COMPLETE":
+            # A job may finish while the user views another photo. Commit its
+            # result only when this photo is selected again and its input still matches.
+            _commit_review_job(st, scope=review_scope)
+            rows = list(st.session_state.get(records_key, []))
+        review_state = ("complete" if job_state == "COMPLETE" else
+                        "pending" if job_state in {"PENDING", "RUNNING"} else
+                        "failed" if job_state == "QUEUE_FULL" else "unavailable")
     elif progress is not None:
         progress.update(label="YOLO 탐지 실패 · 사진 정보는 보존됩니다", state="error", expanded=True)
     _ocr_key, qwen_key = (f"cc_component_ocr_{review_scope}", f"cc_component_qwen_review_{review_scope}")
@@ -444,18 +533,39 @@ def _prepare_board_registry_snapshot(
     previous_photo_id = getattr(selection_before, "active_photo_id", None)
     previous_local_id = getattr(selection_before, "selected_component", None)
     by_photo: dict[str, dict[str, Any]] = {}
+    selected_id = st.session_state.get("circuitcare_v2_photo_choice")
+    if selected_id not in {str(photo.get("image_id") or "") for photo in photos}:
+        selected_id = st.session_state.get(ACTIVE_PHOTO_KEY)
+    if selected_id not in {str(photo.get("image_id") or "") for photo in photos}:
+        selected_id = next((str(photo.get("image_id")) for photo in photos
+                            if photo.get("image_id") in records and isinstance(photo.get("data"), bytes)), None)
+    cached_snapshots = st.session_state.get("circuitcare_v6_photo_component_snapshots", {})
     for photo in photos:
         photo_id = str(photo.get("image_id") or "")
         if photo_id not in records or not isinstance(photo.get("data"), bytes):
             continue
-        by_photo[photo_id] = _prepare_photo_component_snapshot(
-            st, project, photos, photo_id=photo_id, activate=False,
-        )
-    selected_id = st.session_state.get("circuitcare_v2_photo_choice")
-    if selected_id not in by_photo:
-        selected_id = st.session_state.get(ACTIVE_PHOTO_KEY)
-    if selected_id not in by_photo:
-        selected_id = next(iter(by_photo), None)
+        if photo_id == selected_id:
+            by_photo[photo_id] = _prepare_photo_component_snapshot(
+                st, project, photos, photo_id=photo_id, activate=False,
+            )
+            continue
+        raw_fingerprint = hashlib.sha256(photo["data"]).hexdigest()
+        cached = next((snapshot for snapshot in cached_snapshots.values()
+                       if isinstance(snapshot, dict) and snapshot.get("photo_id") == photo_id
+                       and snapshot.get("image_fingerprint") == raw_fingerprint), None)
+        if cached is not None:
+            by_photo[photo_id] = cached
+        else:
+            # Keep unopened photos out of the first-view inference path. They are
+            # analyzed when selected, while previously cached snapshots remain available.
+            by_photo[photo_id] = {"project_id": project.project_id,
+                "board_id": project.board_id or "", "photo_id": photo_id,
+                "image_fingerprint": raw_fingerprint, "review_version": "UNPROCESSED",
+                "review_scope": None, "registry_components": (), "components": (),
+                "component_ids": (), "detection_status": "PENDING_ON_SELECTION",
+                "ai_review_status": "PENDING", "version": None,
+                "analysis_scope_key": AnalysisScope(project.project_id,
+                    project.board_id or "", photo_id).key}
     by_photo = {photo_id: {**snapshot,
                            "side": records[photo_id].side,
                            "capture_type": records[photo_id].capture_type}
@@ -533,7 +643,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
     if selected_id not in ids:
         selected_id = ids[0]
     st.session_state["circuitcare_v2_photo_choice"] = selected_id
-    prepared_snapshot = _prepare_photo_component_snapshot(st, project, photos)
+    prepared_snapshot = st.session_state.get("circuitcare_v7_photo_snapshots_by_id", {}).get(selected_id)
     active_side = records[selected_id].side
 
     # A single board map covers every supported photo on both physical sides.
@@ -645,10 +755,8 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
             canonical_png_bytes = base64.b64decode(canonical["image_png_base64"], validate=True)
             st.caption(f"MOSAIC_PIXEL · 기준 사진 {decoded_canonical.reference_backend_photo_id or '미지정'} · 정합 후보 · 미검증")
         else:
-            loaded = load_board_image(image_data)
-            image = loaded.image
-            source_size = loaded.original_size
-            display_size = loaded.processed_size
+            cached_image, source_size, display_size, _cached_png = _cached_photo_pixels(image_data)
+            image = cached_image.copy()
             active_image_id = selected
     except (ImageLoadError, ValueError):
         st.warning("이미지 표시 실패 · 원본 사진 보기")
@@ -657,17 +765,13 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
     auto_detection_error = None
     detector_image_bytes = None
     if mode == "원본 사진":
-        detector_image = io.BytesIO()
-        image.save(detector_image, format="PNG")
-        detector_image_bytes = detector_image.getvalue()
-        auto_detection_result, auto_detection_error = ensure_component_detection(
-            st, image_bytes=image_data, project_id=project.project_id,
-            photo_id=selected, review_image_bytes=detector_image_bytes,
-            review_image_size=display_size,
-        )
+        _cached_image, _source_size, _processed_size, detector_image_bytes = _cached_photo_pixels(image_data)
+        review_scope = component_review_scope(detector_image_bytes, project.project_id, selected)
+        detection_result_key, _records_key, detection_error_key = review_keys(review_scope)
+        auto_detection_result = st.session_state.get(detection_result_key)
+        auto_detection_error = st.session_state.get(detection_error_key)
         st.session_state["circuitcare_v4_auto_detection_result"] = auto_detection_result
         st.session_state["circuitcare_v4_auto_detection_error"] = auto_detection_error
-        review_scope = component_review_scope(detector_image_bytes, project.project_id, selected)
         _result_key, records_key, _error_key = review_keys(review_scope)
         review_rows = st.session_state.get(records_key, [])
         active_inventory_version = component_inventory_version(
@@ -1351,14 +1455,13 @@ def _render_workflow_stepper(st: Any, workflow: dict[str, Any]) -> None:
 
 
 class _LeftProgressSlot:
-    """Replace the PCB region with a running status only while work executes."""
+    """Render work status beside the PCB without clearing or moving the Viewer."""
 
     def __init__(self, status_slot: Any, viewer_slot: Any) -> None:
         self.status_slot = status_slot
         self.viewer_slot = viewer_slot
 
     def container(self) -> Any:
-        self.viewer_slot.empty()
         return self.status_slot.container()
 
 
@@ -1863,7 +1966,9 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                     transition_progress.write("입력과 프로젝트 범위를 확인합니다.")
                     transition_progress.write("기존 사진별 탐지 결과·Registry·분석 Fingerprint를 재사용합니다.")
         try:
+            prepare_started = time.perf_counter()
             board_registry, photo_snapshot = _prepare_board_registry_snapshot(st, project, photos)
+            _record_perf(st.session_state, "snapshot_registry_prepare", prepare_started)
             snapshot_components = diagnosis_components(board_registry)
             measurement_aliases = measurement_component_aliases(board_registry)
             analysis_target_id = "board:registry:v1"
@@ -1914,6 +2019,13 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                 st.error(f"PCB 진단 자료를 준비하지 못했습니다 · {type(exc).__name__}: {str(exc)[:300]}")
             return
         with left:
+            active_review_scope = (photo_snapshot or {}).get("review_scope")
+            active_review_status = (st.session_state.get(
+                f"cc_ai_review_job_status_{active_review_scope}") if active_review_scope else None)
+            if (status_slot is not None and _render_ai_review_progress is not None
+                    and active_review_status in {"PENDING", "RUNNING"}):
+                with status_slot.container():
+                    _render_ai_review_progress(st, project.project_id, active_review_scope)
             try:
                 with viewer_slot.container():
                     _render_pcb(st, project, photos)

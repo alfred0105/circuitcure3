@@ -616,6 +616,9 @@ def review_components_with_qwen(
             "missed_component_candidates": missed,
             "notes": [str(note)[:300] for note in notes[:10]],
             "model": response.get("model", model), "image_size_px": [width, height],
+            "ollama_metrics": {key: response.get(key) for key in (
+                "total_duration_ns", "load_duration_ns", "prompt_eval_count",
+                "prompt_eval_duration_ns", "eval_count", "eval_duration_ns")},
             "review_image_count": len(images), "review_tiles": sum(item["kind"] == "native_resolution_tile" for item in image_manifest),
             "duplicate_pair_crop_count": len(pair_manifest),
             "review_diagnostics": {
