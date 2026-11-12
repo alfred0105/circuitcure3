@@ -16,6 +16,16 @@ from typing import Any
 import re
 
 
+JOB_CHANGED = threading.Condition()
+JOB_CHANGED.version = 0
+
+
+def _notify_progress(*_args):
+    with JOB_CHANGED:
+        JOB_CHANGED.version += 1
+        JOB_CHANGED.notify_all()
+
+
 @dataclass
 class _Job:
     owner: str
@@ -58,6 +68,7 @@ class _Progress:
                 self.errors.append(str(error)[:400])
                 del self.errors[:-8]
             self.updated_at = time.time()
+        _notify_progress()
 
     def write(self, message: str) -> None:
         value = str(message)[:180]
@@ -83,6 +94,7 @@ class _Progress:
             self.set_stage("QWEN_DUPLICATE_REVIEW", value)
         elif "완료" in lower:
             self.set_stage("RESULT_VALIDATION", value)
+        _notify_progress()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -245,6 +257,7 @@ def submit_ai_review(*, owner: str, scope: str, fingerprint: str, image_bytes: b
         progress = _Progress()
         progress.set_stage("PENDING", "AI 검수 대기 중")
         future = _EXECUTOR.submit(lambda queued_snapshot: _run(queued_snapshot, progress), snapshot)
+        future.add_done_callback(_notify_progress)
         _JOBS[key] = _Job(owner, job_id, scope, fingerprint, future, progress,
                           request_key=request_key, attempt=attempt)
         _JOBS.move_to_end(key)

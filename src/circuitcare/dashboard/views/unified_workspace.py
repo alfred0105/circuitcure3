@@ -198,70 +198,28 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
     return True
 
 
-try:
-    import streamlit as _streamlit
-
-    @_streamlit.fragment(run_every="1s")
-    def _render_ai_review_progress(st: Any, project_id: str, scope: str | None) -> None:
-        if not scope:
-            return
-        state = st.session_state
-        job_id = state.get(f"cc_ai_review_job_{scope}")
-        owner = state.get(f"cc_ai_review_job_owner_{scope}")
-        if not job_id or not owner:
-            return
-        job = get_ai_review_job(owner=owner, job_id=job_id)
-        if job is None:
-            st.warning("AI 검수 작업 상태를 찾을 수 없습니다. PCB 탐지와 기존 검수 기록은 유지됩니다.")
-            return
-        if job.get("status") in {"PENDING", "RUNNING"}:
-            running_log_key = f"cc_ai_review_job_running_logged_{scope}"
-            if job.get("status") == "RUNNING" and state.get(running_log_key) != job_id:
-                state[running_log_key] = job_id
-                LOGGER.info("AI_JOB_RUNNING project=%s photo_id=%s scope_hash=%s job_id=%s ts_ns=%s",
-                            project_id, state.get(f"cc_ai_review_job_photo_id_{scope}", "unknown"),
-                            hashlib.sha256(scope.encode()).hexdigest()[:12], job_id, time.time_ns())
-            progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
-            state[f"cc_ai_review_fragment_rerun_count"] = int(state.get("cc_ai_review_fragment_rerun_count", 0)) + 1
-            LOGGER.info("FRAGMENT_RERUN project=%s photo_id=%s job_id=%s scope_hash=%s count=%s stage=%s ts_ns=%s",
-                        project_id, state.get(f"cc_ai_review_job_photo_id_{scope}", "unknown"), job_id,
-                        hashlib.sha256(scope.encode()).hexdigest()[:12],
-                        state["cc_ai_review_fragment_rerun_count"], progress.get("stage", "RUNNING"), time.time_ns())
-            labels = {"OCR_BOARD": "RapidOCR · PCB 문자 탐색", "OCR_MARKINGS": "RapidOCR · 소자 각인",
-                      "QWEN_CLASS_REVIEW": "Qwen3.5 · 소자 분류", "QWEN_DUPLICATE_REVIEW": "Qwen3.5 · 중복 검토",
-                      "RESULT_VALIDATION": "결과 검증", "COMPLETE": "완료", "FAILED": "실패"}
-            st.markdown("**AI 소자 검수 진행 중**")
-            st.caption(labels.get(progress.get("stage"), "OCR · Qwen 검수") +
-                       f" · {job.get('elapsed_ms', 0) / 1000:.0f}초")
-            total = max(1, int(progress.get("total_batches") or 0))
-            completed = max(0, int(progress.get("completed_batches") or 0))
-            st.progress(min(1.0, completed / total),
-                        text=(f"분류 {completed}/{total} 배치 완료" if progress.get("total_batches")
-                              else labels.get(progress.get("stage"), "작업 준비 중")))
-            detail = str(progress.get("message") or "AI 응답을 기다리고 있습니다.")
-            if progress.get("errors"):
-                detail = "일부 단계 오류 · 성공한 결과는 보존됩니다. " + detail
-            st.caption(detail)
-            return
-        if _commit_review_job(st, scope=scope):
-            status = st.session_state.get(f"cc_ai_review_job_status_{scope}")
-            if status == "STALE":
-                st.info("입력 박스가 변경되어 오래된 AI 결과를 적용하지 않았습니다. AI 소자 검수를 다시 실행할 수 있습니다.")
-            elif status in {"FAILED", "UNAVAILABLE"}:
-                st.warning(job.get("error") or "AI 검수 작업이 실패했습니다. 기존 탐지·검수 기록은 보존됩니다.")
-            elif status == "AI_REVIEW_PARTIAL":
-                st.warning("AI 검수 일부 실패 · 성공한 제안과 사용자 검수 기록은 보존됩니다.")
-            else:
-                st.caption("RapidOCR · Qwen 검수 완료 · 제안은 사용자 확인 전까지 미확정")
-            LOGGER.info("AI_JOB_COMPLETED project=%s photo_id=%s job_id=%s scope_hash=%s status=%s ts_ns=%s",
-                        project_id, state.get(f"cc_ai_review_job_photo_id_{scope}", "unknown"), job_id,
-                        hashlib.sha256(scope.encode()).hexdigest()[:12], status, time.time_ns())
-            # The parent needs one rerun to consume the committed photo snapshot
-            # and remove this polling fragment. No rerun occurs on each poll.
+def _render_ai_review_progress(st: Any, project_id: str, scope: str | None) -> None:
+    if not scope:
+        return
+    from circuitcare.dashboard.components.review_progress import render_review_progress
+    state = st.session_state
+    job_id = state.get(f"cc_ai_review_job_{scope}")
+    owner = state.get(f"cc_ai_review_job_owner_{scope}")
+    if not job_id or not owner:
+        return
+    job = get_ai_review_job(owner=owner, job_id=job_id)
+    if job is None:
+        st.warning("AI 작업 상태를 찾을 수 없습니다. 검수 기록은 보존됩니다.")
+        return
+    def completed():
+        # Browser events only request a commit. Identity, terminal status and
+        # submission versions are still validated by the existing Python path.
+        if (state.get(f"cc_ai_review_job_{scope}") == job_id
+                and state.get(f"cc_ai_review_job_owner_{scope}") == owner
+                and _commit_review_job(st, scope=scope)):
             state["cc_debug_next_full_script_rerun_cause"] = "ai_review_terminal_commit"
-            _streamlit.rerun()
-except (ImportError, AttributeError):  # Older Streamlit remains usable without live polling.
-    _render_ai_review_progress = None
+            LOGGER.info("AI_JOB_COMPLETED project=%s job_id=%s transport=sse", project_id, job_id)
+    render_review_progress(st, owner=owner, job_id=job_id, job=job, on_completed=completed)
 
 
 @lru_cache(maxsize=4)
