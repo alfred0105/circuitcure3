@@ -9,6 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
+from collections import OrderedDict
 import threading
 import time
 from typing import Any
@@ -23,7 +24,10 @@ class _Job:
     fingerprint: str
     future: Future
     progress: "_Progress"
+    request_key: str = ""
+    attempt: int = 1
     started_at: float = field(default_factory=time.perf_counter)
+    created_at: float = field(default_factory=time.time)
 
 
 class _Progress:
@@ -111,9 +115,47 @@ class _WorkerAPI:
 
 _LOCK = threading.RLock()
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="circuitcare-ai-review")
-_JOBS: dict[tuple[str, str], _Job] = {}
+_JOBS: OrderedDict[tuple[str, str], _Job] = OrderedDict()
+_LATEST_REQUEST: dict[tuple[str, str], str] = {}
+_RETRY_COUNTS: dict[tuple[str, str], int] = {}
 _MAX_JOBS = 32
 _MAX_PENDING = 2
+_JOB_TTL_SECONDS = 60 * 60
+
+
+def _result_status(job: _Job) -> str:
+    if not job.future.done():
+        progress = job.progress.snapshot()
+        return "PENDING" if progress.get("stage") == "PENDING" else "RUNNING"
+    try:
+        result = job.future.result()
+    except Exception:
+        return "FAILED"
+    if not isinstance(result, dict):
+        return "FAILED"
+    status = str(result.get("status", "FAILED")).upper()
+    return status if status in {"COMPLETE", "FAILED", "UNAVAILABLE", "AI_REVIEW_PARTIAL", "STALE"} else "FAILED"
+
+
+def _prune_jobs(now: float | None = None) -> None:
+    """Bound retained job metadata while never evicting a running worker."""
+    now = time.time() if now is None else now
+    for key, job in list(_JOBS.items()):
+        if job.future.done() and now - job.created_at > _JOB_TTL_SECONDS:
+            _JOBS.pop(key, None)
+            request = (job.owner, job.request_key)
+            if _LATEST_REQUEST.get(request) == job.job_id:
+                _LATEST_REQUEST.pop(request, None)
+                _RETRY_COUNTS.pop(request, None)
+    while len(_JOBS) > _MAX_JOBS:
+        oldest_done = next((key for key, job in _JOBS.items() if job.future.done()), None)
+        if oldest_done is None:
+            break
+        removed = _JOBS.pop(oldest_done)
+        request = (removed.owner, removed.request_key)
+        if _LATEST_REQUEST.get(request) == removed.job_id:
+            _LATEST_REQUEST.pop(request, None)
+            _RETRY_COUNTS.pop(request, None)
 
 
 def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[str, Any]:
@@ -130,48 +172,73 @@ def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[st
             rows=deepcopy(snapshot["rows"]), records_key=snapshot["records_key"],
             progress=progress,
         )
-        final_stage = "FAILED" if result.upper() in {"FAILED", "UNAVAILABLE"} else "COMPLETE"
+        review_key = f"cc_component_qwen_review_{snapshot['scope']}"
+        review = state.get(review_key) if isinstance(state.get(review_key), dict) else {}
+        result_status = ("AI_REVIEW_PARTIAL" if review.get("verification_status") == "AI_REVIEW_PARTIAL"
+                         else "FAILED" if result.upper() in {"FAILED", "UNAVAILABLE"}
+                         else "COMPLETE")
+        final_stage = "FAILED" if result_status == "FAILED" else "COMPLETE"
         progress.set_stage(final_stage, "AI 검수 작업 실패" if final_stage == "FAILED" else "AI 검수 작업 완료")
-        return {"status": result.upper(), "state": state, "messages": progress.snapshot()["messages"],
+        return {"status": result_status, "state": state, "messages": progress.snapshot()["messages"],
                 "progress": progress.snapshot(),
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-                "fingerprint": snapshot["fingerprint"], "scope": snapshot["scope"]}
+                "fingerprint": snapshot["fingerprint"], "scope": snapshot["scope"],
+                "user_version": snapshot.get("user_version"),
+                "review_fingerprint": snapshot.get("review_fingerprint")}
     except Exception as exc:  # Keep worker failures isolated from Streamlit's script thread.
         error = f"{type(exc).__name__}: {str(exc)[:400]}"
         progress.set_stage("FAILED", error, error=error)
         return {"status": "FAILED", "error": error,
                 "messages": progress.snapshot()["messages"], "progress": progress.snapshot(),
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-                "fingerprint": snapshot["fingerprint"], "scope": snapshot["scope"]}
+                "fingerprint": snapshot["fingerprint"], "scope": snapshot["scope"],
+                "user_version": snapshot.get("user_version"),
+                "review_fingerprint": snapshot.get("review_fingerprint")}
 
 
 def submit_ai_review(*, owner: str, scope: str, fingerprint: str, image_bytes: bytes,
                      rows: list[dict[str, Any]], records_key: str,
-                     state_snapshot: dict[str, Any]) -> tuple[str | None, str]:
+                     state_snapshot: dict[str, Any], user_version: str | None = None,
+                     review_fingerprint: str | None = None,
+                     retry_failed: bool = False) -> tuple[str | None, str]:
     """Submit or reuse one review job; never queue an unbounded model backlog."""
-    job_id = hashlib.sha256(f"{owner}|{scope}|{fingerprint}".encode()).hexdigest()[:24]
-    key = (owner, job_id)
+    request_key = hashlib.sha256(f"{scope}|{fingerprint}".encode()).hexdigest()[:24]
+    request = (owner, request_key)
     with _LOCK:
-        existing = _JOBS.get(key)
+        _prune_jobs()
+        latest_id = _LATEST_REQUEST.get(request)
+        existing = _JOBS.get((owner, latest_id)) if latest_id else None
         if existing:
-            if existing.future.done():
-                return job_id, "COMPLETE"
-            return job_id, "RUNNING"
+            existing_status = _result_status(existing)
+            if existing_status in {"PENDING", "RUNNING"}:
+                return existing.job_id, existing_status
+            if existing_status == "COMPLETE":
+                return existing.job_id, existing_status
+            if existing_status == "AI_REVIEW_PARTIAL" and not retry_failed:
+                return existing.job_id, existing_status
+            if not retry_failed:
+                return existing.job_id, existing_status
+        attempt = _RETRY_COUNTS.get(request, 0) + 1
+        if existing and retry_failed:
+            attempt = max(attempt, existing.attempt + 1)
+        job_id = hashlib.sha256(f"{owner}|{request_key}|attempt:{attempt}".encode()).hexdigest()[:24]
+        key = (owner, job_id)
         active = [job for job in _JOBS.values() if not job.future.done()]
         if len(active) >= _MAX_PENDING + 1:
             return None, "QUEUE_FULL"
+        _RETRY_COUNTS[request] = attempt
         snapshot = {"state": deepcopy(state_snapshot), "image_bytes": bytes(image_bytes),
                     "scope": scope, "rows": deepcopy(rows), "records_key": records_key,
-                    "fingerprint": fingerprint}
+                    "fingerprint": fingerprint, "user_version": user_version,
+                    "review_fingerprint": review_fingerprint}
         progress = _Progress()
         progress.set_stage("PENDING", "AI 검수 대기 중")
         future = _EXECUTOR.submit(lambda queued_snapshot: _run(queued_snapshot, progress), snapshot)
-        _JOBS[key] = _Job(owner, job_id, scope, fingerprint, future, progress)
-        while len(_JOBS) > _MAX_JOBS:
-            oldest = next(iter(_JOBS))
-            if not _JOBS[oldest].future.done():
-                break
-            _JOBS.pop(oldest, None)
+        _JOBS[key] = _Job(owner, job_id, scope, fingerprint, future, progress,
+                          request_key=request_key, attempt=attempt)
+        _JOBS.move_to_end(key)
+        _LATEST_REQUEST[request] = job_id
+        _prune_jobs()
         return job_id, "PENDING"
 
 
@@ -182,13 +249,19 @@ def get_ai_review_job(*, owner: str, job_id: str) -> dict[str, Any] | None:
             return None
         if not job.future.done():
             progress = job.progress.snapshot()
-            return {"status": "PENDING" if progress.get("stage") == "PENDING" else "RUNNING",
+            return {"status": _result_status(job),
                     "scope": job.scope, "fingerprint": job.fingerprint,
                     "elapsed_ms": round((time.perf_counter() - job.started_at) * 1000, 2),
-                    "progress": progress}
+                    "progress": progress, "job_id": job.job_id, "attempt": job.attempt}
         try:
-            return job.future.result()
+            result = job.future.result()
+            if isinstance(result, dict):
+                return {**result, "job_id": job.job_id, "attempt": job.attempt}
+            return {"status": "FAILED", "scope": job.scope, "fingerprint": job.fingerprint,
+                    "error": "AI review worker returned an invalid result.",
+                    "job_id": job.job_id, "attempt": job.attempt}
         except Exception as exc:
             return {"status": "FAILED", "scope": job.scope, "fingerprint": job.fingerprint,
-                    "error": f"{type(exc).__name__}: {str(exc)[:400]}"}
+                    "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+                    "job_id": job.job_id, "attempt": job.attempt}
 

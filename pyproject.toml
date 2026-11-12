@@ -14,7 +14,7 @@ dependencies = ["PyYAML>=6,<7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
-ui = ["streamlit>=1.40,<2", "pandas>=2.1,<4"]
+ui = ["streamlit>=1.51,<2", "pandas>=2.1,<4"]
 pcb-recognition = ["numpy>=1.26,<3", "opencv-python-headless>=4.10,<5", "Pillow>=10", "torch>=2.3", "torchvision>=0.18", "ultralytics>=8.3", "pandas>=2.1,<4"]
 poster = ["matplotlib>=3.8"]
 vision = ["numpy>=1.26,<3", "opencv-python-headless>=4.10,<5", "Pillow>=10"]

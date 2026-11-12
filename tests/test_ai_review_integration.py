@@ -524,16 +524,58 @@ def test_cached_qwen_review_is_invalidated_when_source_box_changes():
     assert qwen_key not in session_state
 
 
-def test_review_fingerprint_ignores_exclude_restore_but_tracks_inference_inputs():
+def test_review_fingerprint_tracks_user_decisions_without_invalidating_inference_cache():
+    from circuitcare.vision.component_recognition_panel import _inference_fingerprint
+
     rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
              "x1": 1, "y1": 1, "x2": 10, "y2": 10}]
     baseline = _review_fingerprint(rows, None)
+    inference = _inference_fingerprint(rows)
     excluded = [{**rows[0], "상태": "제외"}]
     restored = [{**rows[0], "상태": "확인"}]
-    assert _review_fingerprint(excluded, None) == baseline
-    assert _review_fingerprint(restored, None) == baseline
+    assert _review_fingerprint(excluded, None) != baseline
+    assert _review_fingerprint(restored, None) != baseline
+    assert _inference_fingerprint(excluded) == inference
+    assert _inference_fingerprint(restored) == inference
+    assert _review_fingerprint([{**rows[0], "user_edited": True}], None) != baseline
+    assert _review_fingerprint([{**rows[0], "confirmed_part_number": "LM358"}], None) != baseline
     assert _review_fingerprint([{**rows[0], "소자 종류": "capacitor"}], None) != baseline
     assert _review_fingerprint([{**rows[0], "x1": 2}], None) != baseline
+
+
+def test_qwen_batch_setting_is_limited_to_benchmarked_sizes(monkeypatch):
+    from circuitcare.vision.component_recognition_panel import _qwen_review_batch_size
+
+    for size in (2, 4, 6, 8):
+        monkeypatch.setenv("CIRCUITCARE_QWEN_BATCH_SIZE", str(size))
+        assert _qwen_review_batch_size() == size
+    monkeypatch.setenv("CIRCUITCARE_QWEN_BATCH_SIZE", "3")
+    assert _qwen_review_batch_size() == 6
+    monkeypatch.setenv("CIRCUITCARE_QWEN_BATCH_SIZE", "invalid")
+    assert _qwen_review_batch_size() == 6
+
+
+def test_ai_review_worker_merge_preserves_user_rows_and_only_applies_ai_fields():
+    from circuitcare.vision.component_recognition_panel import merge_ai_review_rows
+
+    current = [
+        {"component_id": "r1", "소자 종류": "capacitor", "상태": "확인", "user_edited": True,
+         "confirmed_part_number": "C123", "x1": 5, "measurement_id": "m1"},
+        {"component_id": "manual-1", "소자 종류": "resistor", "상태": "확인", "user_edited": True},
+    ]
+    worker = [
+        {"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요", "x1": 1,
+         "confirmed_part_number": "wrong", "possible_part_number": "R100", "ocr_candidates": ["R1"]},
+        {"component_id": "stale-id", "소자 종류": "IC", "x1": 0, "ocr_candidates": ["U1"]},
+    ]
+    merged = merge_ai_review_rows(current, worker)
+    assert merged[0]["소자 종류"] == "capacitor"
+    assert merged[0]["상태"] == "확인" and merged[0]["user_edited"] is True
+    assert merged[0]["confirmed_part_number"] == "C123"
+    assert merged[0]["measurement_id"] == "m1"
+    assert "possible_part_number" not in merged[0]
+    assert merged[0]["ocr_candidates"] == ["R1"]
+    assert len(merged) == 2 and merged[1]["component_id"] == "manual-1"
 
 
 def test_qwen_duplicate_exclusion_is_only_enabled_for_confident_same_component():
@@ -871,7 +913,7 @@ def test_automatic_ai_review_is_cached_by_photo_observations(monkeypatch):
         st_api.session_state[ocr_key] = ocr
         st_api.session_state[qwen_key] = {
             "verification_status": "AI_SUGGESTIONS_ONLY",
-            "source_fingerprint": panel._review_fingerprint(rows, ocr),
+            "source_fingerprint": panel._inference_fingerprint(rows, ocr),
             "class_reviews": [],
         }
     monkeypatch.setattr(panel, "_run_ai_review_workflow", fake_run)
@@ -899,7 +941,7 @@ def test_excluding_and_restoring_box_reuses_cached_ocr_and_qwen(monkeypatch):
         st_api.session_state[ocr_key] = ocr
         st_api.session_state[qwen_key] = {
             "verification_status": "AI_SUGGESTIONS_ONLY",
-            "source_fingerprint": panel._review_fingerprint(rows, ocr),
+            "source_fingerprint": panel._inference_fingerprint(rows, ocr),
             "class_reviews": [],
         }
 

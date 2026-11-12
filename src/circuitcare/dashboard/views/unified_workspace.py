@@ -59,7 +59,8 @@ from circuitcare.dashboard.views.report_panel import render_report_panel
 from circuitcare.reporting.report_builder import build_pcb_diagnostic_snapshot
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
-    _review_fingerprint, ensure_component_detection, queue_ai_component_review, render_component_recognition_panel,
+    _inference_fingerprint, _review_fingerprint, _review_user_version, ensure_component_detection,
+    merge_ai_review_rows, queue_ai_component_review, render_component_recognition_panel,
     review_aux_keys, review_keys, review_scope as component_review_scope,
 )
 from circuitcare.vision.box_reconciliation import board_visible_review_rows, same_component_box_pair
@@ -116,24 +117,55 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
     if state.get(f"cc_ai_review_job_committed_{scope}") == job_id:
         return False
     fingerprint = state.get(f"cc_ai_review_job_fingerprint_{scope}")
+    if job.get("fingerprint") != fingerprint:
+        state[f"cc_ai_review_job_status_{scope}"] = "STALE"
+        state[f"cc_ai_review_job_committed_{scope}"] = job_id
+        LOGGER.info("AI_JOB_COMMITTED scope_hash=%s status=STALE reason=job_fingerprint_mismatch",
+                    hashlib.sha256(scope.encode()).hexdigest()[:12])
+        return True
     records_key = review_keys(scope)[1]
     current_rows = state.get(records_key, [])
-    if job.get("fingerprint") != fingerprint or _review_fingerprint(current_rows, None) != fingerprint:
+    worker_user_version = job.get("user_version")
+    current_user_version = _review_user_version(current_rows)
+    current_review_fingerprint = _review_fingerprint(
+        current_rows, state.get(review_aux_keys(scope)[0]))
+    submitted_review_fingerprint = state.get(f"cc_ai_review_job_review_fingerprint_{scope}")
+    if (_inference_fingerprint(current_rows) != fingerprint
+            or job.get("review_fingerprint") != submitted_review_fingerprint
+            or (current_review_fingerprint != submitted_review_fingerprint
+                and worker_user_version == current_user_version)):
         state[f"cc_ai_review_job_status_{scope}"] = "STALE"
         state[f"cc_ai_review_job_committed_{scope}"] = job_id
         LOGGER.info("AI_JOB_COMMITTED scope_hash=%s status=STALE reason=fingerprint_changed",
                     hashlib.sha256(scope.encode()).hexdigest()[:12])
         return True
+    worker_status = str(job.get("status", "FAILED")).upper()
+    if worker_status in {"FAILED", "UNAVAILABLE"}:
+        state[f"cc_ai_review_job_status_{scope}"] = worker_status
+        state[f"cc_ai_review_job_error_{scope}"] = job.get("error") or (
+            (job.get("progress") or {}).get("message") if isinstance(job.get("progress"), dict) else None
+        )
+        state[f"cc_ai_review_job_committed_{scope}"] = job_id
+        state[f"cc_ai_review_job_result_ms_{scope}"] = job.get("duration_ms")
+        LOGGER.info("AI_JOB_COMMITTED scope_hash=%s status=%s reason=worker_failed attempt=%s",
+                    hashlib.sha256(scope.encode()).hexdigest()[:12], worker_status, job.get("attempt"))
+        return True
     result_state = job.get("state", {})
-    allowed = (records_key, *review_aux_keys(scope), f"cc_component_marking_ocr_{scope}",
+    worker_rows = result_state.get(records_key, [])
+    merged_rows = merge_ai_review_rows(current_rows, worker_rows if isinstance(worker_rows, list) else [])
+    if worker_user_version != current_user_version:
+        LOGGER.info("AI_REVIEW_USER_VERSION_CHANGED scope_hash=%s action=merge_ai_fields_only",
+                    hashlib.sha256(scope.encode()).hexdigest()[:12])
+    state[records_key] = merged_rows
+    allowed = (*review_aux_keys(scope), f"cc_component_marking_ocr_{scope}",
                f"cc_component_qwen_batches_{scope}", f"cc_component_qwen_pair_queue_{scope}",
                f"cc_ai_review_run_{scope}")
     for key in allowed:
         if key in result_state:
             state[key] = result_state[key]
-    # The source fingerprint is checked above before replacing any session data.
+    # Worker row data is merged by component ID and only AI-owned fields are accepted.
     review_result = state.get(review_aux_keys(scope)[1])
-    committed_status = job.get("status", "FAILED")
+    committed_status = worker_status
     if isinstance(review_result, dict) and review_result.get("verification_status") == "AI_REVIEW_PARTIAL":
         committed_status = "AI_REVIEW_PARTIAL"
     state[f"cc_ai_review_job_status_{scope}"] = committed_status
@@ -397,12 +429,14 @@ def _prepare_photo_component_snapshot(
             st, project=project, image_bytes=detector_image_bytes, scope=review_scope,
             rows=rows, records_key=records_key,
         )
-        if job_state == "COMPLETE":
+        if job_state in {"COMPLETE", "AI_REVIEW_PARTIAL", "FAILED", "UNAVAILABLE"}:
             # A job may finish while the user views another photo. Commit its
             # result only when this photo is selected again and its input still matches.
             _commit_review_job(st, scope=review_scope)
             rows = list(st.session_state.get(records_key, []))
         review_state = ("complete" if job_state == "COMPLETE" else
+                        "partial" if job_state == "AI_REVIEW_PARTIAL" else
+                        "failed" if job_state in {"FAILED", "UNAVAILABLE"} else
                         "pending" if job_state in {"PENDING", "RUNNING"} else
                         "failed" if job_state == "QUEUE_FULL" else "unavailable")
     elif progress is not None:
@@ -2013,7 +2047,8 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
         viewer_error_slot = None
         with left:
             workflow_status_slot = st.empty()
-            qwen_progress_slot = st.empty()
+            # Keep the left layout height constant before, during and after AI review.
+            qwen_progress_slot = st.container(height=152, border=False)
             viewer_slot = st.empty()
             viewer_error_slot = st.empty()
             pending_label = workflow.pop("pending_left_status", None)
@@ -2083,21 +2118,25 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                 f"cc_ai_review_job_status_{active_review_scope}") if active_review_scope else None)
             if (_render_ai_review_progress is not None
                     and active_review_status in {"PENDING", "RUNNING"}):
-                with qwen_progress_slot.container():
+                with qwen_progress_slot:
                     _render_ai_review_progress(st, project.project_id, active_review_scope)
             elif active_review_scope and active_review_status == "QUEUE_FULL":
-                with qwen_progress_slot.container():
+                with qwen_progress_slot:
                     st.warning(st.session_state.get(
                         f"cc_ai_review_job_message_{active_review_scope}",
                         "AI 검수 대기열이 가득 찼습니다. 잠시 후 다시 실행해 주세요."))
             elif active_review_scope and active_review_status in {"COMPLETE", "FAILED", "STALE", "UNAVAILABLE", "AI_REVIEW_PARTIAL"}:
-                with qwen_progress_slot.container():
+                with qwen_progress_slot:
                     if active_review_status == "COMPLETE":
                         st.caption("RapidOCR · Qwen 검수 완료 · 제안은 사용자 확인 전까지 미확정")
                     elif active_review_status == "STALE":
                         st.info("입력 박스가 변경되어 오래된 AI 결과를 적용하지 않았습니다. 검수를 다시 실행할 수 있습니다.")
                     elif active_review_status == "AI_REVIEW_PARTIAL":
                         st.warning("AI 검수 일부 실패 · 성공한 제안과 사용자 검수 기록은 보존됩니다.")
+                    elif active_review_status in {"FAILED", "UNAVAILABLE"}:
+                        st.warning(st.session_state.get(
+                            f"cc_ai_review_job_error_{active_review_scope}",
+                            "AI 검수가 실패했습니다. ‘AI 소자 검수’를 눌러 다시 시도할 수 있습니다."))
                     else:
                         st.warning("AI 검수가 끝났지만 일부 단계가 실패했습니다. 탐지와 사용자 검수 기록은 보존됩니다.")
             try:

@@ -49,7 +49,9 @@ def test_ai_review_job_results_are_owner_scoped_and_duplicate_jobs_reused(monkey
 
     executor = _ImmediateExecutor()
     monkeypatch.setattr(ai_review_jobs, "_EXECUTOR", executor)
-    monkeypatch.setattr(ai_review_jobs, "_JOBS", {})
+    monkeypatch.setattr(ai_review_jobs, "_JOBS", ai_review_jobs.OrderedDict())
+    monkeypatch.setattr(ai_review_jobs, "_LATEST_REQUEST", {})
+    monkeypatch.setattr(ai_review_jobs, "_RETRY_COUNTS", {})
     args = {"scope": "photo-a", "fingerprint": "f1", "image_bytes": b"x",
             "rows": [], "records_key": "rows", "state_snapshot": {}}
     job_id, status = ai_review_jobs.submit_ai_review(owner="session-a", **args)
@@ -60,6 +62,93 @@ def test_ai_review_job_results_are_owner_scoped_and_duplicate_jobs_reused(monkey
     assert executor.calls == 1
     assert ai_review_jobs.get_ai_review_job(owner="session-b", job_id=job_id) is None
     assert ai_review_jobs.get_ai_review_job(owner="session-a", job_id=job_id)["fingerprint"] == "f1"
+
+
+def test_failed_job_is_not_reported_complete_and_explicit_retry_gets_new_id(monkeypatch):
+    from concurrent.futures import Future
+
+    class _FailThenPassExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def submit(self, fn, snapshot):
+            self.calls += 1
+            future = Future()
+            future.set_result({"status": "FAILED" if self.calls == 1 else "COMPLETE",
+                               "scope": snapshot["scope"], "fingerprint": snapshot["fingerprint"]})
+            return future
+
+    executor = _FailThenPassExecutor()
+    monkeypatch.setattr(ai_review_jobs, "_EXECUTOR", executor)
+    monkeypatch.setattr(ai_review_jobs, "_JOBS", ai_review_jobs.OrderedDict())
+    monkeypatch.setattr(ai_review_jobs, "_LATEST_REQUEST", {})
+    monkeypatch.setattr(ai_review_jobs, "_RETRY_COUNTS", {})
+    args = {"owner": "session", "scope": "photo", "fingerprint": "input", "image_bytes": b"x",
+            "rows": [], "records_key": "rows", "state_snapshot": {}}
+    failed_id, first_status = ai_review_jobs.submit_ai_review(**args)
+    duplicate_id, duplicate_status = ai_review_jobs.submit_ai_review(**args)
+    assert first_status == "PENDING"
+    assert duplicate_status == "FAILED"
+    assert duplicate_id == failed_id
+    assert ai_review_jobs.get_ai_review_job(owner="session", job_id=failed_id)["status"] == "FAILED"
+    retry_id, retry_status = ai_review_jobs.submit_ai_review(**args, retry_failed=True)
+    assert retry_status == "PENDING"
+    assert retry_id != failed_id
+    assert ai_review_jobs.get_ai_review_job(owner="session", job_id=retry_id)["status"] == "COMPLETE"
+    assert executor.calls == 2
+
+
+def test_prune_jobs_removes_old_terminal_jobs_but_keeps_running_jobs(monkeypatch):
+    from concurrent.futures import Future
+
+    done = Future()
+    done.set_result({"status": "COMPLETE"})
+    running = Future()
+    terminal = ai_review_jobs._Job("owner", "done", "scope", "fp", done,
+                                   ai_review_jobs._Progress(), request_key="req", created_at=0)
+    active = ai_review_jobs._Job("owner", "active", "scope", "fp", running,
+                                 ai_review_jobs._Progress(), request_key="req2", created_at=0)
+    monkeypatch.setattr(ai_review_jobs, "_JOBS", ai_review_jobs.OrderedDict({
+        ("owner", "done"): terminal, ("owner", "active"): active,
+    }))
+    monkeypatch.setattr(ai_review_jobs, "_LATEST_REQUEST", {("owner", "req"): "done"})
+    ai_review_jobs._prune_jobs(now=ai_review_jobs._JOB_TTL_SECONDS + 1)
+    assert ("owner", "done") not in ai_review_jobs._JOBS
+    assert ("owner", "active") in ai_review_jobs._JOBS
+
+
+def test_commit_merges_ai_evidence_after_user_edit_without_overwriting_review_or_measurement(monkeypatch):
+    from circuitcare.dashboard.views import unified_workspace
+    from circuitcare.vision.component_recognition_panel import (
+        _inference_fingerprint, _review_user_version, review_aux_keys, review_keys,
+    )
+
+    scope = "photo-scope"
+    records_key = review_keys(scope)[1]
+    current = [{"component_id": "r1", "detector_class": "resistor", "소자 종류": "capacitor",
+                "상태": "제외", "user_edited": True, "confirmed_part_number": "C22",
+                "x1": 1, "y1": 2, "x2": 10, "y2": 20, "measurement_id": "m-7"}]
+    worker_rows = [{**current[0], "소자 종류": "resistor", "상태": "검수 필요",
+                    "confirmed_part_number": "WRONG", "ocr_candidates": ["C22"]}]
+    job_id = "job-1"
+    state = {records_key: current,
+             f"cc_ai_review_job_{scope}": job_id,
+             f"cc_ai_review_job_owner_{scope}": "owner",
+             f"cc_ai_review_job_fingerprint_{scope}": _inference_fingerprint(current)}
+    fingerprint = state[f"cc_ai_review_job_fingerprint_{scope}"]
+    job = {"status": "COMPLETE", "job_id": job_id, "fingerprint": fingerprint,
+           "user_version": _review_user_version(worker_rows), "duration_ms": 12,
+           "state": {records_key: worker_rows,
+                     review_aux_keys(scope)[1]: {"source_fingerprint": fingerprint,
+                                                   "verification_status": "AI_SUGGESTIONS_ONLY"}}}
+    monkeypatch.setattr(unified_workspace, "get_ai_review_job", lambda **_kwargs: job)
+    assert unified_workspace._commit_review_job(type("St", (), {"session_state": state})(), scope=scope)
+    saved = state[records_key][0]
+    assert saved["상태"] == "제외" and saved["user_edited"] is True
+    assert saved["소자 종류"] == "capacitor"
+    assert saved["confirmed_part_number"] == "C22"
+    assert saved["measurement_id"] == "m-7"
+    assert saved["ocr_candidates"] == ["C22"]
 
 
 def test_review_progress_tracks_stage_and_batch_counts_without_streamlit(monkeypatch):
@@ -85,7 +174,9 @@ def test_running_job_exposes_thread_safe_progress_snapshot(monkeypatch):
 
     executor = _DelayedExecutor()
     monkeypatch.setattr(ai_review_jobs, "_EXECUTOR", executor)
-    monkeypatch.setattr(ai_review_jobs, "_JOBS", {})
+    monkeypatch.setattr(ai_review_jobs, "_JOBS", ai_review_jobs.OrderedDict())
+    monkeypatch.setattr(ai_review_jobs, "_LATEST_REQUEST", {})
+    monkeypatch.setattr(ai_review_jobs, "_RETRY_COUNTS", {})
     job_id, _status = ai_review_jobs.submit_ai_review(
         owner="owner", scope="scope", fingerprint="f", image_bytes=b"x",
         rows=[], records_key="rows", state_snapshot={},

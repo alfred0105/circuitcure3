@@ -129,6 +129,14 @@ def _review_detection_batches(detections: list[dict], batch_size: int = 6) -> li
             for index in range(0, len(detections), batch_size)] or [[]]
 
 
+def _qwen_review_batch_size() -> int:
+    try:
+        value = int(os.environ.get("CIRCUITCARE_QWEN_BATCH_SIZE", "6"))
+    except (TypeError, ValueError):
+        return 6
+    return value if value in {2, 4, 6, 8} else 6
+
+
 def _pending_duplicate_pair_candidates(
     candidates: list[dict], reviewed_pair_ids: set[str], *, limit: int = 12,
 ) -> list[dict]:
@@ -412,18 +420,69 @@ def undo_last_box_exclusion(state: Any, *, scope: str, rows: list[dict]) -> str 
     return str(component_id)
 
 
-def _review_fingerprint(rows: list[dict], ocr_result: dict | None) -> str:
+def _inference_fingerprint(rows: list[dict], ocr_result: dict | None = None) -> str:
+    """Fingerprint only the visual/model inputs; review actions don't rerun vision."""
     snapshot = [{key: row.get(key) for key in (
-        "component_id", "소자 종류", "x1", "y1", "x2", "y2", "신뢰도",
+        "component_id", "detector_class", "소자 종류", "x1", "y1", "x2", "y2", "신뢰도",
         "ocr_candidates", "reference_designators", "ocr_class_hints", "body_marking",
         "marking_candidates", "marking_ocr_fingerprint", "possible_part_number",
-        "confirmed_part_number", "part_number_status", "part_identity_status",
         "ocr_source", "ocr_score", "qwen_marking_candidates", "qwen_part_number_candidates",
         "qwen_ocr_evidence", "qwen_conflicting_evidence",
     )} for row in rows]
     payload = json.dumps({"rows": snapshot, "ocr": (ocr_result or {}).get("records", [])},
                          ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+_USER_REVIEW_FIELDS = (
+    "component_id", "board_component_id", "소자 종류", "상태", "status_before_exclusion", "user_edited",
+    "user_confirmed", "user_confirmed_class", "confirmed_base_class", "confirmed_subtype",
+    "confirmed_part_number", "part_number_status", "part_identity_status",
+    "reference_designator", "user_reference_designator", "fault_role", "fault_role_status",
+    "measurement_ids", "measurement_id", "measurement_mapping_status",
+)
+_AI_REVIEW_ROW_FIELDS = (
+    "ocr_records", "ocr_candidates", "reference_designators", "ocr_class_hints",
+    "ocr_association_status", "marking_ocr", "marking_ocr_fingerprint", "marking_ocr_status",
+    "body_marking", "marking_candidates", "ocr_source", "ocr_score", "possible_part_number",
+    "ic_identity_candidate", "ocr_inferred_value", "ocr_inference_method",
+)
+
+
+def _review_user_version(rows: list[dict]) -> str:
+    protected = [{key: row.get(key) for key in _USER_REVIEW_FIELDS}
+                 for row in rows if isinstance(row, dict)]
+    return hashlib.sha256(json.dumps(protected, ensure_ascii=False, sort_keys=True,
+                                     default=str).encode()).hexdigest()
+
+
+def _review_fingerprint(rows: list[dict], ocr_result: dict | None) -> str:
+    """Full review snapshot fingerprint, including user decisions and identity links."""
+    payload = {"inference": _inference_fingerprint(rows, ocr_result),
+               "user_review_version": _review_user_version(rows)}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def merge_ai_review_rows(current_rows: list[dict], worker_rows: list[dict]) -> list[dict]:
+    """Merge only AI-owned OCR evidence into current rows, preserving user state."""
+    merged = deepcopy([row for row in current_rows if isinstance(row, dict)])
+    by_id = {str(row.get("component_id")): row for row in merged if row.get("component_id") is not None}
+    for proposed in worker_rows:
+        if not isinstance(proposed, dict) or proposed.get("component_id") is None:
+            continue
+        target = by_id.get(str(proposed["component_id"]))
+        if target is None:
+            # Worker snapshots are not authoritative for IDs or manually added boxes.
+            continue
+        for key in _AI_REVIEW_ROW_FIELDS:
+            if key not in proposed:
+                continue
+            if key == "possible_part_number" and target.get("confirmed_part_number"):
+                continue
+            if key == "body_marking" and target.get("user_confirmed"):
+                continue
+            target[key] = deepcopy(proposed[key])
+    return merged
 
 
 def duplicate_exclusion_enabled(proposal: dict, left_box: list | tuple,
@@ -721,8 +780,11 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                       "review_batches": []}
             batch_cache_key = f"cc_component_qwen_batches_{scope}"
             batch_cache = st_api.session_state.setdefault(batch_cache_key, {})
-            batches = _review_detection_batches(detections, batch_size=6)
+            requested_batch_size = _qwen_review_batch_size()
+            batches = _review_detection_batches(detections, batch_size=requested_batch_size)
             failed_batches = []
+            batch_cache_hits = 0
+            qwen_requests = 0
             for batch_index, batch in enumerate(batches, start=1):
                 _write_analysis_status(progress, f"Qwen 소자 검수 · {batch_index}/{len(batches)} 배치 진행 중")
                 batch_fingerprint = hashlib.sha256(json.dumps({
@@ -732,9 +794,11 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                 }, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
                 cached_batch = batch_cache.get(batch_fingerprint)
                 if isinstance(cached_batch, dict) and cached_batch.get("status") == "complete":
+                    batch_cache_hits += 1
                     partial = cached_batch["result"]
                 else:
                     try:
+                        qwen_requests += 1
                         partial = review_components_with_qwen(ollama, DEFAULT_REVIEW_MODEL,
                             image_bytes, batch, (ocr_result or {}).get("records", []))
                         batch_cache[batch_fingerprint] = {"status": "complete", "result": partial}
@@ -879,7 +943,20 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                 (row.get("ollama_metrics", {}).get(name) or 0) for row in review["review_batches"]
                 if isinstance(row.get("ollama_metrics", {}).get(name), (int, float)))
                 for name in metric_names}
-        review["source_fingerprint"] = _review_fingerprint(rows, ocr_result)
+            eval_count = review["ollama_metrics"].get("eval_count") or 0
+            eval_duration_ns = review["ollama_metrics"].get("eval_duration_ns") or 0
+            review["performance"] = {
+                "batch_size": requested_batch_size,
+                "class_review_batches": len(batches),
+                "class_review_requests": qwen_requests,
+                "class_batch_cache_hits": batch_cache_hits,
+                "qwen_image_count": sum(int(row.get("image_count") or 0)
+                                         for row in review["review_batches"]),
+                "qwen_native_tile_count": review["review_tiles"],
+                "output_tokens_per_second": (round(eval_count * 1e9 / eval_duration_ns, 3)
+                                              if eval_duration_ns else None),
+            }
+        review["source_fingerprint"] = _inference_fingerprint(rows, ocr_result)
         st_api.session_state[qwen_key] = review
         if failed_batches:
             first_failure = failed_batches[0]
@@ -896,7 +973,7 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
             "class_reviews": [], "duplicate_reviews": [], "group_reviews": [],
             "missed_component_candidates": [], "notes": [],
             "model": DEFAULT_REVIEW_MODEL, "verification_status": "AI_REVIEW_FAILED",
-            "source_fingerprint": _review_fingerprint(rows, ocr_result),
+            "source_fingerprint": _inference_fingerprint(rows, ocr_result),
             "review_diagnostics": {"candidate_search": {"status": search_status,
                                                            "error": str(exc) if stage == "candidate_search" else None},
                                    "qwen": {"status": qwen_status, "error": str(exc)},
@@ -913,7 +990,7 @@ def ensure_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
                                 progress: Any = None) -> str:
     """Run the existing OCR→Qwen review once for each unchanged photo observation."""
     ocr_key, qwen_key = review_aux_keys(scope)
-    fingerprint = _review_fingerprint(rows, st_api.session_state.get(ocr_key))
+    fingerprint = _inference_fingerprint(rows, st_api.session_state.get(ocr_key))
     cached = st_api.session_state.get(qwen_key)
     if isinstance(cached, dict) and cached.get("source_fingerprint") == fingerprint:
         _write_analysis_status(progress, "OCR/Qwen 검수 · 결과 재사용")
@@ -931,7 +1008,7 @@ def ensure_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
                             progress=progress)
     result = st_api.session_state.get(qwen_key)
     if isinstance(result, dict):
-        st_api.session_state[run_key] = _review_fingerprint(
+        st_api.session_state[run_key] = _inference_fingerprint(
             rows, st_api.session_state.get(ocr_key))
         return "failed" if result.get("verification_status") in {
             "AI_REVIEW_FAILED", "AI_REVIEW_PARTIAL"} else "complete"
@@ -940,7 +1017,8 @@ def ensure_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
 
 def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
                               rows: list[dict], records_key: str,
-                              owner: str | None = None) -> tuple[str | None, str, str]:
+                              owner: str | None = None,
+                              retry_failed: bool = False) -> tuple[str | None, str, str]:
     """Queue OCR/Qwen review using only an allowlisted snapshot of session data."""
     import secrets
 
@@ -949,24 +1027,33 @@ def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
     token = state.setdefault(session_owner_key, secrets.token_urlsafe(20))
     project_id = str(state.get("circuitcare_v2_current_project_id", "unknown-project"))
     job_owner = owner or f"{token}|{project_id}"
-    fingerprint = _review_fingerprint(rows, None)
+    fingerprint = _inference_fingerprint(rows, None)
     ocr_key, qwen_key = review_aux_keys(scope)
+    review_fingerprint = _review_fingerprint(rows, state.get(ocr_key))
     cached = state.get(qwen_key)
-    if isinstance(cached, dict) and cached.get("source_fingerprint") == _review_fingerprint(
-            rows, state.get(ocr_key)):
+    if (isinstance(cached, dict)
+            and cached.get("verification_status") not in {"AI_REVIEW_FAILED", "AI_REVIEW_PARTIAL"}
+            and cached.get("source_fingerprint") == _inference_fingerprint(rows, state.get(ocr_key))):
         return None, "", "COMPLETE"
     allowed = (records_key, ocr_key, qwen_key, f"cc_component_marking_ocr_{scope}",
                f"cc_component_qwen_batches_{scope}", f"cc_component_qwen_pair_queue_{scope}")
     worker_state = {key: deepcopy(state[key]) for key in allowed if key in state}
     worker_state.pop(f"cc_ai_review_run_{scope}", None)
+    if retry_failed:
+        # Keep successful batch/OCR caches, but force the worker past a failed or
+        # partial top-level result so only failed batches are retried.
+        worker_state.pop(qwen_key, None)
     job_id, status = submit_ai_review(
         owner=job_owner, scope=scope, fingerprint=fingerprint, image_bytes=image_bytes,
         rows=rows, records_key=records_key, state_snapshot=worker_state,
+        user_version=_review_user_version(rows), review_fingerprint=review_fingerprint,
+        retry_failed=retry_failed,
     )
     if job_id:
         state[f"cc_ai_review_job_{scope}"] = job_id
         state[f"cc_ai_review_job_owner_{scope}"] = job_owner
         state[f"cc_ai_review_job_fingerprint_{scope}"] = fingerprint
+        state[f"cc_ai_review_job_review_fingerprint_{scope}"] = review_fingerprint
         state[f"cc_ai_review_job_status_{scope}"] = status
     return job_id, job_owner, status
 
@@ -1155,7 +1242,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
         token = st_api.session_state.setdefault("cc_ai_review_session_owner", os.urandom(20).hex())
         queue_ai_component_review(
             st_api, image_bytes=image_bytes, scope=scope, rows=rows,
-            records_key=records_key, owner=f"{token}|{project_id}",
+            records_key=records_key, owner=f"{token}|{project_id}", retry_failed=True,
         )
         st_api.rerun()
     with st_api.expander("개별 실행 · 고급", expanded=False):
@@ -1213,7 +1300,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                                        records_key=records_key)
 
         qwen_review = st_api.session_state.get(qwen_key)
-        if isinstance(qwen_review, dict) and qwen_review.get("source_fingerprint") != _review_fingerprint(rows, ocr_result):
+        if isinstance(qwen_review, dict) and qwen_review.get("source_fingerprint") != _inference_fingerprint(rows, ocr_result):
             invalidate_review_state()
             qwen_review = None
         if isinstance(qwen_review, dict):
@@ -1235,6 +1322,20 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                     for item in failed_items:
                         st_api.caption(f"{item.get('stage')} · {item.get('component_id', item.get('parent_id', ''))} · {item.get('reason')}")
             st_api.caption(f"제안 모델 · {qwen_review.get('model', 'Qwen Vision')} · 상태 {qwen_review.get('verification_status', 'AI_SUGGESTIONS_ONLY')} · {len(qwen_review.get('review_batches', []))}개 배치 · 1024px 고해상도 타일 {qwen_review.get('review_tiles', 0)}개 · 모든 AI 제안은 미확인")
+            performance = qwen_review.get("performance") if isinstance(qwen_review.get("performance"), dict) else {}
+            ollama_metrics = qwen_review.get("ollama_metrics") if isinstance(qwen_review.get("ollama_metrics"), dict) else {}
+            if performance:
+                total_s = (ollama_metrics.get("total_duration_ns") or 0) / 1e9
+                load_s = (ollama_metrics.get("load_duration_ns") or 0) / 1e9
+                prompt_tokens = ollama_metrics.get("prompt_eval_count") or 0
+                output_tokens = ollama_metrics.get("eval_count") or 0
+                st_api.caption(
+                    f"Qwen 실측 · 요청 {performance.get('class_review_requests', 0)}회 · "
+                    f"입력 이미지 {performance.get('qwen_image_count', 0)}장 · "
+                    f"Ollama {total_s:.1f}초 (모델 로드 {load_s:.2f}초) · "
+                    f"프롬프트 {prompt_tokens:,} / 생성 {output_tokens:,} 토큰 · "
+                    f"생성 {performance.get('output_tokens_per_second') or 0:.1f} 토큰/초"
+                )
             cross_batch = diagnostics.get("cross_batch_duplicate_search", {})
             pair_queue = st_api.session_state.get(f"cc_component_qwen_pair_queue_{scope}", {})
             pair_summary = _duplicate_pair_queue_summary(pair_queue) if pair_queue.get("version") == 2 else {

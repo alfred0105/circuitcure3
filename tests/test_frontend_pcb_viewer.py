@@ -242,8 +242,8 @@ def test_qwen_and_workflow_progress_use_different_slots():
 
     source = (Path(__file__).parents[1] / "src/circuitcare/dashboard/views/unified_workspace.py").read_text()
     assert "workflow_status_slot = st.empty()" in source
-    assert "qwen_progress_slot = st.empty()" in source
-    assert "with qwen_progress_slot.container():" in source
+    assert "qwen_progress_slot = st.container(height=152, border=False)" in source
+    assert "with qwen_progress_slot:" in source
     assert "workflow_status_slot.empty()" in source
     assert "with status_slot.container():" not in source
 
