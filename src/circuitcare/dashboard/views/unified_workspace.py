@@ -59,7 +59,7 @@ from circuitcare.dashboard.views.report_panel import render_report_panel
 from circuitcare.reporting.report_builder import build_pcb_diagnostic_snapshot
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
-    _inference_fingerprint, _observation_fingerprint, _ocr_evidence_fingerprint,
+    _observation_fingerprint, _ocr_evidence_fingerprint,
     _review_fingerprint, _review_user_version, ensure_component_detection,
     merge_ai_review_rows, queue_ai_component_review, render_component_recognition_panel,
     review_aux_keys, review_keys, review_scope as component_review_scope,
@@ -201,7 +201,7 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
 try:
     import streamlit as _streamlit
 
-    @_streamlit.fragment(run_every="1s", key="cc_ai_review_progress_fragment")
+    @_streamlit.fragment(run_every="1s")
     def _render_ai_review_progress(st: Any, project_id: str, scope: str | None) -> None:
         if not scope:
             return

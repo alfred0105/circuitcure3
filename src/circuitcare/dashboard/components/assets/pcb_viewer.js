@@ -46,6 +46,7 @@ export default function(component) {
   if (state.renderCount === 1) telemetry("VIEWER_MOUNT", {reason:"component identity created"});
   else telemetry("VIEWER_RENDER", {reason:"Streamlit component data update"});
   state.setStateValue = setStateValue;
+  state.setTriggerValue = setTriggerValue;
   // Hold the optimistic highlight until Python acknowledges this exact click.
   // A rerun carrying the previous server selection must not make it flash off.
   if (state.pendingSelection && data.selection_ack_event_id === state.pendingSelection.eventId) {

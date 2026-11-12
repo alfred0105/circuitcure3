@@ -30,7 +30,7 @@ from circuitcare.vision.ai_review_service import (
 from circuitcare.frontend.measurement_state import invalidate_legacy_diagnosis
 from circuitcare.analysis.models import AnalysisScope
 from circuitcare.analysis.state_manager import invalidate_analysis
-from circuitcare.vision.ai_review_jobs import submit_ai_review
+from circuitcare.vision.ai_review_jobs import get_ai_review_job, submit_ai_review
 from circuitcare.frontend.workbench_state import ACTIVE_PHOTO_KEY
 
 APP_DIR = Path(__file__).resolve().parents[3] / "apps" / "pcb-component-recognition"
@@ -1056,13 +1056,27 @@ def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
     # inside the job and therefore must not change the request identity mid-run.
     fingerprint = _observation_fingerprint(rows)
     ocr_key, qwen_key = review_aux_keys(scope)
-    review_fingerprint = _review_fingerprint(rows, None)
-    ocr_fingerprint = _ocr_evidence_fingerprint(state.get(ocr_key))
     cached = state.get(qwen_key)
     if (isinstance(cached, dict)
             and cached.get("verification_status") not in {"AI_REVIEW_FAILED", "AI_REVIEW_PARTIAL"}
             and cached.get("source_fingerprint") == _inference_fingerprint(rows, state.get(ocr_key))):
+        state[f"cc_ai_review_job_status_{scope}"] = "COMPLETE"
         return None, "", "COMPLETE"
+    previous_job_id = state.get(f"cc_ai_review_job_{scope}")
+    if (not retry_failed and previous_job_id
+            and state.get(f"cc_ai_review_job_owner_{scope}") == job_owner
+            and state.get(f"cc_ai_review_job_fingerprint_{scope}") == fingerprint):
+        existing = get_ai_review_job(owner=job_owner, job_id=previous_job_id)
+        if existing is not None:
+            # Preserve the original submission versions and avoid copying OCR
+            # and batch caches just to discover that the job already exists.
+            status = str(existing.get("status", "FAILED"))
+            if state.get(f"cc_ai_review_job_status_{scope}") == "STALE":
+                status = "STALE"
+            state[f"cc_ai_review_job_status_{scope}"] = status
+            return previous_job_id, job_owner, status
+    review_fingerprint = _review_fingerprint(rows, None)
+    ocr_fingerprint = _ocr_evidence_fingerprint(state.get(ocr_key))
     allowed = (records_key, ocr_key, qwen_key, f"cc_component_marking_ocr_{scope}",
                f"cc_component_qwen_batches_{scope}", f"cc_component_qwen_pair_queue_{scope}")
     worker_state = {key: deepcopy(state[key]) for key in allowed if key in state}
@@ -1081,8 +1095,9 @@ def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
         state[f"cc_ai_review_job_{scope}"] = job_id
         state[f"cc_ai_review_job_owner_{scope}"] = job_owner
         state[f"cc_ai_review_job_fingerprint_{scope}"] = fingerprint
-        state[f"cc_ai_review_job_review_fingerprint_{scope}"] = review_fingerprint
-        state[f"cc_ai_review_job_ocr_fingerprint_{scope}"] = ocr_fingerprint
+        if job_id != previous_job_id:
+            state[f"cc_ai_review_job_review_fingerprint_{scope}"] = review_fingerprint
+            state[f"cc_ai_review_job_ocr_fingerprint_{scope}"] = ocr_fingerprint
         state[f"cc_ai_review_job_status_{scope}"] = status
     return job_id, job_owner, status
 

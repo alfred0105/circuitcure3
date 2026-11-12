@@ -1005,3 +1005,24 @@ def test_excluding_and_restoring_box_reuses_cached_ocr_and_qwen(monkeypatch):
     assert calls == ["photo"]
     ocr_key, qwen_key = panel.review_aux_keys("photo")
     assert ocr_key in state and qwen_key in state
+
+
+def test_reusing_running_job_preserves_submission_versions_without_copying_caches(monkeypatch):
+    import circuitcare.vision.component_recognition_panel as panel
+    rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
+             "x1": 1, "y1": 2, "x2": 10, "y2": 20}]
+    state = {"cc_ai_review_job_scope": "job", "cc_ai_review_job_owner_scope": "owner",
+             "cc_ai_review_job_fingerprint_scope": panel._observation_fingerprint(rows),
+             "cc_ai_review_job_review_fingerprint_scope": panel._review_fingerprint(rows, None),
+             "cc_ai_review_job_ocr_fingerprint_scope": panel._ocr_evidence_fingerprint(None)}
+    original = state["cc_ai_review_job_review_fingerprint_scope"]
+    rows[0]["상태"] = "제외"
+    monkeypatch.setattr(panel, "get_ai_review_job", lambda **_kw: {"status": "RUNNING"})
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("reused job must not copy caches or submit again")
+    monkeypatch.setattr(panel, "deepcopy", forbidden)
+    monkeypatch.setattr(panel, "submit_ai_review", forbidden)
+    assert panel.queue_ai_component_review(SimpleNamespace(session_state=state),
+        image_bytes=b"photo", scope="scope", rows=rows, records_key="rows", owner="owner") == (
+            "job", "owner", "RUNNING")
+    assert state["cc_ai_review_job_review_fingerprint_scope"] == original

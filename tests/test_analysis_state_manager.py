@@ -288,3 +288,22 @@ def test_board_analysis_projects_verified_measurements_and_drops_replaced_photo_
     args["board_registry"] = replaced_registry
     stale_measurement = current_analysis_snapshot(st, project, **args)
     assert stale_measurement["measurements"] == []
+
+
+def test_late_commit_cannot_cancel_new_run_or_hide_its_result():
+    state = {}
+    scope = AnalysisScope("p-late", "b", "board")
+    first, second = _fingerprints(), _fingerprints(symptoms="no_led")
+    old_run = begin_analysis(state, scope=scope, fingerprints=first)
+    new_run = begin_analysis(state, scope=scope, fingerprints=second)
+    before = get_current_state(state, scope)
+    assert not commit_analysis_result(state, scope=scope, run_id=old_run,
+                                      fingerprints=first, result={"old": True})
+    assert get_current_state(state, scope) == before
+    assert commit_analysis_result(state, scope=scope, run_id=new_run,
+                                  fingerprints=second, result={"new": True})
+    committed = get_current_state(state, scope)
+    assert not commit_analysis_result(state, scope=scope, run_id=new_run,
+                                      fingerprints=second, result={"duplicate": True})
+    assert get_current_state(state, scope) == committed
+    assert get_current_result(state, scope=scope, fingerprints=second) == {"new": True}
