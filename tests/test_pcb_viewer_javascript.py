@@ -41,5 +41,17 @@ context.render({parentElement:parent,data:{...data,selected_component_id:'r1'},s
 nodes['[data-component-layer]'].events.keydown({key:'Enter',preventDefault(){},target:{closest(){return {dataset:{componentId:'r1'}};}}});
 assert.equal(second.length,1);assert.equal(first.length,1);assert.equal(second[0].value.component_id,'r1');
 assert.equal(second[0].value.event_epoch,'epoch');
+const hide=context.render({parentElement:parent,data:{...data,analysis_loading:true},setStateValue(){},
+ setTriggerValue:(key,value)=>second.push({key,value})});
+assert.equal(root.dataset.loading,'true');
+nodes['[data-viewport]'].events.click({clientX:15,clientY:15,detail:1});
+assert.equal(second.length,1);
+hide();
+context.render({parentElement:parent,data:{...data,analysis_loading:false},setStateValue(){},
+ setTriggerValue:(key,value)=>second.push({key,value})});
+assert.equal(root.dataset.loading,'false');
+nodes['[data-viewport]'].events.click({clientX:15,clientY:15,detail:1});
+assert.equal(second.length,2);
+
 ''', encoding="utf-8")
     subprocess.run([node, str(script), str(source)], check=True, capture_output=True, text=True)

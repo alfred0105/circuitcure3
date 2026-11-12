@@ -122,6 +122,7 @@ def render_component_viewer(
     project: ProjectContext, board_side: str, frame_id: str, selected_component_id: str | None,
     map_cache_key: str, image_mode: str,
     photo_id: str | None = None,
+    analysis_loading: bool = False,
     on_box_draw: Any | None = None,
 ) -> tuple[bool, str, str]:
     """Render the viewer and return API availability, key, and coordinate trust state."""
@@ -334,6 +335,7 @@ def render_component_viewer(
         st, image_png_base64=image_b64, image_size_px=image_size_px, components=payload,
         project_id=project.project_id, board_id=project.board_id or "", board_side=board_side,
         frame_id=frame_id, photo_id=photo_id or frame_id,
+        analysis_loading=analysis_loading,
         selected_component_id=selected_id, asset_key=image_fingerprint,
         overlay_version=overlay_version, debug_telemetry=debug_telemetry,
         selection_ack_event_id=ack_event_id, selection_rejected_event_id=rejected_event_id,

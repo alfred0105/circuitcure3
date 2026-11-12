@@ -237,13 +237,14 @@ def test_ai_progress_slot_never_clears_the_pcb_viewer():
     assert viewer_slot.cleared is False
 
 
-def test_qwen_and_workflow_progress_use_different_slots():
+def test_yolo_and_qwen_share_one_fixed_height_progress_slot():
     from pathlib import Path
 
     source = (Path(__file__).parents[1] / "src/circuitcare/dashboard/views/unified_workspace.py").read_text()
     assert "workflow_status_slot = st.empty()" in source
-    assert "qwen_progress_slot = st.container(height=152, border=False)" in source
-    assert "with qwen_progress_slot:" in source
+    assert 'st.container(height=152, border=False, key="cc_workflow_progress")' in source
+    assert "qwen_progress_slot = workflow_status_slot" in source
+    assert "with qwen_progress_slot.container():" in source
     assert "workflow_status_slot.empty()" in source
     assert "with status_slot.container():" not in source
 

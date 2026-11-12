@@ -2,6 +2,7 @@
 
 import base64
 import json
+import os
 import re
 import threading
 import time
@@ -16,13 +17,18 @@ class LocalLLMError(RuntimeError):
 
 class OllamaClient:
     def __init__(self, base_url: str = "http://127.0.0.1:11434", timeout_seconds: int = 180,
-                 num_predict: int = 1300, keep_alive: str = "10m", metadata_ttl_seconds: float = 30):
+                 num_predict: int = 1300, keep_alive: str = "10m", metadata_ttl_seconds: float = 30,
+                 auto_start: bool = False):
         parsed = urlparse(base_url)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Ollama must use a local loopback HTTP URL")
         if type(num_predict) is not int or num_predict < 1:
             raise ValueError("num_predict must be a positive integer")
+        self.backend = os.environ.get("CIRCUITCARE_LLM_BACKEND", "ollama")
+        if self.backend == "mlx" and base_url == "http://127.0.0.1:11434":
+            base_url = "http://127.0.0.1:8766"
         self.base_url = base_url.rstrip("/")
+        self.auto_start = auto_start
         self.timeout_seconds = timeout_seconds
         self.num_predict = num_predict
         self.keep_alive = keep_alive
@@ -177,6 +183,15 @@ class OllamaClient:
         }
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        if self.backend == "mlx":
+            from circuitcare.mlx_transport import request_mlx
+            try:
+                return request_mlx(self._http_request, method, path, payload)
+            except (ValueError, OSError) as exc:
+                raise LocalLLMError(f"Native MLX request failed: {exc}") from exc
+        return self._http_request(method, path, payload)
+
+    def _http_request(self, method: str, path: str, payload: dict | None = None) -> dict:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         request = Request(
             self.base_url + path,
@@ -185,8 +200,10 @@ class OllamaClient:
             method=method,
         )
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                result = json.loads(response.read().decode("utf-8"))
+            from circuitcare.ollama_runtime import ollama_request
+            with ollama_request(self.base_url, auto_start=self.auto_start):
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    result = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             raise LocalLLMError(f"Ollama request failed with HTTP {exc.code}: {detail}") from exc

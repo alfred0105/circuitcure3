@@ -133,7 +133,7 @@ def test_ai_review_runs_ocr_then_qwen_without_running_yolo(monkeypatch):
         calls.append("ocr")
         return {"records": []}
 
-    def run_qwen(*_args):
+    def run_qwen(*_args, **_kwargs):
         calls.append("qwen")
         return {"class_reviews": [], "duplicate_reviews": [], "missed_component_candidates": [], "notes": []}
 
@@ -1026,3 +1026,16 @@ def test_reusing_running_job_preserves_submission_versions_without_copying_cache
         image_bytes=b"photo", scope="scope", rows=rows, records_key="rows", owner="owner") == (
             "job", "owner", "RUNNING")
     assert state["cc_ai_review_job_review_fingerprint_scope"] == original
+
+
+def test_followup_batches_keep_component_crops_without_repeating_board_tiles():
+    from circuitcare.vision.ai_review_service import _review_images
+    output = io.BytesIO()
+    Image.new('RGB', (1600, 1400), 'white').save(output, format='PNG')
+    detections = [{'detection_id': 'r1', 'bbox_xyxy': [10, 10, 80, 50], 'confidence': .8}]
+    first = _review_images(output.getvalue(), detections, include_full_image=True)
+    later = _review_images(output.getvalue(), detections, include_full_image=False)
+    assert any(item['kind'] == 'native_resolution_tile' for item in first[2])
+    assert {item['kind'] for item in later[2]} == {'detection_crop'}
+    assert later[2][0]['detection_id'] == 'r1'
+    assert len(later[0]) < len(first[0])

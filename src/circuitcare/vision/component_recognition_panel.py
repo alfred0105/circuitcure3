@@ -316,7 +316,7 @@ def _ollama_review_client() -> Any:
     from circuitcare.local_llm import OllamaClient
     # Structured per-box fields, OCR evidence and split proposals can exceed a
     # 4096-token completion even for a six-box batch on Qwen3.5 9B.
-    return OllamaClient(timeout_seconds=300, num_predict=8192)
+    return OllamaClient(auto_start=True, timeout_seconds=300, num_predict=8192)
 
 
 def invalidate_qwen_review(state: Any, scope: str) -> None:
@@ -815,7 +815,8 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                 batch_fingerprint = hashlib.sha256(json.dumps({
                     "image": image_fingerprint, "detections": batch,
                     "ocr": (ocr_result or {}).get("records", []), "model": DEFAULT_REVIEW_MODEL,
-                    "schema": "qwen-review-v2", "input_version": 2,
+                    "schema": "qwen-review-v2", "input_version": 3,
+                    "include_board_context": batch_index == 1,
                 }, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
                 cached_batch = batch_cache.get(batch_fingerprint)
                 if isinstance(cached_batch, dict) and cached_batch.get("status") == "complete":
@@ -825,7 +826,8 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                     try:
                         qwen_requests += 1
                         partial = review_components_with_qwen(ollama, DEFAULT_REVIEW_MODEL,
-                            image_bytes, batch, (ocr_result or {}).get("records", []))
+                            image_bytes, batch, (ocr_result or {}).get("records", []),
+                            include_board_context=batch_index == 1)
                         batch_cache[batch_fingerprint] = {"status": "complete", "result": partial}
                     except Exception as batch_exc:
                         batch_cache[batch_fingerprint] = {"status": "failed", "error": str(batch_exc)}

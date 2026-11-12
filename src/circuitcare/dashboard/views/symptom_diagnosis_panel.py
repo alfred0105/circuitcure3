@@ -924,7 +924,7 @@ def _apply_qwen_pcb_assist(
     }
     try:
         result["qwen_fault_proposals"] = suggest_pcb_fault_candidates(
-            OllamaClient(timeout_seconds=120), selected_model,
+            OllamaClient(auto_start=True, timeout_seconds=120), selected_model,
             pcb_context=context, diagnosis=result, knowledge=knowledge,
         )
     except (LocalLLMError, ValueError, TypeError, OSError) as exc:
@@ -949,7 +949,7 @@ def _apply_qwen_pcb_assist(
     if len(result.get("hypotheses", [])) > 1 and eligible_questions:
         try:
             result["llm_follow_up_question"] = select_follow_up_question(
-                OllamaClient(timeout_seconds=120), selected_model, pcb_context=context,
+                OllamaClient(auto_start=True, timeout_seconds=120), selected_model, pcb_context=context,
                 diagnosis=result, answered_test_ids=answered_test_ids,
             )
         except (LocalLLMError, ValueError, TypeError, OSError) as exc:
@@ -1286,7 +1286,7 @@ def render_symptom_diagnosis_panel(
             try:
                 analysis_progress.write("증상 구조화 · 진행 중")
                 with st.spinner("AI가 증상을 정리하는 중…" if simple_ui else f"{selected_model}이 증상을 구조화하는 중…"):
-                    parsed = parse_user_report(OllamaClient(timeout_seconds=120), selected_model, symptom_text)
+                    parsed = parse_user_report(OllamaClient(auto_start=True, timeout_seconds=120), selected_model, symptom_text)
                 analysis_progress.write("증상 구조화 · 완료")
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 parsed = {"observations": [], "uncertain_facts": [], "parser_status": "FAILED", "error": str(exc)}
@@ -1352,7 +1352,7 @@ def render_symptom_diagnosis_panel(
             try:
                 with st.spinner("AI가 추가 가능성을 확인하는 중…" if simple_ui else f"{selected_model}이 미등록 원인 가능성을 별도 검토하는 중…"):
                     result["llm_unverified_suggestions"] = suggest_unregistered_causes(
-                        OllamaClient(timeout_seconds=120), selected_model,
+                        OllamaClient(auto_start=True, timeout_seconds=120), selected_model,
                         symptom_text=symptom_text, diagnosis=result,
                     )
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
@@ -1361,7 +1361,7 @@ def render_symptom_diagnosis_panel(
             try:
                 with st.spinner("AI가 근거를 정리하는 중…" if simple_ui else f"{selected_model}이 근거를 정리하는 중…"):
                     result["llm_assist"] = explain_candidates(
-                        OllamaClient(timeout_seconds=120), selected_model,
+                        OllamaClient(auto_start=True, timeout_seconds=120), selected_model,
                         symptom_text=symptom_text, diagnosis=result,
                     )
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
@@ -1370,7 +1370,7 @@ def render_symptom_diagnosis_panel(
             try:
                 with st.spinner("AI가 소자별 검사 이유를 정리하는 중…" if simple_ui else f"{selected_model}이 소자별 검사 이유를 짧게 정리하는 중…"):
                     result["llm_component_explanations"] = explain_component_candidates(
-                        OllamaClient(timeout_seconds=120), selected_model,
+                        OllamaClient(auto_start=True, timeout_seconds=120), selected_model,
                         candidates=result["component_candidates"],
                     )
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
@@ -1752,7 +1752,7 @@ def render_symptom_diagnosis_panel(
             if llm_enabled and selected_model and state["result"].get("hypotheses"):
                 try:
                     state["result"]["llm_assist"] = explain_candidates(
-                        OllamaClient(timeout_seconds=120), selected_model,
+                        OllamaClient(auto_start=True, timeout_seconds=120), selected_model,
                         symptom_text=symptom_text, diagnosis=state["result"],
                     )
                 except (LocalLLMError, ValueError, TypeError, OSError) as exc:
@@ -1760,7 +1760,7 @@ def render_symptom_diagnosis_panel(
             if llm_enabled and selected_model and state["result"].get("component_candidates"):
                 try:
                     state["result"]["llm_component_explanations"] = explain_component_candidates(
-                        OllamaClient(timeout_seconds=120), selected_model,
+                        OllamaClient(auto_start=True, timeout_seconds=120), selected_model,
                         candidates=state["result"]["component_candidates"],
                     )
                 except (LocalLLMError, ValueError, TypeError, OSError) as exc:

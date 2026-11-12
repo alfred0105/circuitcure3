@@ -320,6 +320,7 @@ def review_components_with_qwen(
     ocr_records: list[dict[str, Any]],
     *, duplicate_pair_candidates: list[dict[str, Any]] | None = None,
     duplicate_pairs_only: bool = False,
+    include_board_context: bool = True,
 ) -> dict[str, Any]:
     """Request suggestions and validate every ID and normalized box before display."""
     identified = []
@@ -359,7 +360,7 @@ def review_components_with_qwen(
             image_bytes, identified, group_candidates=group_candidates,
             duplicate_pair_candidates=duplicate_pair_candidates,
             max_crop_count=0 if duplicate_pairs_only else 10,
-            include_full_image=not duplicate_pairs_only,
+            include_full_image=not duplicate_pairs_only and include_board_context,
             review_diagnostics=candidate_diagnostics)
     except Exception as exc:
         raise AIReviewStageError("candidate_search", str(exc)) from exc

@@ -233,21 +233,15 @@ try:
             st.markdown("**AI 소자 검수 진행 중**")
             st.caption(labels.get(progress.get("stage"), "OCR · Qwen 검수") +
                        f" · {job.get('elapsed_ms', 0) / 1000:.0f}초")
-            messages = progress.get("messages", [])
-            if any("PCB OCR · 완료" in message for message in messages):
-                st.caption("RapidOCR · 완료")
-            elif any("PCB OCR · 진행 중" in message for message in messages):
-                st.caption("RapidOCR · 진행 중")
-            if progress.get("total_batches"):
-                current_batch = progress.get("current_batch", 0)
-                st.progress(min(1.0, progress.get("completed_batches", 0) /
-                                max(1, progress["total_batches"])),
-                            text=f"Qwen 분류 배치 {current_batch}/{progress['total_batches']} 진행 중 · "
-                                 f"{progress.get('completed_batches', 0)}/{progress['total_batches']} 완료")
-            if progress.get("message"):
-                st.caption(progress["message"])
+            total = max(1, int(progress.get("total_batches") or 0))
+            completed = max(0, int(progress.get("completed_batches") or 0))
+            st.progress(min(1.0, completed / total),
+                        text=(f"분류 {completed}/{total} 배치 완료" if progress.get("total_batches")
+                              else labels.get(progress.get("stage"), "작업 준비 중")))
+            detail = str(progress.get("message") or "AI 응답을 기다리고 있습니다.")
             if progress.get("errors"):
-                st.warning("일부 단계에서 오류가 발생했습니다. 성공한 검수 결과는 계속 처리합니다.")
+                detail = "일부 단계 오류 · 성공한 결과는 보존됩니다. " + detail
+            st.caption(detail)
             return
         if _commit_review_job(st, scope=scope):
             status = st.session_state.get(f"cc_ai_review_job_status_{scope}")
@@ -1221,6 +1215,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         board_side=side_enum or active_side, frame_id=frame_id,
         selected_component_id=selected_component_id,
         photo_id=str(selected),
+        analysis_loading=st.session_state.get(f"cc_ai_review_job_status_{review_scope}") in {"PENDING", "RUNNING"},
         # Keep the selection owner key identical to _render_pcb's invalidation
         # key even when this photo has no registered component map yet.
         map_cache_key=cache_key, image_mode=mode,
@@ -2096,9 +2091,11 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
         viewer_slot = None
         viewer_error_slot = None
         with left:
-            workflow_status_slot = st.empty()
-            # Keep the left layout height constant before, during and after AI review.
-            qwen_progress_slot = st.container(height=152, border=False)
+            # YOLO, transitions, OCR and Qwen share one reserved surface. A
+            # disappearing status above a separate Qwen surface shifted Viewer.
+            with st.container(height=152, border=False, key="cc_workflow_progress"):
+                workflow_status_slot = st.empty()
+            qwen_progress_slot = workflow_status_slot
             viewer_slot = st.empty()
             viewer_error_slot = st.empty()
             pending_label = workflow.pop("pending_left_status", None)
@@ -2171,15 +2168,15 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                 f"cc_ai_review_job_status_{active_review_scope}") if active_review_scope else None)
             if (_render_ai_review_progress is not None
                     and active_review_status in {"PENDING", "RUNNING"}):
-                with qwen_progress_slot:
+                with qwen_progress_slot.container():
                     _render_ai_review_progress(st, project.project_id, active_review_scope)
             elif active_review_scope and active_review_status == "QUEUE_FULL":
-                with qwen_progress_slot:
+                with qwen_progress_slot.container():
                     st.warning(st.session_state.get(
                         f"cc_ai_review_job_message_{active_review_scope}",
                         "AI 검수 대기열이 가득 찼습니다. 잠시 후 다시 실행해 주세요."))
             elif active_review_scope and active_review_status in {"COMPLETE", "FAILED", "STALE", "UNAVAILABLE", "AI_REVIEW_PARTIAL"}:
-                with qwen_progress_slot:
+                with qwen_progress_slot.container():
                     if active_review_status == "COMPLETE":
                         st.caption("RapidOCR · Qwen 검수 완료 · 제안은 사용자 확인 전까지 미확정")
                     elif active_review_status == "STALE":

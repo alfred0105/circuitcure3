@@ -178,8 +178,19 @@ def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[st
                          else "FAILED" if result.upper() in {"FAILED", "UNAVAILABLE"}
                          else "COMPLETE")
         final_stage = "FAILED" if result_status == "FAILED" else "COMPLETE"
-        progress.set_stage(final_stage, "AI 검수 작업 실패" if final_stage == "FAILED" else "AI 검수 작업 완료")
+        failures = review.get("failed_batches") or []
+        error = next((str(item.get("error")) for item in failures
+                      if isinstance(item, dict) and item.get("error")), None)
+        if not error:
+            diagnostics = review.get("review_diagnostics") or {}
+            error = next((str(diagnostics.get(stage, {}).get("error"))
+                          for stage in ("qwen", "candidate_search")
+                          if isinstance(diagnostics.get(stage), dict)
+                          and diagnostics[stage].get("error")), None)
+        progress.set_stage(final_stage, (f"AI 검수 실패 · {error}" if error else "AI 검수 작업 실패")
+                           if final_stage == "FAILED" else "AI 검수 작업 완료")
         return {"status": result_status, "state": state, "messages": progress.snapshot()["messages"],
+                "error": error,
                 "progress": progress.snapshot(),
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                 "fingerprint": snapshot["fingerprint"], "scope": snapshot["scope"],

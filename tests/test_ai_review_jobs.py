@@ -226,3 +226,17 @@ def test_running_job_exposes_thread_safe_progress_snapshot(monkeypatch):
     assert running["status"] == "RUNNING"
     assert running["progress"]["stage"] == "OCR_MARKINGS"
     assert running["progress"]["message"] == "소자 각인 OCR 처리 중"
+
+
+def test_worker_failure_returns_original_batch_error(monkeypatch):
+    from circuitcare.vision import component_recognition_panel as panel
+    def failed(api, **kwargs):
+        api.session_state['cc_component_qwen_review_s'] = {
+            'verification_status': 'AI_REVIEW_FAILED',
+            'failed_batches': [{'error': 'Ollama request timed out'}]}
+        return 'failed'
+    monkeypatch.setattr(panel, 'ensure_ai_component_review', failed)
+    result = ai_review_jobs._run({'state': {}, 'scope': 's', 'rows': [],
+        'records_key': 'rows', 'image_bytes': b'photo', 'fingerprint': 'v1'})
+    assert result['status'] == 'FAILED'
+    assert result['error'] == 'Ollama request timed out'

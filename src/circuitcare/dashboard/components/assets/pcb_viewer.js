@@ -30,6 +30,11 @@ export default function(component) {
   }
   state.renderCount += 1;
   state.data = data;
+  const loading = Boolean(data.analysis_loading);
+  root.dataset.loading = loading ? "true" : "false";
+  const loadingPanel = root.querySelector("[data-loading]");
+  if (loadingPanel) loadingPanel.hidden = !loading;
+  if (loading) { tooltip.hidden = true; state.hover = null; }
   const telemetry = (event, details = {}) => {
     if (!data.debug_telemetry) return;
     const digest = (value) => {
@@ -70,6 +75,7 @@ export default function(component) {
   };
   // Hover and click must use this exact SVG→image transform and hit policy.
   const hitComponents = (event) => {
+    if (state.data.analysis_loading) return [];
     const p = point(event.clientX, event.clientY);
     const x = (p.x - state.x) / state.scale;
     const y = (p.y - state.y) / state.scale;
@@ -116,6 +122,7 @@ export default function(component) {
       : `박스 ${(state.data.components || []).length}개 · 클릭하여 선택`;
   };
   const sendSelection = (componentId, action = null, bbox = null, overlapIds = null) => {
+    if (state.data.analysis_loading) return;
     state.sequence += 1;
     const eventId = `${Date.now()}-${state.sequence}`;
     const payload = {
@@ -298,6 +305,7 @@ export default function(component) {
   if (state.listeners.length === 0) {
     listen(viewport,"wheel",(event)=>{ event.preventDefault(); zoomAt(event.deltaY<0?1.12:1/1.12,point(event.clientX,event.clientY)); },{passive:false});
     listen(viewport,"pointerdown",(event)=>{
+      if (state.data.analysis_loading) return;
       if (event.button!==0) return;
       const p=point(event.clientX,event.clientY);
       if(state.drawMode){
