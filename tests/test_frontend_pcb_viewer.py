@@ -137,7 +137,7 @@ def test_viewer_click_keeps_valid_selection_and_filters_stale_overlap_ids(monkey
             "overlapping_component_ids": ["c1", "deleted-stale-id"], "event_seq": 1,
             "event_id": "click-stale-overlap", "event_epoch": kwargs["event_epoch"],
         }}
-        kwargs["on_selection_change"]()
+        kwargs["on_selection_event_change"]()
         return object()
 
     monkeypatch.setattr(workspace, "render_pcb_viewer", fake_render)
@@ -237,6 +237,39 @@ def test_ai_progress_slot_never_clears_the_pcb_viewer():
     assert viewer_slot.cleared is False
 
 
+def test_qwen_and_workflow_progress_use_different_slots():
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "src/circuitcare/dashboard/views/unified_workspace.py").read_text()
+    assert "workflow_status_slot = st.empty()" in source
+    assert "qwen_progress_slot = st.empty()" in source
+    assert "with qwen_progress_slot.container():" in source
+    assert "workflow_status_slot.empty()" in source
+    assert "with status_slot.container():" not in source
+
+
+def test_viewer_identity_and_image_asset_are_independent_from_overlay_version(monkeypatch):
+    import circuitcare.dashboard.components.pcb_workspace as workspace
+
+    st = SimpleNamespace(session_state={SELECTION_KEY: SelectionState("p1", "b1")})
+    output = io.BytesIO()
+    Image.new("RGB", (32, 32), "white").save(output, format="PNG")
+    captured = []
+    monkeypatch.setattr(workspace, "render_pcb_viewer",
+                        lambda _st, **kwargs: captured.append(kwargs) or object())
+    args = dict(st=st, image=None, source_image_bytes=output.getvalue(), canonical_png_bytes=None,
+                image_size_px=(32, 32), components=(_model(),), project=ProjectContext("p1", "b1"),
+                board_side="TOP", frame_id="photo1", selected_component_id=None,
+                image_mode="원본 사진")
+    workspace.render_component_viewer(**args, map_cache_key="overlay-v1")
+    changed_box = ComponentOverlayViewModel(**{**_model().__dict__, "bbox_xyxy": (11, 21, 31, 51)})
+    workspace.render_component_viewer(**{**args, "components": (changed_box,)}, map_cache_key="overlay-v2")
+
+    assert captured[0]["key"] == captured[1]["key"]
+    assert captured[0]["asset_key"] == captured[1]["asset_key"]
+    assert captured[0]["overlay_version"] != captured[1]["overlay_version"]
+
+
 def test_viewer_updates_regions_incrementally_without_replacing_svg_layer():
     from pathlib import Path
 
@@ -244,6 +277,9 @@ def test_viewer_updates_regions_incrementally_without_replacing_svg_layer():
     assert "layer.replaceChildren()" not in source
     assert "state.regionNodes = new Map()" in source
     assert "entry.shape.classList.toggle(\"cc-selected\", id === selectedId)" in source
+    assert "state.setTriggerValue(\"selection_event\", payload)" in source
+    assert 'state.setStateValue("selection", payload)' not in source
+    assert 'image.setAttribute("href"' in source
 
 
 def test_pcb_viewer_uses_shared_hit_test_from_real_click_and_does_not_capture_plain_click():

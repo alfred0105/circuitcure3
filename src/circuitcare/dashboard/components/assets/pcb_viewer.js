@@ -23,14 +23,33 @@ export default function(component) {
   if (!state) {
     state = { scale:1, x:0, y:0, assetKey:"", hover:null, drag:null, drawMode:false, boxDraw:null,
       selectedComponentId:undefined, pendingSelection:null, suppressClick:false,
-      listeners:[], observer:null, sequence:0, userAdjusted:false, mountedAssetKey:"" };
+      listeners:[], observer:null, sequence:0, userAdjusted:false, mountedAssetKey:"",
+      instanceId:`pcb-${Date.now()}-${Math.random().toString(36).slice(2,8)}`, renderCount:0, hrefChangeCount:0 };
     instances.set(root, state);
+    state.mounted=true;
   }
+  state.renderCount += 1;
   state.data = data;
+  const telemetry = (event, details = {}) => {
+    if (!data.debug_telemetry) return;
+    const digest = (value) => {
+      let hash=2166136261;
+      for (const char of String(value || "")) hash=Math.imul(hash ^ char.charCodeAt(0),16777619);
+      return (hash>>>0).toString(16).padStart(8,"0");
+    };
+    console.debug("[pcb-viewer-telemetry]", {event, timestamp:new Date().toISOString(),
+      instance_id:state.instanceId, viewer_key:root.dataset.viewerKey || data.viewer_key || null,
+      asset_key_hash:digest(state.assetKey || data.asset_key), frame_id:data.frame_id,
+      image_fingerprint:String(data.asset_key || "").slice(0,16), render_count:state.renderCount,
+      href_change_count:state.hrefChangeCount, ...details});
+  };
+  if (state.renderCount === 1) telemetry("VIEWER_MOUNT", {reason:"component identity created"});
+  else telemetry("VIEWER_RENDER", {reason:"Streamlit component data update"});
   state.setStateValue = setStateValue;
   // Hold the optimistic highlight until Python acknowledges this exact click.
   // A rerun carrying the previous server selection must not make it flash off.
   if (state.pendingSelection && data.selection_ack_event_id === state.pendingSelection.eventId) {
+    telemetry("SELECTION_ACK", {event_id:state.pendingSelection.eventId, component_id:state.pendingSelection.componentId});
     state.pendingSelection = null;
     state.selectedComponentId = data.selected_component_id;
   } else if (state.pendingSelection && data.selection_rejected_event_id === state.pendingSelection.eventId) {
@@ -104,12 +123,13 @@ export default function(component) {
       overlapping_component_ids:overlapIds || (componentId ? [componentId] : []),
       event_id:eventId,
     };
+    telemetry("SELECTION_SENT", {event_id:payload.event_id, event_seq:payload.event_seq,
+      component_id:componentId, overlapping_count:payload.overlapping_component_ids.length});
     console.debug("[pcb-selection] event_send", {event_id:payload.event_id, seq:payload.event_seq,
       action:payload.selection_action, component_id:componentId,
       overlapping_component_ids:payload.overlapping_component_ids});
-    state.setStateValue("selection", payload);
-    // CCv2 state values persist the complete selected component; the explicit
-    // trigger guarantees a rerun/callback for each click, including same-box clicks.
+    // Selection is an event, not durable frontend state: the trigger guarantees
+    // one callback per physical click, including repeated clicks on the same box.
     state.setTriggerValue("selection_event", payload);
     if (action !== "draw") state.pendingSelection = {eventId, componentId};
   };
@@ -217,6 +237,7 @@ export default function(component) {
     image.setAttribute("x","0"); image.setAttribute("y","0");
     image.setAttribute("width",String(width)); image.setAttribute("height",String(height));
     const key = `${data.asset_key}|${data.project_id}|${data.board_id}|${data.board_side}|${data.frame_id}`;
+    const readyOnceKey = key;
     const reportReady = () => {
       if (state.assetKey !== key || state.mountedAssetKey === key) return;
       const [expectedWidth, expectedHeight] = data.image_size_px;
@@ -225,8 +246,11 @@ export default function(component) {
       state.mountedAssetKey=key;
       setStateValue("viewer_status", { asset_key:key, status:"READY",
         image_size_px:[expectedWidth,expectedHeight], event_id:`ready-${Date.now()}` });
+      telemetry("VIEWER_READY", {reason:"image decoded", ready_key_hash:readyOnceKey.slice(0,24)});
     };
     if (state.assetKey !== key) {
+      const previousAssetKey = state.assetKey;
+      telemetry("ASSET_KEY_CHANGED", {reason:previousAssetKey ? "image fingerprint changed" : "initial image"});
       state.assetKey=key;
       state.hover=null; state.drag=null; state.boxDraw=null; state.drawMode=false;
       state.selectedComponentId=undefined; state.pendingSelection=null; state.suppressClick=false;
@@ -236,6 +260,9 @@ export default function(component) {
       state.mountedAssetKey="";
       image.addEventListener("load", reportReady, { once:true });
       image.setAttribute("href", `data:image/png;base64,${data.image_png_base64}`);
+      state.hrefChangeCount += 1;
+      telemetry("IMAGE_HREF_CHANGED", {reason:previousAssetKey ? "new image fingerprint" : "initial image"});
+      telemetry("CAMERA_RESET", {reason:"image asset changed"});
       fit();
     }
     if (state.mountedAssetKey !== key) {
@@ -361,6 +388,16 @@ export default function(component) {
       if(!state.userAdjusted)fit();
     }); state.observer.observe(viewport);
   }
+  const previousOverlayVersion=state.overlayVersion;
   setImage(); renderRegions(); drawCamera();
-  return ()=>{ for(const remove of state.listeners.splice(0))remove(); state.observer?.disconnect(); };
+  if (previousOverlayVersion !== data.overlay_version) {
+    telemetry("REGION_PATCH", {reason:previousOverlayVersion ? "overlay version changed" : "initial regions",
+      overlay_version:data.overlay_version, component_count:(data.components || []).length});
+    state.overlayVersion=data.overlay_version;
+  }
+  return ()=>{
+    for(const remove of state.listeners.splice(0))remove();
+    state.observer?.disconnect();
+    if (!root.isConnected && state.mounted) { telemetry("VIEWER_UNMOUNT", {reason:"component DOM removed"}); state.mounted=false; }
+  };
 }

@@ -96,6 +96,11 @@ def _queue_ai_review(st: Any, *, project: ProjectContext, image_bytes: bytes,
         st, image_bytes=image_bytes, scope=scope, rows=rows,
         records_key=records_key, owner=owner,
     )
+    LOGGER.info("AI_JOB_SUBMITTED project=%s scope_hash=%s status=%s job_id=%s",
+                project.project_id, hashlib.sha256(scope.encode()).hexdigest()[:12], status, job_id or "none")
+    if status == "QUEUE_FULL":
+        st.session_state[f"cc_ai_review_job_status_{scope}"] = "QUEUE_FULL"
+        st.session_state[f"cc_ai_review_job_message_{scope}"] = "AI 검수 대기열이 가득 찼습니다. 잠시 후 다시 실행해 주세요."
     return job_id or "", status
 
 
@@ -116,6 +121,8 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
     if job.get("fingerprint") != fingerprint or _review_fingerprint(current_rows, None) != fingerprint:
         state[f"cc_ai_review_job_status_{scope}"] = "STALE"
         state[f"cc_ai_review_job_committed_{scope}"] = job_id
+        LOGGER.info("AI_JOB_COMMITTED scope_hash=%s status=STALE reason=fingerprint_changed",
+                    hashlib.sha256(scope.encode()).hexdigest()[:12])
         return True
     result_state = job.get("state", {})
     allowed = (records_key, *review_aux_keys(scope), f"cc_component_marking_ocr_{scope}",
@@ -125,7 +132,11 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
         if key in result_state:
             state[key] = result_state[key]
     # The source fingerprint is checked above before replacing any session data.
-    state[f"cc_ai_review_job_status_{scope}"] = job.get("status", "FAILED")
+    review_result = state.get(review_aux_keys(scope)[1])
+    committed_status = job.get("status", "FAILED")
+    if isinstance(review_result, dict) and review_result.get("verification_status") == "AI_REVIEW_PARTIAL":
+        committed_status = "AI_REVIEW_PARTIAL"
+    state[f"cc_ai_review_job_status_{scope}"] = committed_status
     state[f"cc_ai_review_job_result_ms_{scope}"] = job.get("duration_ms")
     state[f"cc_ai_review_job_messages_{scope}"] = job.get("messages", [])
     state[f"cc_ai_review_job_committed_{scope}"] = job_id
@@ -134,6 +145,8 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
                     "status": job.get("status"), "image_bytes": None,
                     "scope_hash": hashlib.sha256(scope.encode()).hexdigest()[:12]})
     del metrics[:-50]
+    LOGGER.info("AI_JOB_COMMITTED scope_hash=%s status=%s duration_ms=%s",
+                hashlib.sha256(scope.encode()).hexdigest()[:12], committed_status, job.get("duration_ms"))
     return True
 
 
@@ -144,27 +157,63 @@ try:
     def _render_ai_review_progress(st: Any, project_id: str, scope: str | None) -> None:
         if not scope:
             return
-        job_id = st.session_state.get(f"cc_ai_review_job_{scope}")
-        owner = st.session_state.get(f"cc_ai_review_job_owner_{scope}")
+        state = st.session_state
+        job_id = state.get(f"cc_ai_review_job_{scope}")
+        owner = state.get(f"cc_ai_review_job_owner_{scope}")
         if not job_id or not owner:
             return
         job = get_ai_review_job(owner=owner, job_id=job_id)
         if job is None:
+            st.warning("AI 검수 작업 상태를 찾을 수 없습니다. PCB 탐지와 기존 검수 기록은 유지됩니다.")
             return
-        if job.get("status") == "RUNNING":
-            st.caption(f"RapidOCR · Qwen 검수 진행 중 · {job.get('elapsed_ms', 0) / 1000:.0f}초")
+        if job.get("status") in {"PENDING", "RUNNING"}:
+            running_log_key = f"cc_ai_review_job_running_logged_{scope}"
+            if job.get("status") == "RUNNING" and state.get(running_log_key) != job_id:
+                state[running_log_key] = job_id
+                LOGGER.info("AI_JOB_RUNNING project=%s scope_hash=%s job_id=%s",
+                            project_id, hashlib.sha256(scope.encode()).hexdigest()[:12], job_id)
+            progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+            state[f"cc_ai_review_fragment_rerun_count"] = int(state.get("cc_ai_review_fragment_rerun_count", 0)) + 1
+            LOGGER.info("FRAGMENT_RERUN scope_hash=%s count=%s stage=%s",
+                        hashlib.sha256(scope.encode()).hexdigest()[:12],
+                        state["cc_ai_review_fragment_rerun_count"], progress.get("stage", "RUNNING"))
+            labels = {"OCR_BOARD": "RapidOCR · PCB 문자 탐색", "OCR_MARKINGS": "RapidOCR · 소자 각인",
+                      "QWEN_CLASS_REVIEW": "Qwen3.5 · 소자 분류", "QWEN_DUPLICATE_REVIEW": "Qwen3.5 · 중복 검토",
+                      "RESULT_VALIDATION": "결과 검증", "COMPLETE": "완료", "FAILED": "실패"}
+            st.markdown("**AI 소자 검수 진행 중**")
+            st.caption(labels.get(progress.get("stage"), "OCR · Qwen 검수") +
+                       f" · {job.get('elapsed_ms', 0) / 1000:.0f}초")
+            messages = progress.get("messages", [])
+            if any("PCB OCR · 완료" in message for message in messages):
+                st.caption("RapidOCR · 완료")
+            elif any("PCB OCR · 진행 중" in message for message in messages):
+                st.caption("RapidOCR · 진행 중")
+            if progress.get("total_batches"):
+                current_batch = progress.get("current_batch", 0)
+                st.progress(min(1.0, progress.get("completed_batches", 0) /
+                                max(1, progress["total_batches"])),
+                            text=f"Qwen 분류 배치 {current_batch}/{progress['total_batches']} 진행 중 · "
+                                 f"{progress.get('completed_batches', 0)}/{progress['total_batches']} 완료")
+            if progress.get("message"):
+                st.caption(progress["message"])
+            if progress.get("errors"):
+                st.warning("일부 단계에서 오류가 발생했습니다. 성공한 검수 결과는 계속 처리합니다.")
             return
         if _commit_review_job(st, scope=scope):
             status = st.session_state.get(f"cc_ai_review_job_status_{scope}")
             if status == "STALE":
                 st.info("입력 박스가 변경되어 오래된 AI 결과를 적용하지 않았습니다. AI 소자 검수를 다시 실행할 수 있습니다.")
-            elif status == "FAILED":
+            elif status in {"FAILED", "UNAVAILABLE"}:
                 st.warning(job.get("error") or "AI 검수 작업이 실패했습니다. 기존 탐지·검수 기록은 보존됩니다.")
+            elif status == "AI_REVIEW_PARTIAL":
+                st.warning("AI 검수 일부 실패 · 성공한 제안과 사용자 검수 기록은 보존됩니다.")
             else:
                 st.caption("RapidOCR · Qwen 검수 완료 · 제안은 사용자 확인 전까지 미확정")
+            LOGGER.info("AI_JOB_COMPLETED project=%s scope_hash=%s status=%s",
+                        project_id, hashlib.sha256(scope.encode()).hexdigest()[:12], status)
+            # The parent needs one rerun to consume the committed photo snapshot
+            # and remove this polling fragment. No rerun occurs on each poll.
             _streamlit.rerun()
-        else:
-            st.caption("RapidOCR · Qwen 검수 완료")
 except (ImportError, AttributeError):  # Older Streamlit remains usable without live polling.
     _render_ai_review_progress = None
 
@@ -584,6 +633,9 @@ def _prepare_board_registry_snapshot(
         st.session_state, project_id=project.project_id, board_id=project.board_id,
         photo_snapshots=by_photo,
     )
+    LOGGER.info("REGISTRY_REBUILT project=%s photo_count=%s component_count=%s version=%s",
+                project.project_id, len(by_photo), len(registry.get("components", [])),
+                str(registry.get("version", ""))[-16:])
     for photo_id, snapshot in by_photo.items():
         models = tuple(replace(item, board_component_id=registry["source_to_board_id"].get(
             source_key_for_component(photo_id, item.component_id))) for item in snapshot.get("components", ()))
@@ -1457,12 +1509,12 @@ def _render_workflow_stepper(st: Any, workflow: dict[str, Any]) -> None:
 class _LeftProgressSlot:
     """Render work status beside the PCB without clearing or moving the Viewer."""
 
-    def __init__(self, status_slot: Any, viewer_slot: Any) -> None:
-        self.status_slot = status_slot
+    def __init__(self, workflow_status_slot: Any, viewer_slot: Any) -> None:
+        self.workflow_status_slot = workflow_status_slot
         self.viewer_slot = viewer_slot
 
     def container(self) -> Any:
-        return self.status_slot.container()
+        return self.workflow_status_slot.container()
 
 
 def _advance_workflow(st: Any, project: ProjectContext, stage: str, label: str, event: str, *,
@@ -1941,6 +1993,9 @@ def _render_workflow_report(
 
 def render_workbench_shell(st: Any, project: ProjectContext) -> None:
     """Keep the PCB Viewer fixed while rendering one selected task panel."""
+    run_count = int(st.session_state.get("cc_debug_full_script_rerun_count", 0)) + 1
+    st.session_state["cc_debug_full_script_rerun_count"] = run_count
+    LOGGER.info("FULL_SCRIPT_RERUN project=%s count=%s", project.project_id, run_count)
     _style(st)
     selection = st.session_state.get(SELECTION_KEY)
     if getattr(selection, "project_id", None) != project.project_id:
@@ -1952,16 +2007,20 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
     workflow = get_workflow_state(st.session_state, project)
     with st.container(key="cc_workbench_body"):
         left, right = st.columns([1.85, 1], gap="large")
-        status_slot = None
+        workflow_status_slot = None
+        qwen_progress_slot = None
         viewer_slot = None
+        viewer_error_slot = None
         with left:
-            status_slot = st.empty()
+            workflow_status_slot = st.empty()
+            qwen_progress_slot = st.empty()
             viewer_slot = st.empty()
+            viewer_error_slot = st.empty()
             pending_label = workflow.pop("pending_left_status", None)
             transition_progress = None
             if pending_label:
                 workflow["transition_status"] = "PREPARING"
-                with status_slot.container():
+                with workflow_status_slot.container():
                     transition_progress = st.status(pending_label, expanded=True)
                     transition_progress.write("입력과 프로젝트 범위를 확인합니다.")
                     transition_progress.write("기존 사진별 탐지 결과·Registry·분석 Fingerprint를 재사용합니다.")
@@ -2022,17 +2081,32 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
             active_review_scope = (photo_snapshot or {}).get("review_scope")
             active_review_status = (st.session_state.get(
                 f"cc_ai_review_job_status_{active_review_scope}") if active_review_scope else None)
-            if (status_slot is not None and _render_ai_review_progress is not None
+            if (_render_ai_review_progress is not None
                     and active_review_status in {"PENDING", "RUNNING"}):
-                with status_slot.container():
+                with qwen_progress_slot.container():
                     _render_ai_review_progress(st, project.project_id, active_review_scope)
+            elif active_review_scope and active_review_status == "QUEUE_FULL":
+                with qwen_progress_slot.container():
+                    st.warning(st.session_state.get(
+                        f"cc_ai_review_job_message_{active_review_scope}",
+                        "AI 검수 대기열이 가득 찼습니다. 잠시 후 다시 실행해 주세요."))
+            elif active_review_scope and active_review_status in {"COMPLETE", "FAILED", "STALE", "UNAVAILABLE", "AI_REVIEW_PARTIAL"}:
+                with qwen_progress_slot.container():
+                    if active_review_status == "COMPLETE":
+                        st.caption("RapidOCR · Qwen 검수 완료 · 제안은 사용자 확인 전까지 미확정")
+                    elif active_review_status == "STALE":
+                        st.info("입력 박스가 변경되어 오래된 AI 결과를 적용하지 않았습니다. 검수를 다시 실행할 수 있습니다.")
+                    elif active_review_status == "AI_REVIEW_PARTIAL":
+                        st.warning("AI 검수 일부 실패 · 성공한 제안과 사용자 검수 기록은 보존됩니다.")
+                    else:
+                        st.warning("AI 검수가 끝났지만 일부 단계가 실패했습니다. 탐지와 사용자 검수 기록은 보존됩니다.")
             try:
                 with viewer_slot.container():
                     _render_pcb(st, project, photos)
             except Exception as exc:
                 workflow["transition_status"] = "FAILED"
                 workflow["transition_error"] = f"{type(exc).__name__}: {str(exc)[:400]}"
-                with status_slot.container():
+                with viewer_error_slot.container():
                     failed = st.status("PCB Viewer 준비 실패 · 기존 입력은 유지됩니다", state="error", expanded=True)
                     failed.write(f"{type(exc).__name__}: {str(exc)[:300]}")
             if transition_progress is not None:
@@ -2040,8 +2114,8 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                     transition_progress.update(label="단계 자료와 PCB Overlay 준비 완료",
                                                state="complete", expanded=False)
                     workflow["transition_status"] = "READY"
-                    status_slot.empty()
-        left_progress_slot = _LeftProgressSlot(status_slot, viewer_slot)
+                    workflow_status_slot.empty()
+        left_progress_slot = _LeftProgressSlot(workflow_status_slot, viewer_slot)
         with right:
             if workflow.get("transition_status") == "FAILED" and workflow.get("transition_error"):
                 st.error(f"단계 준비 실패 · {workflow['transition_error']} · 기존 검수·측정 기록은 보존됩니다.")

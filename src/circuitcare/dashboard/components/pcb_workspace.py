@@ -9,6 +9,7 @@ import hashlib
 import io
 import math
 import logging
+import os
 import secrets
 from typing import Any
 
@@ -81,20 +82,22 @@ def validate_component_selection_event(
 
 
 @lru_cache(maxsize=8)
-def _prepare_source_image(raw: bytes) -> tuple[str, tuple[int, int]]:
+def _prepare_source_image(raw: bytes) -> tuple[str, tuple[int, int], str]:
     loaded = load_board_image(raw, max_edge=2400)
     output = io.BytesIO()
     loaded.image.save(output, format="PNG", optimize=False)
-    return base64.b64encode(output.getvalue()).decode("ascii"), loaded.processed_size
+    png = output.getvalue()
+    return base64.b64encode(png).decode("ascii"), loaded.processed_size, hashlib.sha256(png).hexdigest()
 
 
 @lru_cache(maxsize=4)
-def _prepare_canonical_image(raw_png: bytes) -> tuple[str, tuple[int, int]]:
+def _prepare_canonical_image(raw_png: bytes) -> tuple[str, tuple[int, int], str]:
     with Image.open(io.BytesIO(raw_png)) as source:
         image = source.convert("RGB")
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=False)
-    return base64.b64encode(output.getvalue()).decode("ascii"), image.size
+    png = output.getvalue()
+    return base64.b64encode(png).decode("ascii"), image.size, hashlib.sha256(png).hexdigest()
 
 
 def scale_overlay_to_display(
@@ -121,17 +124,26 @@ def render_component_viewer(
 ) -> tuple[bool, str, str]:
     """Render the viewer and return API availability, key, and coordinate trust state."""
     if image_mode == "통합 이미지" and canonical_png_bytes is not None:
-        image_b64, display_size = _prepare_canonical_image(canonical_png_bytes)
+        image_b64, display_size, image_fingerprint = _prepare_canonical_image(canonical_png_bytes)
     else:
-        image_b64, display_size = _prepare_source_image(source_image_bytes)
+        image_b64, display_size, image_fingerprint = _prepare_source_image(source_image_bytes)
     if display_size != image_size_px:
         return False, "", "INVALID_COORDINATE_FRAME"
-    digest = hashlib.sha256(f"{project.project_id}|{project.board_id}|{map_cache_key}|{board_side}|{frame_id}|{image_mode}".encode()).hexdigest()[:16]
+    # Component identity follows the visible photo frame, not its overlay/data
+    # version. Detection and Qwen updates must patch regions in-place.
+    digest = hashlib.sha256(
+        f"{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}".encode()
+    ).hexdigest()[:16]
     viewer_key = f"cc_v4_pcb_viewer_{digest}"
-    epoch_key = f"{viewer_key}_event_epoch"
+    expected_asset_key = f"{image_fingerprint}|{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}"
+    overlay_version = hashlib.sha256(repr([
+        (item.component_id, item.bbox_xyxy, item.component_type, item.overlay_status,
+         item.ocr_marking, item.fault_candidate_status) for item in components
+    ]).encode()).hexdigest()[:16]
+    epoch_key = f"{viewer_key}_{image_fingerprint[:16]}_event_epoch"
     event_epoch = st.session_state.setdefault(epoch_key, secrets.token_urlsafe(18))
     active_frame_key = "circuitcare_v4_active_viewer_frame"
-    frame_scope = f"{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}|{image_mode}"
+    frame_scope = f"{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}|{image_mode}|{image_fingerprint}"
     prior_frame_scope = st.session_state.get(active_frame_key)
     if prior_frame_scope != frame_scope:
         previous_viewer_key = st.session_state.get("circuitcare_v4_active_viewer_key")
@@ -148,7 +160,6 @@ def render_component_viewer(
         selected_id = selection.selected_component
 
     mount_status_key = f"{viewer_key}_mount_status"
-    expected_asset_key = f"{map_cache_key}|{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}"
     last_id_key = f"{viewer_key}_last_event"
     rejected_id_key = f"{viewer_key}_rejected_event"
 
@@ -172,6 +183,8 @@ def render_component_viewer(
                     events.append({"stage": "viewer_image_ready", "status": "complete",
                                    "asset_key_hash": hashlib.sha256(expected_asset_key.encode()).hexdigest()[:12]})
                     del events[:-50]
+                    LOGGER.info("pcb_viewer event=VIEWER_READY viewer_key=%s asset_hash=%s frame_id=%s",
+                                viewer_key, hashlib.sha256(expected_asset_key.encode()).hexdigest()[:12], frame_id)
                 st.session_state[mount_status_key] = "READY"
         event = None
         if isinstance(result, dict):
@@ -288,15 +301,22 @@ def render_component_viewer(
         "fault_history": list(item.fault_history),
     } for item in components]
     ack_event_id = st.session_state.get(last_id_key)
+    render_count_key = "cc_debug_viewer_render_request_count"
+    render_count = int(st.session_state.get(render_count_key, 0)) + 1
+    st.session_state[render_count_key] = render_count
+    debug_telemetry = str(os.environ.get("CIRCUITCARE_VIEWER_DEBUG", "")).lower() in {"1", "true", "yes"}
+    LOGGER.info("pcb_viewer event=VIEWER_RENDER_REQUESTED viewer_key=%s frame_id=%s render=%s image_hash=%s overlay_version=%s",
+                viewer_key, frame_id, render_count, image_fingerprint[:12], overlay_version)
     rejected_event_id = st.session_state.get(rejected_id_key)
     result = render_pcb_viewer(
         st, image_png_base64=image_b64, image_size_px=image_size_px, components=payload,
         project_id=project.project_id, board_id=project.board_id or "", board_side=board_side,
-        frame_id=frame_id, selected_component_id=selected_id, asset_key=map_cache_key,
+        frame_id=frame_id, selected_component_id=selected_id, asset_key=image_fingerprint,
+        overlay_version=overlay_version, debug_telemetry=debug_telemetry,
         selection_ack_event_id=ack_event_id, selection_rejected_event_id=rejected_event_id,
         event_sequence_seed=int(st.session_state.get(f"{viewer_key}_last_seq", 0)),
         event_epoch=event_epoch,
-        key=viewer_key, on_selection_change=handle_selection_change,
+        key=viewer_key, on_selection_change=None,
         on_selection_event_change=handle_selection_change,
         on_viewer_status_change=handle_selection_change,
     )

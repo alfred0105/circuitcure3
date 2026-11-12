@@ -627,6 +627,7 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
         from PIL import Image
         from circuitcare.vision.ocr_backend import run_component_marking_ocr
 
+        _write_analysis_status(progress, "소자 각인 OCR · 진행 중")
         image_fingerprint = hashlib.sha256(image_bytes).hexdigest()
         marking_cache_key = f"cc_component_marking_ocr_{scope}"
         marking_cache = st_api.session_state.setdefault(marking_cache_key, {})
@@ -753,6 +754,11 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                     "review_tiles": partial.get("review_tiles", 0),
                     "duplicate_pair_crop_count": partial.get("duplicate_pair_crop_count", 0),
                     "ollama_metrics": partial.get("ollama_metrics", {})})
+                stage_update = getattr(progress, "set_stage", None)
+                if callable(stage_update):
+                    stage_update("QWEN_CLASS_REVIEW", f"Qwen 소자 검수 · {batch_index}/{len(batches)} 배치 완료",
+                                 completed_batches=batch_index, total_batches=len(batches),
+                                 current_batch=batch_index)
                 review["review_diagnostics"][f"batch_{batch_index}"] = partial.get("review_diagnostics", {})
             # Search the complete active detection set before considering batch
             # boundaries. Cross-batch pairs receive their own focused paired crops.
@@ -832,6 +838,7 @@ def _run_ai_review_workflow(st_api: Any, *, image_bytes: bytes, scope: str, rows
                 "error": pair_error,
             }
             review["failed_batches"] = failed_batches
+            _write_analysis_status(progress, "Qwen 중복 후보 검토 · 진행 중")
             search_failed = any(row.get("stage") == "candidate_search" for row in failed_batches)
             batch_diagnostics = [review["review_diagnostics"].get(f"batch_{index}", {})
                                  for index in range(1, len(batches) + 1)]
