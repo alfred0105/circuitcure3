@@ -11,6 +11,7 @@ import math
 import logging
 import os
 import secrets
+import time
 from typing import Any
 
 from PIL import Image
@@ -120,6 +121,7 @@ def render_component_viewer(
     image_size_px: tuple[int, int], components: tuple[ComponentOverlayViewModel, ...],
     project: ProjectContext, board_side: str, frame_id: str, selected_component_id: str | None,
     map_cache_key: str, image_mode: str,
+    photo_id: str | None = None,
     on_box_draw: Any | None = None,
 ) -> tuple[bool, str, str]:
     """Render the viewer and return API availability, key, and coordinate trust state."""
@@ -137,8 +139,9 @@ def render_component_viewer(
     viewer_key = f"cc_v4_pcb_viewer_{digest}"
     expected_asset_key = f"{image_fingerprint}|{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}"
     overlay_version = hashlib.sha256(repr([
-        (item.component_id, item.bbox_xyxy, item.component_type, item.overlay_status,
-         item.ocr_marking, item.fault_candidate_status) for item in components
+        (item.component_id, item.bbox_xyxy, item.display_label, item.component_type,
+         item.overlay_status, item.overlay_source, item.ocr_marking,
+         item.fault_candidate_status) for item in components
     ]).encode()).hexdigest()[:16]
     epoch_key = f"{viewer_key}_{image_fingerprint[:16]}_event_epoch"
     event_epoch = st.session_state.setdefault(epoch_key, secrets.token_urlsafe(18))
@@ -179,12 +182,15 @@ def render_component_viewer(
                 ready_event_key = f"{mount_status_key}_last_event"
                 if st.session_state.get(ready_event_key) != viewer_status["event_id"]:
                     st.session_state[ready_event_key] = viewer_status["event_id"]
+                    st.session_state["cc_debug_next_full_script_rerun_cause"] = "viewer_ready_component_state"
                     events = st.session_state.setdefault("cc_performance_events", [])
                     events.append({"stage": "viewer_image_ready", "status": "complete",
                                    "asset_key_hash": hashlib.sha256(expected_asset_key.encode()).hexdigest()[:12]})
                     del events[:-50]
-                    LOGGER.info("pcb_viewer event=VIEWER_READY viewer_key=%s asset_hash=%s frame_id=%s",
-                                viewer_key, hashlib.sha256(expected_asset_key.encode()).hexdigest()[:12], frame_id)
+                    LOGGER.info("pcb_viewer event=VIEWER_READY viewer_key=%s project_id=%s photo_id=%s asset_hash=%s frame_id=%s ts_ns=%s",
+                                viewer_key, project.project_id, frame_id,
+                                hashlib.sha256(expected_asset_key.encode()).hexdigest()[:12],
+                                frame_id, time.time_ns())
                 st.session_state[mount_status_key] = "READY"
         event = None
         if isinstance(result, dict):
@@ -305,13 +311,30 @@ def render_component_viewer(
     render_count = int(st.session_state.get(render_count_key, 0)) + 1
     st.session_state[render_count_key] = render_count
     debug_telemetry = str(os.environ.get("CIRCUITCARE_VIEWER_DEBUG", "")).lower() in {"1", "true", "yes"}
+    telemetry_key = f"cc_viewer_payload_profile_{viewer_key}"
+    previous_profile = st.session_state.get(telemetry_key, {})
+    image_unchanged = previous_profile.get("image_fingerprint") == image_fingerprint
+    overlay_unchanged = previous_profile.get("overlay_version") == overlay_version
+    payload_chars = len(image_b64)
+    st.session_state[telemetry_key] = {
+        "image_fingerprint": image_fingerprint, "overlay_version": overlay_version,
+        "render_count": int(previous_profile.get("render_count", 0)) + 1,
+        "base64_chars": payload_chars,
+    }
+    events = st.session_state.setdefault("cc_performance_events", [])
+    events.append({"stage": "pcb_viewer_payload", "image_bytes_base64_chars": payload_chars,
+                   "overlay_component_count": len(payload), "image_unchanged": image_unchanged,
+                   "overlay_unchanged": overlay_unchanged,
+                   "image_href_expected_change": not image_unchanged})
+    del events[:-50]
     LOGGER.info("pcb_viewer event=VIEWER_RENDER_REQUESTED viewer_key=%s frame_id=%s render=%s image_hash=%s overlay_version=%s",
                 viewer_key, frame_id, render_count, image_fingerprint[:12], overlay_version)
     rejected_event_id = st.session_state.get(rejected_id_key)
     result = render_pcb_viewer(
         st, image_png_base64=image_b64, image_size_px=image_size_px, components=payload,
         project_id=project.project_id, board_id=project.board_id or "", board_side=board_side,
-        frame_id=frame_id, selected_component_id=selected_id, asset_key=image_fingerprint,
+        frame_id=frame_id, photo_id=photo_id or frame_id,
+        selected_component_id=selected_id, asset_key=image_fingerprint,
         overlay_version=overlay_version, debug_telemetry=debug_telemetry,
         selection_ack_event_id=ack_event_id, selection_rejected_event_id=rejected_event_id,
         event_sequence_seed=int(st.session_state.get(f"{viewer_key}_last_seq", 0)),

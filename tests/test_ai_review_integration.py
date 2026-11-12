@@ -525,7 +525,9 @@ def test_cached_qwen_review_is_invalidated_when_source_box_changes():
 
 
 def test_review_fingerprint_tracks_user_decisions_without_invalidating_inference_cache():
-    from circuitcare.vision.component_recognition_panel import _inference_fingerprint
+    from circuitcare.vision.component_recognition_panel import (
+        _inference_fingerprint, _observation_fingerprint, _ocr_evidence_fingerprint,
+    )
 
     rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
              "x1": 1, "y1": 1, "x2": 10, "y2": 10}]
@@ -541,6 +543,48 @@ def test_review_fingerprint_tracks_user_decisions_without_invalidating_inference
     assert _review_fingerprint([{**rows[0], "confirmed_part_number": "LM358"}], None) != baseline
     assert _review_fingerprint([{**rows[0], "소자 종류": "capacitor"}], None) != baseline
     assert _review_fingerprint([{**rows[0], "x1": 2}], None) != baseline
+
+
+def test_ocr_output_version_does_not_mutate_yolo_job_input_fingerprint():
+    from circuitcare.vision.component_recognition_panel import (
+        _inference_fingerprint, _observation_fingerprint, _ocr_evidence_fingerprint,
+        _review_fingerprint,
+    )
+
+    rows = [{"component_id": "r1", "detector_class": "resistor", "소자 종류": "resistor",
+             "상태": "검수 필요", "x1": 1, "y1": 2, "x2": 10, "y2": 12}]
+    ocr = {"source_image_fingerprint": "image-v1", "engine": "RapidOCR",
+           "records": [{"text": "R1", "bbox_xyxy": [1, 1, 4, 4]}]}
+    observation_before = _observation_fingerprint(rows)
+    review_before = _review_fingerprint(rows, None)
+    inference_before_ocr = _inference_fingerprint(rows, None)
+    with_ocr_rows = [{**rows[0], "ocr_candidates": ["R1"], "reference_designators": ["R1"]}]
+    assert _observation_fingerprint(with_ocr_rows) == observation_before
+    assert _review_fingerprint(with_ocr_rows, ocr) == review_before
+    assert _ocr_evidence_fingerprint(ocr) != _ocr_evidence_fingerprint(None)
+    assert _inference_fingerprint(with_ocr_rows, ocr) != inference_before_ocr
+
+
+def test_ocr_enrichment_keeps_ai_job_request_identity_stable(monkeypatch):
+    import circuitcare.vision.component_recognition_panel as panel
+    submitted = []
+
+    def fake_submit(**kwargs):
+        submitted.append(kwargs)
+        return "job-stable", "PENDING"
+
+    monkeypatch.setattr(panel, "submit_ai_review", fake_submit)
+    state = {"circuitcare_v2_current_project_id": "project-1"}
+    api = SimpleNamespace(session_state=state)
+    initial = [{"component_id": "r1", "detector_class": "resistor", "소자 종류": "resistor",
+                "상태": "검수 필요", "x1": 1, "y1": 2, "x2": 10, "y2": 20}]
+    enriched = [{**initial[0], "ocr_candidates": ["R1"], "reference_designators": ["R1"]}]
+    for rows in (initial, enriched):
+        panel.queue_ai_component_review(api, image_bytes=b"photo", scope="scope",
+                                        rows=rows, records_key="rows", owner="owner")
+    assert len(submitted) == 2
+    assert submitted[0]["fingerprint"] == submitted[1]["fingerprint"]
+    assert submitted[0]["review_fingerprint"] == submitted[1]["review_fingerprint"]
 
 
 def test_qwen_batch_setting_is_limited_to_benchmarked_sizes(monkeypatch):

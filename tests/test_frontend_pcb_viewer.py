@@ -264,10 +264,17 @@ def test_viewer_identity_and_image_asset_are_independent_from_overlay_version(mo
     workspace.render_component_viewer(**args, map_cache_key="overlay-v1")
     changed_box = ComponentOverlayViewModel(**{**_model().__dict__, "bbox_xyxy": (11, 21, 31, 51)})
     workspace.render_component_viewer(**{**args, "components": (changed_box,)}, map_cache_key="overlay-v2")
+    workspace.render_component_viewer(**{**args, "components": (changed_box,)}, map_cache_key="overlay-v2")
 
     assert captured[0]["key"] == captured[1]["key"]
     assert captured[0]["asset_key"] == captured[1]["asset_key"]
     assert captured[0]["overlay_version"] != captured[1]["overlay_version"]
+    assert captured[1]["overlay_version"] == captured[2]["overlay_version"]
+    profile = st.session_state[f"cc_viewer_payload_profile_{captured[2]['key']}"]
+    assert profile["render_count"] == 3
+    assert st.session_state["cc_performance_events"][-1]["image_unchanged"] is True
+    assert st.session_state["cc_performance_events"][-1]["overlay_unchanged"] is True
+    assert st.session_state["cc_performance_events"][-1]["image_href_expected_change"] is False
 
 
 def test_viewer_updates_regions_incrementally_without_replacing_svg_layer():
@@ -277,6 +284,8 @@ def test_viewer_updates_regions_incrementally_without_replacing_svg_layer():
     assert "layer.replaceChildren()" not in source
     assert "state.regionNodes = new Map()" in source
     assert "entry.shape.classList.toggle(\"cc-selected\", id === selectedId)" in source
+    assert "if (!overlayChanged && !selectionChanged) return;" in source
+    assert "state.imageGeometryKey !== geometryKey" in source
     assert "state.setTriggerValue(\"selection_event\", payload)" in source
     assert 'state.setStateValue("selection", payload)' not in source
     assert 'image.setAttribute("href"' in source
@@ -438,6 +447,62 @@ def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(mon
     board_source = registry["components"][0]["source_components"][0]
     assert board_source["possible_part_number"] == "AMS1117"
     assert board_source["qwen_conflicting_evidence"] == ["OCR 후보가 일치하지 않음"]
+
+
+def test_initial_yolo_status_uses_dedicated_slot_and_finishes_explicitly(monkeypatch):
+    from contextlib import nullcontext
+    from circuitcare.dashboard.views import unified_workspace
+
+    class Status:
+        def __init__(self):
+            self.writes = []
+            self.updates = []
+
+        def write(self, message):
+            self.writes.append(message)
+
+        def update(self, **kwargs):
+            self.updates.append(kwargs)
+
+    status = Status()
+    class Slot:
+        def container(self):
+            return nullcontext()
+
+    output = io.BytesIO()
+    Image.new("RGB", (32, 24), "navy").save(output, format="PNG")
+    photo = output.getvalue()
+    project = ProjectContext("p-status", "b-status", image_records=(ImageRecord("photo-status"),))
+    state = {"circuitcare_v2_photo_choice": "photo-status"}
+    st = SimpleNamespace(session_state=state, status=lambda *_a, **_k: status)
+
+    def fake_detection(st_api, *, image_bytes, project_id, photo_id, progress=None, **_kwargs):
+        assert progress is status
+        scope = unified_workspace.component_review_scope(
+            unified_workspace._cached_photo_pixels(image_bytes)[3], project_id, photo_id)
+        _result, rows_key, _error = review_keys(scope)
+        st_api.session_state[rows_key] = []
+        return {"detections": [], "image_width": 32, "image_height": 24}, None
+
+    monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
+    monkeypatch.setattr(unified_workspace, "_queue_ai_review", lambda *_a, **_kwargs: ("job-1", "PENDING"))
+    unified_workspace._prepare_photo_component_snapshot(
+        st, project, [{"image_id": "photo-status", "data": photo}],
+        workflow_status_slot=Slot(),
+    )
+    assert status.updates[-1]["state"] == "complete"
+    assert "YOLO 탐지 완료" in status.updates[-1]["label"]
+
+    failed_status = Status()
+    st.status = lambda *_a, **_k: failed_status
+    st.session_state = {"circuitcare_v2_photo_choice": "photo-status"}
+    monkeypatch.setattr(unified_workspace, "ensure_component_detection",
+                        lambda *_a, **_k: (None, "weights missing"))
+    unified_workspace._prepare_photo_component_snapshot(
+        st, project, [{"image_id": "photo-status", "data": photo}],
+        workflow_status_slot=Slot(),
+    )
+    assert failed_status.updates[-1]["state"] == "error"
 
 
 def test_unvalidated_qwen_cleanup_never_auto_excludes_and_protects_user_confirmed_rows():

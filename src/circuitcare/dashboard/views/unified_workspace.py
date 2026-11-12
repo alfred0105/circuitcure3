@@ -59,7 +59,8 @@ from circuitcare.dashboard.views.report_panel import render_report_panel
 from circuitcare.reporting.report_builder import build_pcb_diagnostic_snapshot
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
-    _inference_fingerprint, _review_fingerprint, _review_user_version, ensure_component_detection,
+    _inference_fingerprint, _observation_fingerprint, _ocr_evidence_fingerprint,
+    _review_fingerprint, _review_user_version, ensure_component_detection,
     merge_ai_review_rows, queue_ai_component_review, render_component_recognition_panel,
     review_aux_keys, review_keys, review_scope as component_review_scope,
 )
@@ -90,15 +91,21 @@ def _review_job_owner(st: Any, project_id: str) -> str:
 
 
 def _queue_ai_review(st: Any, *, project: ProjectContext, image_bytes: bytes,
-                     scope: str, rows: list[dict[str, Any]], records_key: str) -> tuple[str, str]:
+                     scope: str, rows: list[dict[str, Any]], records_key: str,
+                     photo_id: str | None = None) -> tuple[str, str]:
     """Queue the full OCR/Qwen workflow from a session-owned immutable snapshot."""
     owner = _review_job_owner(st, project.project_id)
+    previous_job_id = st.session_state.get(f"cc_ai_review_job_{scope}")
     job_id, _job_owner, status = queue_ai_component_review(
         st, image_bytes=image_bytes, scope=scope, rows=rows,
         records_key=records_key, owner=owner,
     )
-    LOGGER.info("AI_JOB_SUBMITTED project=%s scope_hash=%s status=%s job_id=%s",
-                project.project_id, hashlib.sha256(scope.encode()).hexdigest()[:12], status, job_id or "none")
+    event = "AI_JOB_SUBMITTED" if job_id and job_id != previous_job_id and status == "PENDING" else "AI_JOB_REUSED"
+    LOGGER.info("%s project=%s photo_id=%s scope_hash=%s status=%s job_id=%s ts_ns=%s",
+                event, project.project_id, photo_id or "unknown",
+                hashlib.sha256(scope.encode()).hexdigest()[:12], status, job_id or "none", time.time_ns())
+    if photo_id:
+        st.session_state[f"cc_ai_review_job_photo_id_{scope}"] = photo_id
     if status == "QUEUE_FULL":
         st.session_state[f"cc_ai_review_job_status_{scope}"] = "QUEUE_FULL"
         st.session_state[f"cc_ai_review_job_message_{scope}"] = "AI 검수 대기열이 가득 찼습니다. 잠시 후 다시 실행해 주세요."
@@ -127,10 +134,11 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
     current_rows = state.get(records_key, [])
     worker_user_version = job.get("user_version")
     current_user_version = _review_user_version(current_rows)
-    current_review_fingerprint = _review_fingerprint(
-        current_rows, state.get(review_aux_keys(scope)[0]))
+    current_review_fingerprint = _review_fingerprint(current_rows, None)
     submitted_review_fingerprint = state.get(f"cc_ai_review_job_review_fingerprint_{scope}")
-    if (_inference_fingerprint(current_rows) != fingerprint
+    submitted_ocr_fingerprint = state.get(f"cc_ai_review_job_ocr_fingerprint_{scope}")
+    current_ocr_fingerprint = _ocr_evidence_fingerprint(state.get(review_aux_keys(scope)[0]))
+    if (_observation_fingerprint(current_rows) != fingerprint
             or job.get("review_fingerprint") != submitted_review_fingerprint
             or (current_review_fingerprint != submitted_review_fingerprint
                 and worker_user_version == current_user_version)):
@@ -151,6 +159,14 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
                     hashlib.sha256(scope.encode()).hexdigest()[:12], worker_status, job.get("attempt"))
         return True
     result_state = job.get("state", {})
+    worker_ocr = result_state.get(review_aux_keys(scope)[0]) if isinstance(result_state, dict) else None
+    worker_ocr_fingerprint = _ocr_evidence_fingerprint(worker_ocr)
+    if current_ocr_fingerprint not in {submitted_ocr_fingerprint, worker_ocr_fingerprint}:
+        state[f"cc_ai_review_job_status_{scope}"] = "STALE"
+        state[f"cc_ai_review_job_committed_{scope}"] = job_id
+        LOGGER.info("AI_JOB_COMMITTED scope_hash=%s status=STALE reason=ocr_evidence_changed",
+                    hashlib.sha256(scope.encode()).hexdigest()[:12])
+        return True
     worker_rows = result_state.get(records_key, [])
     merged_rows = merge_ai_review_rows(current_rows, worker_rows if isinstance(worker_rows, list) else [])
     if worker_user_version != current_user_version:
@@ -202,13 +218,15 @@ try:
             running_log_key = f"cc_ai_review_job_running_logged_{scope}"
             if job.get("status") == "RUNNING" and state.get(running_log_key) != job_id:
                 state[running_log_key] = job_id
-                LOGGER.info("AI_JOB_RUNNING project=%s scope_hash=%s job_id=%s",
-                            project_id, hashlib.sha256(scope.encode()).hexdigest()[:12], job_id)
+                LOGGER.info("AI_JOB_RUNNING project=%s photo_id=%s scope_hash=%s job_id=%s ts_ns=%s",
+                            project_id, state.get(f"cc_ai_review_job_photo_id_{scope}", "unknown"),
+                            hashlib.sha256(scope.encode()).hexdigest()[:12], job_id, time.time_ns())
             progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
             state[f"cc_ai_review_fragment_rerun_count"] = int(state.get("cc_ai_review_fragment_rerun_count", 0)) + 1
-            LOGGER.info("FRAGMENT_RERUN scope_hash=%s count=%s stage=%s",
+            LOGGER.info("FRAGMENT_RERUN project=%s photo_id=%s job_id=%s scope_hash=%s count=%s stage=%s ts_ns=%s",
+                        project_id, state.get(f"cc_ai_review_job_photo_id_{scope}", "unknown"), job_id,
                         hashlib.sha256(scope.encode()).hexdigest()[:12],
-                        state["cc_ai_review_fragment_rerun_count"], progress.get("stage", "RUNNING"))
+                        state["cc_ai_review_fragment_rerun_count"], progress.get("stage", "RUNNING"), time.time_ns())
             labels = {"OCR_BOARD": "RapidOCR · PCB 문자 탐색", "OCR_MARKINGS": "RapidOCR · 소자 각인",
                       "QWEN_CLASS_REVIEW": "Qwen3.5 · 소자 분류", "QWEN_DUPLICATE_REVIEW": "Qwen3.5 · 중복 검토",
                       "RESULT_VALIDATION": "결과 검증", "COMPLETE": "완료", "FAILED": "실패"}
@@ -241,10 +259,12 @@ try:
                 st.warning("AI 검수 일부 실패 · 성공한 제안과 사용자 검수 기록은 보존됩니다.")
             else:
                 st.caption("RapidOCR · Qwen 검수 완료 · 제안은 사용자 확인 전까지 미확정")
-            LOGGER.info("AI_JOB_COMPLETED project=%s scope_hash=%s status=%s",
-                        project_id, hashlib.sha256(scope.encode()).hexdigest()[:12], status)
+            LOGGER.info("AI_JOB_COMPLETED project=%s photo_id=%s job_id=%s scope_hash=%s status=%s ts_ns=%s",
+                        project_id, state.get(f"cc_ai_review_job_photo_id_{scope}", "unknown"), job_id,
+                        hashlib.sha256(scope.encode()).hexdigest()[:12], status, time.time_ns())
             # The parent needs one rerun to consume the committed photo snapshot
             # and remove this polling fragment. No rerun occurs on each poll.
+            state["cc_debug_next_full_script_rerun_cause"] = "ai_review_terminal_commit"
             _streamlit.rerun()
 except (ImportError, AttributeError):  # Older Streamlit remains usable without live polling.
     _render_ai_review_progress = None
@@ -387,6 +407,7 @@ def _attach_verified_history(
 def _prepare_photo_component_snapshot(
     st: Any, project: ProjectContext, photos: list[dict[str, Any]], *,
     photo_id: str | None = None, activate: bool = True,
+    workflow_status_slot: Any = None, workflow_status: Any = None,
 ) -> dict[str, Any]:
     """Prepare one photo's review snapshot without depending on Viewer rendering."""
     records = {item.image_id: item for item in project.image_records}
@@ -413,21 +434,42 @@ def _prepare_photo_component_snapshot(
     review_scope = component_review_scope(detector_image_bytes, project.project_id, photo_id)
     result_key, records_key, error_key = review_keys(review_scope)
     detection_needs_run = result_key not in st.session_state and error_key not in st.session_state
-    progress = st.status("PCB 분석 중", expanded=True) if detection_needs_run else None
-    if progress is not None:
+    progress = workflow_status
+    if detection_needs_run and progress is None and workflow_status_slot is not None:
+        with workflow_status_slot.container():
+            progress = st.status("PCB 분석 중", expanded=True)
+            progress.write("이미지 준비 · 완료")
+    elif detection_needs_run and progress is None:
+        # Non-workbench callers retain a status surface, but the interactive
+        # workbench always supplies its dedicated workflow slot.
+        progress = st.status("PCB 분석 중", expanded=True)
         progress.write("이미지 준비 · 완료")
+    if detection_needs_run:
+        LOGGER.info("PCB_ANALYSIS_STAGE event=YOLO_STARTED project=%s photo_id=%s mode=synchronous reason=locator_load_and_prediction_run_on_script_thread ts_ns=%s",
+                    project.project_id, photo_id, time.time_ns())
     auto_result, auto_error = ensure_component_detection(
         st, image_bytes=image_data, project_id=project.project_id, photo_id=photo_id,
         review_image_bytes=detector_image_bytes, review_image_size=processed_size,
         progress=progress,
     )
+    if detection_needs_run and progress is not None:
+        if auto_error or auto_result is None:
+            progress.update(label="YOLO 탐지 실패 · 기존 검수 기록은 보존됩니다",
+                            state="error", expanded=True)
+            LOGGER.info("PCB_ANALYSIS_STAGE event=YOLO_FINISHED project=%s photo_id=%s status=error ts_ns=%s",
+                        project.project_id, photo_id, time.time_ns())
+        else:
+            progress.update(label=f"YOLO 탐지 완료 · {len(auto_result.get('detections', []))}개 후보",
+                            state="complete", expanded=False)
+            LOGGER.info("PCB_ANALYSIS_STAGE event=YOLO_FINISHED project=%s photo_id=%s status=complete detections=%s ts_ns=%s",
+                        project.project_id, photo_id, len(auto_result.get("detections", [])), time.time_ns())
     rows = list(st.session_state.get(records_key, []))
     review_state = "unavailable"
     if (auto_result is not None and not auto_error
             and auto_result.get("image_width") and auto_result.get("image_height")):
         _job_id, job_state = _queue_ai_review(
             st, project=project, image_bytes=detector_image_bytes, scope=review_scope,
-            rows=rows, records_key=records_key,
+            rows=rows, records_key=records_key, photo_id=photo_id,
         )
         if job_state in {"COMPLETE", "AI_REVIEW_PARTIAL", "FAILED", "UNAVAILABLE"}:
             # A job may finish while the user views another photo. Commit its
@@ -439,8 +481,6 @@ def _prepare_photo_component_snapshot(
                         "failed" if job_state in {"FAILED", "UNAVAILABLE"} else
                         "pending" if job_state in {"PENDING", "RUNNING"} else
                         "failed" if job_state == "QUEUE_FULL" else "unavailable")
-    elif progress is not None:
-        progress.update(label="YOLO 탐지 실패 · 사진 정보는 보존됩니다", state="error", expanded=True)
     _ocr_key, qwen_key = (f"cc_component_ocr_{review_scope}", f"cc_component_qwen_review_{review_scope}")
     qwen_result = st.session_state.get(qwen_key, {})
     qwen_types = {str(item.get("detection_id")): item for item in qwen_result.get("class_reviews", [])
@@ -609,6 +649,7 @@ def _prepare_photo_component_snapshot(
 
 def _prepare_board_registry_snapshot(
     st: Any, project: ProjectContext, photos: list[dict[str, Any]],
+    *, workflow_status_slot: Any = None, workflow_status: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Refresh cached photo snapshots, then build the independent board registry."""
     records = {item.image_id: item for item in project.image_records}
@@ -630,6 +671,8 @@ def _prepare_board_registry_snapshot(
         if photo_id == selected_id:
             by_photo[photo_id] = _prepare_photo_component_snapshot(
                 st, project, photos, photo_id=photo_id, activate=False,
+                workflow_status_slot=workflow_status_slot,
+                workflow_status=workflow_status,
             )
             continue
         raw_fingerprint = hashlib.sha256(photo["data"]).hexdigest()
@@ -1177,6 +1220,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         image_size_px=viewer_size, components=tuple(component_models), project=project,
         board_side=side_enum or active_side, frame_id=frame_id,
         selected_component_id=selected_component_id,
+        photo_id=str(selected),
         # Keep the selection owner key identical to _render_pcb's invalidation
         # key even when this photo has no registered component map yet.
         map_cache_key=cache_key, image_mode=mode,
@@ -2029,7 +2073,13 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
     """Keep the PCB Viewer fixed while rendering one selected task panel."""
     run_count = int(st.session_state.get("cc_debug_full_script_rerun_count", 0)) + 1
     st.session_state["cc_debug_full_script_rerun_count"] = run_count
-    LOGGER.info("FULL_SCRIPT_RERUN project=%s count=%s", project.project_id, run_count)
+    active_photo_id = st.session_state.get("circuitcare_v2_photo_choice") or st.session_state.get(ACTIVE_PHOTO_KEY)
+    rerun_cause = st.session_state.pop("cc_debug_next_full_script_rerun_cause", "widget_or_external")
+    rerun_causes = st.session_state.setdefault("cc_debug_full_script_rerun_causes", {})
+    rerun_causes[rerun_cause] = int(rerun_causes.get(rerun_cause, 0)) + 1
+    LOGGER.info("FULL_SCRIPT_RERUN project=%s photo_id=%s count=%s cause=%s cause_count=%s ts_ns=%s",
+                project.project_id, active_photo_id or "unknown", run_count, rerun_cause,
+                rerun_causes[rerun_cause], time.time_ns())
     _style(st)
     selection = st.session_state.get(SELECTION_KEY)
     if getattr(selection, "project_id", None) != project.project_id:
@@ -2061,7 +2111,10 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                     transition_progress.write("기존 사진별 탐지 결과·Registry·분석 Fingerprint를 재사용합니다.")
         try:
             prepare_started = time.perf_counter()
-            board_registry, photo_snapshot = _prepare_board_registry_snapshot(st, project, photos)
+            board_registry, photo_snapshot = _prepare_board_registry_snapshot(
+                st, project, photos, workflow_status_slot=workflow_status_slot,
+                workflow_status=transition_progress,
+            )
             _record_perf(st.session_state, "snapshot_registry_prepare", prepare_started)
             snapshot_components = diagnosis_components(board_registry)
             measurement_aliases = measurement_component_aliases(board_registry)

@@ -120,7 +120,8 @@ def test_prune_jobs_removes_old_terminal_jobs_but_keeps_running_jobs(monkeypatch
 def test_commit_merges_ai_evidence_after_user_edit_without_overwriting_review_or_measurement(monkeypatch):
     from circuitcare.dashboard.views import unified_workspace
     from circuitcare.vision.component_recognition_panel import (
-        _inference_fingerprint, _review_user_version, review_aux_keys, review_keys,
+        _observation_fingerprint, _review_fingerprint, _review_user_version,
+        _ocr_evidence_fingerprint, review_aux_keys, review_keys,
     )
 
     scope = "photo-scope"
@@ -134,9 +135,12 @@ def test_commit_merges_ai_evidence_after_user_edit_without_overwriting_review_or
     state = {records_key: current,
              f"cc_ai_review_job_{scope}": job_id,
              f"cc_ai_review_job_owner_{scope}": "owner",
-             f"cc_ai_review_job_fingerprint_{scope}": _inference_fingerprint(current)}
+             f"cc_ai_review_job_fingerprint_{scope}": _observation_fingerprint(current),
+             f"cc_ai_review_job_review_fingerprint_{scope}": _review_fingerprint(current, None),
+             f"cc_ai_review_job_ocr_fingerprint_{scope}": _ocr_evidence_fingerprint(None)}
     fingerprint = state[f"cc_ai_review_job_fingerprint_{scope}"]
     job = {"status": "COMPLETE", "job_id": job_id, "fingerprint": fingerprint,
+           "review_fingerprint": state[f"cc_ai_review_job_review_fingerprint_{scope}"],
            "user_version": _review_user_version(worker_rows), "duration_ms": 12,
            "state": {records_key: worker_rows,
                      review_aux_keys(scope)[1]: {"source_fingerprint": fingerprint,
@@ -149,6 +153,41 @@ def test_commit_merges_ai_evidence_after_user_edit_without_overwriting_review_or
     assert saved["confirmed_part_number"] == "C22"
     assert saved["measurement_id"] == "m-7"
     assert saved["ocr_candidates"] == ["C22"]
+
+
+def test_commit_accepts_ocr_evidence_created_inside_the_same_review_job(monkeypatch):
+    from circuitcare.dashboard.views import unified_workspace
+    from circuitcare.vision.component_recognition_panel import (
+        _observation_fingerprint, _review_fingerprint, _review_user_version,
+        _ocr_evidence_fingerprint, review_aux_keys, review_keys,
+    )
+
+    scope = "p-photo-native"
+    records_key = review_keys(scope)[1]
+    ocr_key, qwen_key = review_aux_keys(scope)
+    rows = [{"component_id": "r1", "detector_class": "resistor", "소자 종류": "resistor",
+             "상태": "검수 필요", "x1": 1, "y1": 2, "x2": 10, "y2": 20}]
+    fingerprint = _observation_fingerprint(rows)
+    review_fingerprint = _review_fingerprint(rows, None)
+    ocr_result = {"source_image_fingerprint": "sha256:photo", "engine": "RapidOCR",
+                  "records": [{"text": "R1", "bbox_xyxy": [1, 1, 3, 3]}]}
+    worker_rows = [{**rows[0], "ocr_candidates": ["R1"], "reference_designators": ["R1"]}]
+    state = {records_key: rows,
+             f"cc_ai_review_job_{scope}": "job-ocr",
+             f"cc_ai_review_job_owner_{scope}": "owner",
+             f"cc_ai_review_job_fingerprint_{scope}": fingerprint,
+             f"cc_ai_review_job_review_fingerprint_{scope}": review_fingerprint,
+             f"cc_ai_review_job_ocr_fingerprint_{scope}": _ocr_evidence_fingerprint(None)}
+    job = {"status": "COMPLETE", "job_id": "job-ocr", "fingerprint": fingerprint,
+           "review_fingerprint": review_fingerprint, "user_version": _review_user_version(rows),
+           "duration_ms": 20,
+           "state": {records_key: worker_rows, ocr_key: ocr_result,
+                     qwen_key: {"verification_status": "AI_SUGGESTIONS_ONLY"}}}
+    monkeypatch.setattr(unified_workspace, "get_ai_review_job", lambda **_kwargs: job)
+    assert unified_workspace._commit_review_job(type("St", (), {"session_state": state})(), scope=scope)
+    assert state[f"cc_ai_review_job_status_{scope}"] == "COMPLETE"
+    assert state[ocr_key] == ocr_result
+    assert state[records_key][0]["ocr_candidates"] == ["R1"]
 
 
 def test_review_progress_tracks_stage_and_batch_counts_without_streamlit(monkeypatch):

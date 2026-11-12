@@ -39,7 +39,7 @@ export default function(component) {
     };
     console.debug("[pcb-viewer-telemetry]", {event, timestamp:new Date().toISOString(),
       instance_id:state.instanceId, viewer_key:root.dataset.viewerKey || data.viewer_key || null,
-      asset_key_hash:digest(state.assetKey || data.asset_key), frame_id:data.frame_id,
+      project_id:data.project_id, photo_id:data.photo_id, asset_key_hash:digest(state.assetKey || data.asset_key), frame_id:data.frame_id,
       image_fingerprint:String(data.asset_key || "").slice(0,16), render_count:state.renderCount,
       href_change_count:state.hrefChangeCount, ...details});
   };
@@ -102,10 +102,12 @@ export default function(component) {
     state.scale = scale; state.userAdjusted = true; drawCamera();
   };
   const applySelectedHighlight = (componentId) => {
+    const previous = state.selectedComponentId || null;
     state.selectedComponentId = componentId || null;
-    for (const shape of layer.querySelectorAll("[data-component-id]")) {
-      shape.classList.toggle("cc-selected", shape.dataset.componentId === state.selectedComponentId);
-    }
+    if (previous && previous !== state.selectedComponentId)
+      state.regionNodes?.get(previous)?.shape.classList.remove("cc-selected");
+    if (state.selectedComponentId)
+      state.regionNodes?.get(state.selectedComponentId)?.shape.classList.add("cc-selected");
     const statusLabel = root.querySelector("[data-status-label]");
     const selected = (state.data.components || []).find((item) => item.component_id === state.selectedComponentId);
     if (statusLabel) statusLabel.textContent = selected
@@ -173,6 +175,22 @@ export default function(component) {
     const components = data.components || [];
     const selectedId = state.selectedComponentId !== undefined
       ? state.selectedComponentId : data.selected_component_id;
+    const overlayChanged = state.renderedOverlayVersion !== data.overlay_version;
+    const selectionChanged = state.renderedSelectedId !== selectedId;
+    if (!overlayChanged && !selectionChanged) return;
+    if (!overlayChanged) {
+      if (state.renderedSelectedId)
+        state.regionNodes?.get(state.renderedSelectedId)?.shape.classList.remove("cc-selected");
+      if (selectedId)
+        state.regionNodes?.get(selectedId)?.shape.classList.add("cc-selected");
+      state.renderedSelectedId = selectedId;
+      const statusLabel = root.querySelector("[data-status-label]");
+      const selected = components.find((item) => item.component_id === selectedId);
+      if (statusLabel) statusLabel.textContent = selected
+        ? `선택 ${selected.display_label || selected.component_type} · ${selected.component_id}`
+        : `박스 ${components.length}개 · 클릭하여 선택`;
+      return;
+    }
     if (!state.regionNodes) state.regionNodes = new Map();
     const desired = new Set(components.map((item) => item.component_id));
     for (const [id, entry] of state.regionNodes) {
@@ -221,6 +239,8 @@ export default function(component) {
       }
       entry.shape.classList.toggle("cc-selected", id === selectedId);
     }
+    state.renderedOverlayVersion = data.overlay_version;
+    state.renderedSelectedId = selectedId;
     const statusLabel = root.querySelector("[data-status-label]");
     if (statusLabel) {
       const selected = components.find((item) => item.component_id === selectedId);
@@ -233,10 +253,14 @@ export default function(component) {
     const [width,height] = data.image_size_px || [];
     if (!data.image_png_base64 || !width || !height) { empty.hidden=false; return; }
     empty.hidden=true;
-    canvas.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    image.setAttribute("x","0"); image.setAttribute("y","0");
-    image.setAttribute("width",String(width)); image.setAttribute("height",String(height));
     const key = `${data.asset_key}|${data.project_id}|${data.board_id}|${data.board_side}|${data.frame_id}`;
+    const geometryKey = `${key}|${width}x${height}`;
+    if (state.imageGeometryKey !== geometryKey) {
+      canvas.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      image.setAttribute("x","0"); image.setAttribute("y","0");
+      image.setAttribute("width",String(width)); image.setAttribute("height",String(height));
+      state.imageGeometryKey = geometryKey;
+    }
     const readyOnceKey = key;
     const reportReady = () => {
       if (state.assetKey !== key || state.mountedAssetKey === key) return;

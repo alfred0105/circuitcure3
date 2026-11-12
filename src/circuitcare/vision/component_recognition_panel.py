@@ -420,18 +420,37 @@ def undo_last_box_exclusion(state: Any, *, scope: str, rows: list[dict]) -> str 
     return str(component_id)
 
 
-def _inference_fingerprint(rows: list[dict], ocr_result: dict | None = None) -> str:
-    """Fingerprint only the visual/model inputs; review actions don't rerun vision."""
+def _observation_fingerprint(rows: list[dict]) -> str:
+    """Stable version of YOLO observations, independent of later OCR/review output."""
     snapshot = [{key: row.get(key) for key in (
         "component_id", "detector_class", "소자 종류", "x1", "y1", "x2", "y2", "신뢰도",
+    )} for row in rows]
+    payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _ocr_evidence_fingerprint(ocr_result: dict | None) -> str:
+    """Version OCR output separately so producing OCR cannot mutate the YOLO job input."""
+    result = ocr_result if isinstance(ocr_result, dict) else {}
+    payload = {"source_image_fingerprint": result.get("source_image_fingerprint"),
+               "status": result.get("status"), "engine": result.get("engine"),
+               "records": result.get("records", [])}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                     default=str).encode()).hexdigest()
+
+
+def _inference_fingerprint(rows: list[dict], ocr_result: dict | None = None) -> str:
+    """Fingerprint YOLO observations plus OCR evidence for AI-result cache validation."""
+    ai_evidence = [{key: row.get(key) for key in (
         "ocr_candidates", "reference_designators", "ocr_class_hints", "body_marking",
         "marking_candidates", "marking_ocr_fingerprint", "possible_part_number",
         "ocr_source", "ocr_score", "qwen_marking_candidates", "qwen_part_number_candidates",
         "qwen_ocr_evidence", "qwen_conflicting_evidence",
     )} for row in rows]
-    payload = json.dumps({"rows": snapshot, "ocr": (ocr_result or {}).get("records", [])},
-                         ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(payload.encode()).hexdigest()
+    payload = {"observation": _observation_fingerprint(rows), "row_ocr": ai_evidence,
+               "ocr_evidence": _ocr_evidence_fingerprint(ocr_result)}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                     default=str).encode()).hexdigest()
 
 
 _USER_REVIEW_FIELDS = (
@@ -457,8 +476,8 @@ def _review_user_version(rows: list[dict]) -> str:
 
 
 def _review_fingerprint(rows: list[dict], ocr_result: dict | None) -> str:
-    """Full review snapshot fingerprint, including user decisions and identity links."""
-    payload = {"inference": _inference_fingerprint(rows, ocr_result),
+    """Job input fingerprint: YOLO observation plus user decisions, not worker OCR output."""
+    payload = {"observation": _observation_fingerprint(rows),
                "user_review_version": _review_user_version(rows)}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -620,7 +639,13 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
     started = time.perf_counter()
     try:
         _write_analysis_status(progress, "YOLO 소자 탐지 · 진행 중")
-        with st_api.spinner("선택한 PCB 사진에서 소자를 자동 탐지하고 있습니다…"):
+        # The workbench owns a persistent workflow_status_slot. Showing a
+        # second spinner here makes the initial loader disappear/reappear as
+        # YOLO hands off to the asynchronous OCR/Qwen panel.
+        from contextlib import nullcontext
+        progress_context = nullcontext() if progress is not None else st_api.spinner(
+            "선택한 PCB 사진에서 소자를 자동 탐지하고 있습니다…")
+        with progress_context:
             engine = _app_server()
             engine.load_component_locator()
             result = engine.run_prediction(image_bytes, {"conf": INFERENCE_CONFIG["conf"],
@@ -1027,9 +1052,12 @@ def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
     token = state.setdefault(session_owner_key, secrets.token_urlsafe(20))
     project_id = str(state.get("circuitcare_v2_current_project_id", "unknown-project"))
     job_owner = owner or f"{token}|{project_id}"
-    fingerprint = _inference_fingerprint(rows, None)
+    # Job identity is tied to immutable YOLO observations. OCR output is produced
+    # inside the job and therefore must not change the request identity mid-run.
+    fingerprint = _observation_fingerprint(rows)
     ocr_key, qwen_key = review_aux_keys(scope)
-    review_fingerprint = _review_fingerprint(rows, state.get(ocr_key))
+    review_fingerprint = _review_fingerprint(rows, None)
+    ocr_fingerprint = _ocr_evidence_fingerprint(state.get(ocr_key))
     cached = state.get(qwen_key)
     if (isinstance(cached, dict)
             and cached.get("verification_status") not in {"AI_REVIEW_FAILED", "AI_REVIEW_PARTIAL"}
@@ -1054,6 +1082,7 @@ def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
         state[f"cc_ai_review_job_owner_{scope}"] = job_owner
         state[f"cc_ai_review_job_fingerprint_{scope}"] = fingerprint
         state[f"cc_ai_review_job_review_fingerprint_{scope}"] = review_fingerprint
+        state[f"cc_ai_review_job_ocr_fingerprint_{scope}"] = ocr_fingerprint
         state[f"cc_ai_review_job_status_{scope}"] = status
     return job_id, job_owner, status
 
