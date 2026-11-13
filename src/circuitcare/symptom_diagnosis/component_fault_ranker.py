@@ -185,6 +185,8 @@ def rank_component_candidates(
                 "score_is_probability": False,
                 "status": visual_status, "visual_status": visual_status,
                 "measurement_status": verdict["verdict"].upper(),
+                "assessment_status": verdict.get("assessment_status", "INCONCLUSIVE"),
+                "decision_scope": "FAULT_HYPOTHESIS_ONLY",
                 "measurement_verdict": verdict["verdict"],
                 "measurement_reason": verdict["reason"],
                 "required_measurement_tests": verdict["required_tests"],

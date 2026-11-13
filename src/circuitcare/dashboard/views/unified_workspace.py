@@ -1678,6 +1678,42 @@ def _render_workflow_candidates(
         measurements=all_measurements, allow_retest=allow_retest,
         symptoms=(current_result.get("symptom_codes", []) if isinstance(current_result, dict) else []),
     )
+    from circuitcare.symptom_diagnosis.active_inspection_planner import plan_active_inspections
+    knowledge = load_knowledge()
+    measurement_status_by_id = {
+        str(row.get("measurement_id")): row.get("assessment_status", row.get("verdict"))
+        for row in (current_result.get("measurement_evidence", [])
+                    if isinstance(current_result, dict) else [])
+        if isinstance(row, dict) and row.get("measurement_id")
+    }
+    active_plan = plan_active_inspections(
+        hypotheses=current_result.get("hypotheses", []) if isinstance(current_result, dict) else [],
+        component_candidates=(current_result.get("all_component_candidates",
+                                                current_result.get("component_candidates", []))
+                              if isinstance(current_result, dict) else []),
+        functional_block_groups=(current_result.get("functional_block_groups", [])
+                                 if isinstance(current_result, dict) else []),
+        evidence_gaps=current_result.get("evidence_gaps", []) if isinstance(current_result, dict) else [],
+        measurements=[
+            {**_measurement_record_dict(row),
+             "assessment_status": measurement_status_by_id.get(
+                 str(_measurement_record_dict(row).get("measurement_id") or ""))}
+            for row in all_measurements
+        ],
+        observations=current_result.get("observations", {}) if isinstance(current_result, dict) else {},
+        inspection_history=workflow.get("inspection_history", []), knowledge=knowledge,
+        allow_retest=allow_retest,
+    )
+    workflow["active_inspection_plan"] = active_plan
+    planned_targets = list(dict.fromkeys(
+        str(component_id)
+        for item in active_plan.get("candidates", [])
+        for component_id in item.get("target_component_ids", [])
+    ))
+    if planned_targets:
+        planned_rank = {component_id: index for index, component_id in enumerate(planned_targets)}
+        targets.sort(key=lambda row: planned_rank.get(str(row.get("board_component_id") or ""),
+                                                      len(planned_rank) + len(targets)))
     workflow["candidate_ids"] = [str(row.get("board_component_id") or row.get("component_id"))
                                   for row in candidates]
     workflow["inspection_targets"] = targets
@@ -1702,6 +1738,17 @@ def _render_workflow_candidates(
                               reason="현재 Registry에서 측정·검사 대상으로 해석 가능한 소자가 없습니다.")
         return
 
+    plan_candidates = active_plan.get("candidates", [])
+    plan_blocked = active_plan.get("blocked", [])
+    if plan_candidates or plan_blocked:
+        st.markdown("#### 가설을 구분할 다음 검사")
+        for plan_item in plan_candidates[:3]:
+            st.markdown(f"**{plan_item['name']}** · 가설 쌍 구분 {plan_item['separation_count']}개")
+            st.caption(plan_item["reason"] + (" · " + " · ".join(plan_item["prerequisites"])
+                                               if plan_item.get("prerequisites") else ""))
+        for plan_item in plan_blocked[:3]:
+            st.info(f"{plan_item['name']} · 안전/조건 확인 필요: " +
+                    (" · ".join(plan_item.get("prerequisites", [])) or "검사 조건 검토"))
     st.markdown("#### 우선 확인할 검사 대상 · 최대 3개")
     measurable = sum(target.get("inspection_kind") == "MEASUREMENT" for target in targets)
     st.caption(f"측정 가능 {measurable}개 · 추가 확인 대상 {len(targets) - measurable}개")

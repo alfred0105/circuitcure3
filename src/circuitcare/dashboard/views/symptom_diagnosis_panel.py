@@ -1309,6 +1309,10 @@ def render_symptom_diagnosis_panel(
                                 type="primary", disabled=preview,
                                 key=f"{key}_reassessment_retry")
     run_after_measurement_change = _consume_measurement_change_rerun(state, measurement_fingerprint)
+    reuse_qwen_for_measurement_change = bool(
+        run_after_measurement_change
+        and state.get("last_qwen_input_fingerprint") == fingerprint
+    )
     run_after_initial_answer = bool(state.pop("run_after_initial_answer", False))
     # A stage transition requests one automatic run. Failures and stale commits
     # must wait for an explicit retry click; otherwise every rerun can enqueue
@@ -1435,7 +1439,8 @@ def render_symptom_diagnosis_panel(
         )
         component_rows = _component_rows(components, component_inventory)
         parsed = {"observations": [], "uncertain_facts": [], "parser_status": "SKIPPED"}
-        if llm_enabled and selected_model and symptom_text.strip():
+        if (llm_enabled and selected_model and symptom_text.strip()
+                and not reuse_qwen_for_measurement_change):
             try:
                 analysis_progress.write("증상 구조화 · 진행 중")
                 with st.spinner("AI가 증상을 정리하는 중…" if simple_ui else f"{selected_model}이 증상을 구조화하는 중…"):
@@ -1446,6 +1451,13 @@ def render_symptom_diagnosis_panel(
                 LOGGER.warning("diagnosis symptom_structuring_failed project=%s model=%s error=%s",
                                project.project_id, selected_model, str(exc)[:500])
                 analysis_progress.write("증상 구조화 · 실패 · 규칙 진단 계속")
+        elif reuse_qwen_for_measurement_change:
+            cached_parsed = state.get("parsed_observations")
+            parsed = ({"observations": cached_parsed, "uncertain_facts": [],
+                       "parser_status": "REUSED_SYMPTOM_INPUT"}
+                      if isinstance(cached_parsed, list) else
+                      {"observations": [], "uncertain_facts": [], "parser_status": "SKIPPED"})
+            analysis_progress.write("측정 변경 · 증상 구조화 결과 재사용 · Qwen 호출 생략")
         state["parsed_observations"] = parsed.get("observations", [])
         combined_observations = _combined_observations(state)
         parsed_symptoms = [row["code"] for row in state["parsed_observations"]
@@ -1490,7 +1502,8 @@ def render_symptom_diagnosis_panel(
         _attach_evidence_v1(result, components=component_rows, measurements=measurements,
                             observations=combined_observations)
         if (result.get("status") != "NEEDS_SYMPTOMS" and result.get("symptom_codes")
-                and llm_enabled and selected_model and qwen_pcb_strategy):
+                and llm_enabled and selected_model and qwen_pcb_strategy
+                and not reuse_qwen_for_measurement_change):
             with st.spinner("AI가 PCB 구조를 검토하는 중…" if simple_ui else f"{selected_model}이 PCB 구조를 참고해 미검증 후보를 검토하는 중…"):
                 analysis_progress.write("Qwen PCB 보조 검토 · 진행 중")
                 _apply_qwen_pcb_assist(
@@ -1503,7 +1516,8 @@ def render_symptom_diagnosis_panel(
                 analysis_progress.write("Qwen PCB 보조 검토 · 실패 · 규칙 후보 유지")
             else:
                 analysis_progress.write("Qwen PCB 보조 검토 · 완료")
-        if len(result.get("hypotheses", [])) < 3 and llm_enabled and selected_model:
+        if (len(result.get("hypotheses", [])) < 3 and llm_enabled and selected_model
+                and not reuse_qwen_for_measurement_change):
             try:
                 with st.spinner("AI가 추가 가능성을 확인하는 중…" if simple_ui else f"{selected_model}이 미등록 원인 가능성을 별도 검토하는 중…"):
                     result["llm_unverified_suggestions"] = suggest_unregistered_causes(
@@ -1512,7 +1526,8 @@ def render_symptom_diagnosis_panel(
                     )
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 result["llm_suggestion_error"] = str(exc)
-        if llm_enabled and selected_model and result.get("hypotheses"):
+        if (llm_enabled and selected_model and result.get("hypotheses")
+                and not reuse_qwen_for_measurement_change):
             try:
                 with st.spinner("AI가 근거를 정리하는 중…" if simple_ui else f"{selected_model}이 근거를 정리하는 중…"):
                     result["llm_assist"] = explain_candidates(
@@ -1521,7 +1536,8 @@ def render_symptom_diagnosis_panel(
                     )
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 result["llm_error"] = str(exc)
-        if llm_enabled and selected_model and result.get("component_candidates"):
+        if (llm_enabled and selected_model and result.get("component_candidates")
+                and not reuse_qwen_for_measurement_change):
             try:
                 with st.spinner("AI가 소자별 검사 이유를 정리하는 중…" if simple_ui else f"{selected_model}이 소자별 검사 이유를 짧게 정리하는 중…"):
                     result["llm_component_explanations"] = explain_component_candidates(
@@ -1530,6 +1546,12 @@ def render_symptom_diagnosis_panel(
                     )
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 result["llm_component_error"] = str(exc)
+        if llm_enabled and selected_model:
+            if reuse_qwen_for_measurement_change:
+                LOGGER.info("diagnosis_qwen_skipped project=%s reason=measurement_only input_fingerprint=%s",
+                            project.project_id, str(fingerprint)[:16])
+            else:
+                state["last_qwen_input_fingerprint"] = fingerprint
         analysis_progress.write("검사 추천 준비 · 완료")
         live_snapshot = current_analysis_snapshot(
             st, project, components=components, component_inventory=component_inventory,

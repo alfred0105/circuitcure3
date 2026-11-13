@@ -73,6 +73,9 @@ def evaluate_component_measurements(
             "component_id": component_id, "fault_id": fault_id, "test_id": test_id,
             "measurement_target": target, "operating_conditions": condition,
             "measurement_id": measurement_id, "status": status, "verdict": verdict,
+            "assessment_status": {"supports": "SUPPORTED", "refutes": "REFUTED",
+                                  "conflicted": "CONFLICTED"}.get(verdict, "INCONCLUSIVE"),
+            "decision_scope": "FAULT_HYPOTHESIS_ONLY",
             "reason": reason, "reference_source_id": row.get("reference_source_id"),
             "reference_verification_status": row.get("reference_verification_status"),
             "evidence_ids": [measurement_id] if measurement_id else [],
@@ -86,6 +89,7 @@ def evaluate_component_measurements(
             new_valid = verdict in {"supports", "refutes"}
             if old_valid and new_valid and previous.get("verdict") != verdict:
                 previous.update(status="CONFLICTED", verdict="conflicted",
+                                assessment_status="CONFLICTED",
                                 reason="동일한 검사·단자·조건의 결과가 서로 충돌합니다.")
             elif previous.get("verdict") == "conflicted":
                 previous["evidence_ids"] = evidence_ids

@@ -112,6 +112,52 @@ def test_mock_model_stages_are_separate_and_llm_failure_keeps_rule_diagnosis():
     assert [step["stage"].split(":", 1)[0] for step in run["stage_trace"]][:2] == ["yolo_detection", "component_review"]
 
 
+def test_block_recall_at_three_uses_only_adjudicated_block_ids_and_reports_fraction():
+    case = _case()
+    case["reference"] = {
+        "adjudication_status": "CONFIRMED", "fault_type_ids": ["F1"],
+        "faulty_functional_block_ids": ["power", "control"],
+        "evidence_sources": ["independent_repair_record"],
+    }
+    run = {"case_id": case["case_id"], "execution_mode": "MOCK", "status": "CANDIDATES_AVAILABLE",
+           "hypotheses": [{"fault_id": "F1", "score": 1}],
+           "functional_block_hypotheses": [
+               {"functional_block_id": "power", "score": 2},
+               {"functional_block_id": "driver", "score": 1},
+               {"functional_block_id": "input", "score": .5},
+           ]}
+    scored = score_run(case, run)
+    assert scored["block_recall_at_3"] == .5
+    assert scored["block_recall_status"] == "EVALUATED"
+    aggregate = evaluate_runs([case], [run])
+    assert aggregate["block_recall_at_3"]["value"] == .5
+    assert aggregate["block_recall_at_3"]["n"] == 1
+
+
+def test_active_plan_recommendations_are_scored_and_dataset_kinds_are_separated():
+    mock_case = _case()
+    mock_case["reference"] = {"adjudication_status": "CONFIRMED", "fault_type_ids": ["F1"],
+        "useful_test_ids": ["T1"], "recommendation_labels_status": "CONFIRMED",
+        "evidence_sources": ["fixture-label"]}
+    synthetic_case = deepcopy(mock_case)
+    synthetic_case["case_id"] = "fixture-synthetic-1"
+    synthetic_case["case_kind"] = "SYNTHETIC"
+    mock_run = {"case_id": mock_case["case_id"], "case_kind": "MOCK", "execution_mode": "MOCK",
+        "strategy": "active_inspection_v1", "status": "CANDIDATES_AVAILABLE",
+        "hypotheses": [{"fault_id": "F1", "score": 1}], "top_candidates": [],
+        "all_component_candidates": [], "next_tests": [], "measurement_evidence": [],
+        "active_inspection_plan": {"candidates": [{"test_id": "T1", "separation_count": 1}]},
+        "measurement_comparison": {"reassessment_duration_ms": 12.5}}
+    synthetic_run = {**mock_run, "case_id": synthetic_case["case_id"], "case_kind": "SYNTHETIC",
+                     "active_inspection_plan": {"candidates": [{"test_id": "T2", "separation_count": 0}]}}
+    mock_score = score_run(mock_case, mock_run)
+    assert mock_score["useful_test_recommended"] is True
+    assert mock_score["reassessment_duration_ms"] == 12.5
+    report = evaluate_runs([mock_case, synthetic_case], [mock_run, synthetic_run])
+    assert set(report["dataset_breakdown"]) == {"MOCK", "SYNTHETIC"}
+    assert report["dataset_breakdown"]["MOCK"]["cases"][0]["useful_test_recommended"] is True
+
+
 def test_top3_scoring_and_detection_metrics_require_adjudicated_labels():
     case = _case()
     case["reference"] = {"adjudication_status": "CONFIRMED", "root_cause_ids": ["F1", "F2"],

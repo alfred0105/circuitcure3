@@ -42,6 +42,8 @@ def test_conflicted_measurement_verdict_is_not_overwritten_by_later_measurement(
     verdict = next(iter(result.values()))
     assert verdict["status"] == "CONFLICTED"
     assert verdict["verdict"] == "conflicted"
+    assert verdict["assessment_status"] == "CONFLICTED"
+    assert verdict["decision_scope"] == "FAULT_HYPOTHESIS_ONLY"
     assert verdict["evidence_ids"] == ["m1", "m2", "m3"]
 
 

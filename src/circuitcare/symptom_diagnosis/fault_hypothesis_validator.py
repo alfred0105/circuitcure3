@@ -32,7 +32,10 @@ def summarize_measurement_verdict(
         verdict = "refutes"
     else:
         verdict = "non_diagnostic"
-    return {"verdict": verdict, "required_tests": sorted(required),
+    return {"verdict": verdict,
+            "assessment_status": {"supports": "SUPPORTED", "refutes": "REFUTED",
+                                  "conflicted": "CONFLICTED"}.get(verdict, "INCONCLUSIVE"),
+            "decision_scope": "FAULT_HYPOTHESIS_ONLY", "required_tests": sorted(required),
             "completed_tests": sorted(completed), "missing_tests": missing,
             "alternative_causes": list(mode.get("alternative_causes", [])),
             "evidence": valid,

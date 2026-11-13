@@ -23,6 +23,7 @@ from circuitcare.symptom_diagnosis.fault_hypothesis_validator import (
 )
 from circuitcare.symptom_diagnosis.measurement_evaluator import evaluate_component_measurements
 from circuitcare.symptom_diagnosis.measurement_validation import verified_measurements_for_inference
+from circuitcare.symptom_diagnosis.active_inspection_planner import plan_active_inspections
 
 KNOWLEDGE_DIR = Path(__file__).with_name("knowledge")
 FAILURE_FUNCTION = {
@@ -312,6 +313,8 @@ def diagnose(
     silkscreen_labels: list[dict[str, Any]] | None = None,
     connectivity: dict[str, Any] | None = None, connectivity_status: str = "none",
     knowledge: dict[str, Any] | None = None,
+    inspection_history: list[dict[str, Any]] | None = None,
+    allow_retest: bool = False,
     _simulate_questions: bool = True,
 ) -> dict[str, Any]:
     """Generate ranked, explicitly unverified causes from normalized evidence."""
@@ -469,6 +472,8 @@ def diagnose(
                 "matched_rules": [], "hypotheses": [], "functional_blocks": functional_blocks,
                 "functional_block_groups": functional_block_groups,
                 "evidence_ledger": evidence_ledger, "evidence_gaps": [], "next_tests": [],
+                "active_inspection_plan": {"status": "NO_HYPOTHESES", "candidates": [],
+                                            "blocked": [], "score_is_probability": False},
                 "processing_timings_ms": {"measurement_validation": round(measurement_validation_ms, 3),
                                            "candidate_ranking": 0.0, "recommendation_generation": 0.0,
                                            "total": round((time.perf_counter() - diagnosis_started) * 1000, 3)},
@@ -661,6 +666,7 @@ def diagnose(
                 current_context=current_context,
                 silkscreen_labels=silkscreen_labels, connectivity=connectivity,
                 connectivity_status=connectivity_status, knowledge=kb,
+                inspection_history=inspection_history, allow_retest=allow_retest,
                 _simulate_questions=False,
             )
             answer_scores[answer] = [(row["fault_id"], float(row["score"]))
@@ -713,6 +719,13 @@ def diagnose(
                                                  " ".join(str(row.get("measurement_target") or "").casefold().split()),
                                                  " ".join(str(row.get("operating_conditions") or "").casefold().split())), {})
                     .get("verdict", "non_diagnostic")),
+        "assessment_status": (measurement_assessments.get((str(row.get("component_id") or ""),
+                                                            str(row.get("fault_hypothesis") or ""),
+                                                            str(row.get("test_id") or ""),
+                                                            " ".join(str(row.get("measurement_target") or "").casefold().split()),
+                                                            " ".join(str(row.get("operating_conditions") or "").casefold().split())), {})
+                              .get("assessment_status", "INCONCLUSIVE")),
+        "decision_scope": "FAULT_HYPOTHESIS_ONLY",
         "used_for_ranking": any(candidate.get("component_id") == row.get("component_id")
                                  and candidate.get("fault_hypothesis") == row.get("fault_hypothesis")
                                  and candidate.get("measurement_verdict") in {"supports", "refutes"}
@@ -768,6 +781,19 @@ def diagnose(
         measurement_evidence=measurement_evidence, evidence_ledger=evidence_ledger,
         connectivity_status=connectivity_status,
     )
+    active_inspection_plan = plan_active_inspections(
+        hypotheses=ranked, component_candidates=all_component_candidates,
+        functional_block_groups=functional_block_groups, evidence_gaps=evidence_gaps,
+        measurements=[
+            {**row,
+             "assessment_status": next((item.get("assessment_status", item.get("verdict"))
+                                        for item in measurement_evidence
+                                        if item.get("measurement_id") == row.get("measurement_id")), None)}
+            for row in (measurements or []) if isinstance(row, dict)
+        ], observations=facts,
+        inspection_history=inspection_history or [], knowledge=kb,
+        allow_retest=allow_retest,
+    )
     return {"status": status, "symptom_codes": selected, "observations": facts,
             "component_inventory": {"complete": bool(inventory_complete),
                                     "confirmed_component_ids": sorted(confirmed_ids),
@@ -783,6 +809,7 @@ def diagnose(
             "hierarchical_hypotheses": hierarchical_hypotheses,
             "component_candidate_groups": list(candidate_groups_by_id.values()),
             "evidence_ledger": evidence_ledger, "evidence_gaps": evidence_gaps,
+            "active_inspection_plan": active_inspection_plan,
             "hypothesis_groups": hypothesis_groups,
             "component_candidates": component_candidates,
             "all_component_candidates": all_component_candidates,

@@ -24,8 +24,8 @@ def main() -> int:
     run.add_argument("--real-yolo", action="store_true", help="use local production YOLO weights")
     run.add_argument("--mode", choices=("REAL_MODEL", "CACHED", "MOCK", "SYNTHETIC"),
                      help="explicit execution mode; REAL_MODEL requires local weights")
-    run.add_argument("--strategy", choices=("baseline", "evidence_v1"), default="baseline",
-                     help="diagnosis ranking strategy; evidence_v1 remains experimental/opt-in")
+    run.add_argument("--strategy", choices=("baseline", "evidence_v1", "active_inspection_v1"), default="baseline",
+                     help="baseline ranking, experimental evidence reranking, or ranking-neutral active inspection planning")
     args = parser.parse_args()
     if args.command == "register":
         print(register_cases(args.source, args.destination))
