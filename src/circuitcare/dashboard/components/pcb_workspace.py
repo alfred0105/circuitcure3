@@ -144,7 +144,7 @@ def render_component_viewer(
     overlay_version = hashlib.sha256(repr([
         (item.component_id, item.bbox_xyxy, item.display_label, item.component_type,
          item.overlay_status, item.overlay_source, item.ocr_marking,
-         item.fault_candidate_status) for item in components
+         item.fault_candidate_status, item.functional_block_roles) for item in components
     ]).encode()).hexdigest()[:16]
     epoch_key = f"{viewer_key}_{image_fingerprint[:16]}_event_epoch"
     event_epoch = st.session_state.setdefault(epoch_key, secrets.token_urlsafe(18))
@@ -324,6 +324,7 @@ def render_component_viewer(
         "fault_hypothesis": item.fault_hypothesis,
         "fault_role_status": item.fault_role_status,
         "fault_history": list(item.fault_history),
+        "functional_block_roles": list(item.functional_block_roles),
     } for item in components]
     ack_event_id = st.session_state.get(last_id_key)
     render_count_key = "cc_debug_viewer_render_request_count"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from typing import Any
 
 from circuitcare.symptom_diagnosis.fault_hypothesis_validator import (
@@ -96,9 +97,13 @@ def rank_component_candidates(
             component_id for (component_id, measured_fault, *_), assessment in assessments.items()
             if measured_fault == fault_id and assessment.get("verdict") in {"supports", "refutes"}
         )
-        # Identical instances cannot be distinguished by alphabetic ID order.
+        # Keep indistinguishable instances as an explicit unresolved group. Do
+        # not silently drop every candidate or imply that the first ID is best.
+        ambiguous_ids = sorted(str(part.get("component_id") or "") for part, _ in eligible)
+        candidate_group_id = None
         if len(eligible) > 1 and not targeted_ids:
-            continue
+            candidate_group_id = "candidate-group-" + hashlib.sha256(
+                f"{fault_id}|{'|'.join(ambiguous_ids)}".encode()).hexdigest()[:12]
         if targeted_ids:
             eligible = [(part, validation) for part, validation in eligible
                         if str(part.get("component_id")) in targeted_ids]
@@ -166,6 +171,9 @@ def rank_component_candidates(
             ]))
             results.append({
                 "component_id": component_id, "component_type": part_type,
+                "candidate_group_id": candidate_group_id,
+                "candidate_group_status": "UNRESOLVED_AMBIGUITY" if candidate_group_id else None,
+                "candidate_group_component_ids": ambiguous_ids if candidate_group_id else [],
                 "candidate_rank": 0, "rank": 0, "fault_hypothesis": fault_id,
                 "fault_id": fault_id, "fault_title": hypothesis.get("title", fault_id),
                 "score": round(score, 2), "score_breakdown": {
@@ -174,6 +182,7 @@ def rank_component_candidates(
                     "component_observations": round(observation_score, 3),
                     "validated_measurement": round(measurement_score, 3),
                 },
+                "score_is_probability": False,
                 "status": visual_status, "visual_status": visual_status,
                 "measurement_status": verdict["verdict"].upper(),
                 "measurement_verdict": verdict["verdict"],

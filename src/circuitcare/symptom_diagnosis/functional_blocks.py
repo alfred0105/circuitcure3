@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from math import hypot
 import re
 from typing import Any
@@ -116,3 +118,48 @@ def analyze_functional_blocks(
             "ic_identity": identity, "status": "INFERRED", "verified": False,
         })
     return result
+
+
+def build_functional_block_groups(
+    components: list[dict[str, Any]], component_roles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group reviewed components by inferred role; membership never implies wiring."""
+    roles_by_id = {str(row.get("component_id")): row for row in component_roles
+                   if isinstance(row, dict) and row.get("component_id")}
+    groups: list[dict[str, Any]] = []
+    for role in ("power", "control", "control_timing", "control_input", "input",
+                 "output", "driver", "protection", "thermal", "buzzer", "relay"):
+        members = []
+        for component in components:
+            component_id = str(component.get("board_component_id") or component.get("component_id") or "")
+            role_row = roles_by_id.get(component_id, {})
+            if (str(component.get("component_type") or "").casefold() == "not_component"
+                    or str(component.get("presence_status") or "").upper() == "EXCLUDED"):
+                continue
+            if role not in role_row.get("candidate_blocks", []):
+                continue
+            members.append({"board_component_id": str(component.get("board_component_id") or component_id),
+                            "component_id": component_id,
+                            "component_type": component.get("component_type", "unknown"),
+                            "evidence_status": ("VERIFIED" if str(component.get("component_type_status") or "").upper() == "USER_CONFIRMED"
+                                                and str(component.get("presence_status") or "").upper() in {"CONFIRMED", "USER_CONFIRMED"}
+                                                else "UNKNOWN"),
+                            "photo_id": component.get("photo_id"),
+                            "bbox_xyxy": component.get("bbox_xyxy", component.get("bbox")),
+                            "role_evidence": role_row.get("role_evidence", {}).get(role, [])})
+        if not members:
+            continue
+        member_ids = sorted({row["board_component_id"] for row in members})
+        seed = json.dumps([role, member_ids], ensure_ascii=False, separators=(",", ":"))
+        block_id = f"block-{hashlib.sha256(seed.encode()).hexdigest()[:12]}"
+        evidence = list(dict.fromkeys(text for member in members for text in member["role_evidence"]))
+        groups.append({"block_id": block_id, "functional_block_id": block_id, "role": role,
+                       "title": role.replace("_", " ").title(), "component_ids": member_ids,
+                       "board_component_ids": member_ids, "members": members,
+                       "supporting_evidence": evidence, "opposing_evidence": [],
+                       "verification_status": "INFERRED", "status": "INFERRED",
+                       "verified": False, "connectivity_status": "NOT_INFERRED",
+                       "unknown_connectivity_component_ids": member_ids,
+                       "unverified_relations": [],
+                       "connectivity_note": "역할 그룹은 전기적 연결 관계를 의미하지 않습니다."})
+    return groups

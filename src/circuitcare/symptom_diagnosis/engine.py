@@ -14,6 +14,9 @@ import yaml
 from circuitcare.symptom_diagnosis.schemas import EvidenceStatus, Observation
 from circuitcare.component_taxonomy import normalize_component_class
 from circuitcare.symptom_diagnosis.functional_blocks import analyze_functional_blocks
+from circuitcare.symptom_diagnosis.functional_blocks import build_functional_block_groups
+from circuitcare.symptom_diagnosis.evidence_ledger import build_evidence_ledger
+from circuitcare.symptom_diagnosis.evidence_gaps import analyze_evidence_gaps
 from circuitcare.symptom_diagnosis.component_fault_ranker import rank_component_candidates, rank_joint_candidates
 from circuitcare.symptom_diagnosis.fault_hypothesis_validator import (
     summarize_measurement_verdict, validate_component_hypothesis,
@@ -316,6 +319,10 @@ def diagnose(
     kb = knowledge or load_knowledge()
     ontology = kb["symptom_ontology"]["symptoms"]
     observed_facts, provenance, evidence_conflicts = _normalize_observations(observations)
+    ledger_observations = (list(observations) if isinstance(observations, list) else
+                           [{"code": str(code), "value": value, "status": "observed", "source": "user_report"}
+                            for code, value in observations.items() if value is not None]
+                           if isinstance(observations, dict) else [])
     requested_symptoms = list(dict.fromkeys([*(symptoms or []), *infer_symptom_codes(symptom_text, kb)]))
     selected = []
     considered: set[str] = set()
@@ -342,6 +349,7 @@ def diagnose(
         facts.setdefault(code, True)
     normalized_parts = [dict(part, component_type=_normalized_type(part.get("component_type", part.get("label"))))
                         for part in (components or [])]
+    detected_parts = normalized_parts
     # A detection is not proof of presence. Only explicitly reviewed IDs may
     # create component-level hypotheses or scope component measurements.
     supplied_confirmed_ids = {str(value) for value in (confirmed_component_ids or []) if str(value)}
@@ -362,10 +370,13 @@ def diagnose(
     _derive_function_facts(facts)
     taxonomy = kb["component_taxonomy"].get("component_types", {})
     functional_blocks = analyze_functional_blocks(
-        normalized_parts, taxonomy, silkscreen_labels=silkscreen_labels,
+        detected_parts, taxonomy, silkscreen_labels=silkscreen_labels,
         ic_catalog=kb.get("ic_part_catalog", {}).get("parts", {}),
     )
-    blocks_by_component = {str(row.get("component_id")): row for row in functional_blocks}
+    confirmed_functional_blocks = [row for row in functional_blocks
+                                   if str(row.get("component_id") or "") in confirmed_ids]
+    functional_block_groups = build_functional_block_groups(detected_parts, functional_blocks)
+    blocks_by_component = {str(row.get("component_id")): row for row in confirmed_functional_blocks}
 
     matched_rules = [rule for rule in kb["symptom_rules"]["rules"]
                      if _condition_matches(rule.get("when", {}), facts)]
@@ -445,9 +456,19 @@ def diagnose(
         if facts.get("MULTIPLE_FUNCTIONS_FAILED"):
             generated.add("COMPOUND_FAILURE")
     else:
+        evidence_ledger = build_evidence_ledger(
+            observations=ledger_observations,
+            conflicts=evidence_conflicts, components=[dict(part, component_type_status=(
+                part.get("component_type_status") or ("USER_CONFIRMED" if str(part.get("component_id") or "") in confirmed_ids else "UNCONFIRMED")),
+                presence_status="CONFIRMED" if str(part.get("component_id") or "") in confirmed_ids else "UNCONFIRMED")
+                for part in detected_parts], functional_blocks=functional_blocks,
+            measurements=measurements or [],
+            source_version=str((current_context or {}).get("component_map_version") or "") or None)
         return {"status": "NEEDS_SYMPTOMS", "symptom_codes": [], "observations": facts,
                 "evidence_conflicts": evidence_conflicts,
-                "matched_rules": [], "hypotheses": [], "functional_blocks": [], "next_tests": [],
+                "matched_rules": [], "hypotheses": [], "functional_blocks": functional_blocks,
+                "functional_block_groups": functional_block_groups,
+                "evidence_ledger": evidence_ledger, "evidence_gaps": [], "next_tests": [],
                 "processing_timings_ms": {"measurement_validation": round(measurement_validation_ms, 3),
                                            "candidate_ranking": 0.0, "recommendation_generation": 0.0,
                                            "total": round((time.perf_counter() - diagnosis_started) * 1000, 3)},
@@ -556,11 +577,13 @@ def diagnose(
                        "evidence_details": evidence_details,
                        "related_component_ids": [part.get("component_id") for part in applicable_parts],
                        "status": "UNVERIFIED_CANDIDATE"})
+    # Keep the legacy flat list for existing callers; new clients receive
+    # independently sorted level lists below instead of comparing unlike ranks.
     level_priority = {"component": 0, "functional_block": 1, "board": 2, "system": 3}
     ranked.sort(key=lambda row: (level_priority.get(row["level"], 4), -row["score"], row["title"]))
     rule_ranking_started = time.perf_counter()
     ranked_component_evidence = rank_component_candidates(
-        hypotheses=ranked, components=normalized_parts, functional_blocks=functional_blocks,
+        hypotheses=ranked, components=normalized_parts, functional_blocks=confirmed_functional_blocks,
         observations=(observations if isinstance(observations, list) else []),
         measurements=ranking_measurements,
         confirmed_component_ids=confirmed_ids, profiles=kb.get("component_test_profiles", {}),
@@ -571,7 +594,7 @@ def diagnose(
     verified_component_history = [row for row in ranked_component_evidence
                                   if row.get("visual_status") in {"FAULT_SUPPORTED", "FAULT_REFUTED"}]
     component_candidates = rank_component_candidates(
-        hypotheses=ranked, components=normalized_parts, functional_blocks=functional_blocks,
+        hypotheses=ranked, components=normalized_parts, functional_blocks=confirmed_functional_blocks,
         observations=(observations if isinstance(observations, list) else []),
         measurements=ranking_measurements,
         confirmed_component_ids=confirmed_ids, profiles=kb.get("component_test_profiles", {}),
@@ -581,6 +604,19 @@ def diagnose(
     # still shows its historical three distinct components, while opt-in
     # strategies and evaluators can inspect every eligible pair before slicing.
     all_component_candidates = ranked_component_evidence
+    candidate_groups_by_id: dict[str, dict[str, Any]] = {}
+    for row in all_component_candidates:
+        group_id = row.get("candidate_group_id")
+        if not group_id:
+            continue
+        group = candidate_groups_by_id.setdefault(str(group_id), {
+            "candidate_group_id": str(group_id), "fault_id": row.get("fault_hypothesis"),
+            "component_ids": list(row.get("candidate_group_component_ids", [])),
+            "status": "UNRESOLVED_AMBIGUITY", "reason": "현재 근거로는 같은 종류 후보를 구별할 수 없습니다.",
+            "score_is_probability": False,
+        })
+        group["component_ids"] = sorted(set(group["component_ids"]) |
+                                        {str(row.get("component_id"))})
     joint_candidates = rank_joint_candidates(
         hypotheses=ranked, component_candidates=component_candidates, observations=facts,
     )
@@ -689,6 +725,49 @@ def diagnose(
                                                      "reason", "검사 프로파일·기준 출처·조건이 검증되지 않아 판정에 사용하지 않았습니다."),
     } for row in measurements or [] if isinstance(row, dict)
         and str(row.get("component_id") or "") in confirmed_ids]
+    evidence_ledger = build_evidence_ledger(
+        observations=ledger_observations,
+        conflicts=evidence_conflicts,
+        components=[dict(part, component_type_status=(part.get("component_type_status") or
+                         ("USER_CONFIRMED" if str(part.get("component_id") or "") in confirmed_ids else "UNCONFIRMED")),
+                         presence_status="CONFIRMED" if str(part.get("component_id") or "") in confirmed_ids else "UNCONFIRMED")
+                    for part in detected_parts],
+        functional_blocks=functional_blocks, measurements=measurements or [],
+        source_version=str((current_context or {}).get("component_map_version") or "") or None)
+    functional_hypotheses = []
+    for hypothesis in ranked:
+        mode = modes.get(str(hypothesis.get("fault_id") or ""), {})
+        if mode.get("level") != "functional_block":
+            continue
+        required_roles = set(mode.get("functional_roles", []))
+        for block in functional_block_groups:
+            if required_roles and block.get("role") not in required_roles:
+                continue
+            functional_hypotheses.append({**hypothesis,
+                "hypothesis_id": f"{hypothesis['fault_id']}:{block['block_id']}",
+                "level": "functional_block", "functional_block_id": block["block_id"],
+                "functional_block": block["role"], "related_component_ids": list(block["component_ids"]),
+                "supporting_evidence": list(dict.fromkeys([
+                    *hypothesis.get("supporting_evidence", []), *block.get("supporting_evidence", [])])),
+                "status": "UNVERIFIED_CANDIDATE", "score_is_probability": False})
+    hierarchical_hypotheses = {
+        "system": sorted([row for row in ranked if row.get("level") == "system"],
+                          key=lambda row: (-row.get("score", 0), row.get("fault_id", ""))),
+        "functional_blocks": sorted(functional_hypotheses,
+                                    key=lambda row: (-row.get("score", 0), row.get("functional_block_id", ""), row.get("fault_id", ""))),
+        "components": sorted(all_component_candidates,
+                              key=lambda row: (-row.get("score", 0), row.get("component_id", ""), row.get("fault_hypothesis", ""))),
+        "board": sorted([*([row for row in ranked if row.get("level") == "board"]),
+                          *[{**row, "level": "board", "source": "direct_board_evidence"}
+                            for row in joint_candidates]],
+                        key=lambda row: (-row.get("score", 0), row.get("fault_id", ""))),
+    }
+    evidence_gaps = analyze_evidence_gaps(
+        hypotheses=ranked, knowledge=kb, confirmed_types=detected_types,
+        functional_blocks=confirmed_functional_blocks, component_candidates=all_component_candidates,
+        measurement_evidence=measurement_evidence, evidence_ledger=evidence_ledger,
+        connectivity_status=connectivity_status,
+    )
     return {"status": status, "symptom_codes": selected, "observations": facts,
             "component_inventory": {"complete": bool(inventory_complete),
                                     "confirmed_component_ids": sorted(confirmed_ids),
@@ -700,6 +779,10 @@ def diagnose(
             "matched_rules": [{"id": rule["id"], "name": rule["name"]}
                               for rule in sorted(matched_rules, key=lambda item: -item.get("priority", 0))],
             "hypotheses": ranked, "functional_blocks": functional_blocks,
+            "functional_block_groups": functional_block_groups,
+            "hierarchical_hypotheses": hierarchical_hypotheses,
+            "component_candidate_groups": list(candidate_groups_by_id.values()),
+            "evidence_ledger": evidence_ledger, "evidence_gaps": evidence_gaps,
             "hypothesis_groups": hypothesis_groups,
             "component_candidates": component_candidates,
             "all_component_candidates": all_component_candidates,

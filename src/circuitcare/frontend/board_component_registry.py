@@ -140,7 +140,8 @@ def measurement_view_model_for_board_component(
     """Resolve a board identity to a real, non-excluded photo observation for measurement UI."""
     component = next((row for row in registry.get("components", [])
                       if str(row.get("board_component_id")) == str(board_component_id)), None)
-    if not component or component.get("component_type") == "board_feature":
+    if (not component or component.get("component_type") == "board_feature"
+            or component.get("presence_status") == "EXCLUDED"):
         return None
     sources = []
     for row in component.get("source_components", []):
@@ -227,6 +228,7 @@ def source_observation_fingerprint(source: dict[str, Any]) -> str:
         "qwen_component_subtype_candidate", "qwen_component_type_alternatives", "qwen_review_status",
         "qwen_visual_evidence", "qwen_ocr_evidence", "qwen_conflicting_evidence",
         "qwen_marking_candidates", "qwen_part_number_candidates", "qwen_functional_role_candidates",
+        "user_component_type_id", "user_component_type_name", "user_component_parent_class",
         "ocr_inferred_value", "ocr_inference_method",
     )
     payload = {key: source.get(key) for key in identity_fields}
@@ -413,6 +415,9 @@ def _source_rows(photo_snapshots: dict[str, dict[str, Any]]) -> dict[str, dict[s
                 "qwen_marking_candidates": list(get("qwen_marking_candidates", ()) or ()),
                 "qwen_part_number_candidates": list(get("qwen_part_number_candidates", ()) or ()),
                 "qwen_functional_role_candidates": list(get("qwen_functional_role_candidates", ()) or ()),
+                "user_component_type_id": get("user_component_type_id"),
+                "user_component_type_name": get("user_component_type_name"),
+                "user_component_parent_class": get("user_component_parent_class"),
                 "ocr_inferred_value": get("ocr_inferred_value"),
                 "ocr_inference_method": get("ocr_inference_method"),
             }

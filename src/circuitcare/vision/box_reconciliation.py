@@ -386,7 +386,8 @@ def preserve_review_rows(
             for key in ("ocr_records", "ocr_candidates", "reference_designators", "ocr_class_hints", "ocr_association_status",
                         "ai_review", "ai_proposed_class", "duplicate_of", "exclusion_reason",
                         "group_split_member_ids", "group_parent_id", "group_review_confirmed",
-                        "group_review_decision"):
+                        "group_review_decision", "user_component_type_id", "user_component_type_name",
+                        "user_component_parent_class", "training_label_user_confirmed"):
                 if key in old:
                     row[key] = old[key]
         result.append(row)

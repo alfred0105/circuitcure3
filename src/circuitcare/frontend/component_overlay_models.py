@@ -50,6 +50,7 @@ class ComponentOverlayViewModel:
     ocr_class_hints: tuple[str, ...] = ()
     reference_designators: tuple[str, ...] = ()
     board_component_id: str | None = None
+    functional_block_roles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

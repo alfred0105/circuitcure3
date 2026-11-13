@@ -90,6 +90,29 @@ def test_qwen_candidate_schema_and_result_are_allowlisted_and_unverified():
     assert "FAULT_SUPPORTED" not in item_schema["uncertainty_status"]["enum"]
 
 
+def test_qwen_block_proposals_and_evidence_ledger_ids_are_allowlisted():
+    knowledge = load_knowledge()
+    fault_id = next(key for key, row in knowledge["fault_modes"]["fault_modes"].items()
+                    if "capacitor" in row.get("candidate_component_types", []))
+    response = {"proposals": [{"component_id": "bc-c1", "suspected_fault_id": fault_id,
+        "functional_block": "power", "functional_block_id": "block-abc123", "reason": "가설",
+        "supporting_evidence_ids": ["ev-verified-1"], "opposing_evidence_ids": [],
+        "missing_information": ["측정 기준"], "recommended_next_action": "기준 확인",
+        "uncertainty_status": "UNVERIFIED"}]}
+    client = FakeClient(response)
+    context = {"focus_components": [{"component_id": "bc-c1", "type": "capacitor",
+        "review_status": "USER_CONFIRMED", "component_type_status": "USER_CONFIRMED"}],
+        "observations": {}, "functional_block_groups": [{"block_id": "block-abc123",
+        "role": "power", "component_ids": ["bc-c1"], "connectivity_status": "NOT_INFERRED"}],
+        "evidence_ledger": [{"evidence_id": "ev-verified-1", "status": "VERIFIED"}]}
+    result = suggest_pcb_fault_candidates(client, "qwen", pcb_context=context,
+                                          diagnosis={}, knowledge=knowledge)
+    assert result["proposals"][0]["functional_block_id"] == "block-abc123"
+    assert result["proposals"][0]["supporting_evidence_ids"] == ["ev-verified-1"]
+    schema = client.calls[0][2]["properties"]["proposals"]["items"]["properties"]
+    assert schema["functional_block_id"]["enum"] == ["block-abc123", "__none__"]
+
+
 def test_qwen_rejects_wrong_fault_component_pair_and_unconfirmed_component():
     knowledge = load_knowledge()
     resistor_fault = next(key for key, row in knowledge["fault_modes"]["fault_modes"].items()

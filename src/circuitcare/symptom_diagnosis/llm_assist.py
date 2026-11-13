@@ -32,6 +32,8 @@ def suggest_pcb_fault_candidates(
         return {"proposals": [], "model": model, "status": "NO_ELIGIBLE_COMPONENTS"}
     block_values = sorted({"power", "input", "control", "control_input", "control_timing",
                            "driver", "output", "protection", "thermal", "buzzer", "relay"})
+    block_groups = {str(row.get("block_id")): row for row in pcb_context.get("functional_block_groups", [])
+                    if isinstance(row, dict) and row.get("block_id")}
     raw_observations = pcb_context.get("observations", {})
     evidence_values = ({str(key) for key in raw_observations}
                        if isinstance(raw_observations, dict) else set())
@@ -41,6 +43,9 @@ def suggest_pcb_fault_candidates(
     for row in pcb_context.get("measurement_evidence", []) if isinstance(pcb_context.get("measurement_evidence"), list) else []:
         if isinstance(row, dict) and row.get("measurement_id"):
             evidence_values.add(f"measurement:{row['measurement_id']}")
+    for row in pcb_context.get("evidence_ledger", []) if isinstance(pcb_context.get("evidence_ledger"), list) else []:
+        if isinstance(row, dict) and row.get("evidence_id"):
+            evidence_values.add(str(row["evidence_id"]))
     evidence_options = sorted(evidence_values) or ["__none__"]
     schema = {
         "type": "object", "additionalProperties": False, "required": ["proposals"],
@@ -53,6 +58,7 @@ def suggest_pcb_fault_candidates(
                 "component_id": {"type": "string", "enum": eligible_ids},
                 "suspected_fault_id": {"type": "string", "enum": modes},
                 "functional_block": {"type": "string", "enum": block_values + ["UNKNOWN"]},
+                "functional_block_id": {"type": "string", "enum": sorted(block_groups) + ["__none__"]},
                 "reason": {"type": "string", "maxLength": 500},
                 "supporting_evidence_ids": {"type": "array", "maxItems": 6,
                                              "items": {"type": "string", "enum": evidence_options}},
@@ -67,6 +73,7 @@ def suggest_pcb_fault_candidates(
     }
     payload = {"pcb_context": pcb_context, "rule_hypotheses": pcb_context.get("hypotheses", []),
                "allowed_component_ids": eligible_ids, "allowed_fault_ids": modes,
+               "allowed_functional_block_ids": sorted(block_groups),
                "evidence_ids": evidence_options}
     response = client.chat_json(model, [
         {"role": "system", "content": (
@@ -74,6 +81,7 @@ def suggest_pcb_fault_candidates(
             "type_evidence_status와 ocr_evidence_status가 CONFIRMED인 정보만 확인 사실로 사용한다. TENTATIVE 표시는 검수 단서일 뿐이다. "
             "미검수 소자의 종류는 잠정값이므로 확정 사실처럼 말하지 않는다. 입력 JSON의 허용 고장 유형과 증거만 사용한다. "
             "사용자 의심은 미검증 단서다. 존재하지 않는 측정·배선·핀·연결·소자·증거를 만들지 않는다. "
+            "기능 블록 ID는 supplied functional_block_groups에 있는 ID만 선택하고, 없으면 __none__으로 둔다. "
             "근거가 부족하면 후보를 생략하거나 INCONCLUSIVE로 제안한다. Qwen 제안만으로 고장을 확정하거나 "
             "FAULT_SUPPORTED 판정을 내리지 않는다. 기능부는 추정 후보일 뿐 연결 사실이 아니다. "
             "JSON 스키마에 맞는 제안 최대 3개를 반환한다."
@@ -141,11 +149,15 @@ def suggest_pcb_fault_candidates(
         proposed_block = row.get("functional_block")
         if not isinstance(proposed_block, str):
             proposed_block = "UNKNOWN"
+        proposed_block_id = row.get("functional_block_id")
+        if proposed_block_id not in block_groups:
+            proposed_block_id = None
         validated.append({
             "component_id": cid, "suspected_fault_id": fault_id,
             "board_component_id": cid,
             "component_type": actual_type if actual_type != "unknown" else sorted(actual_types)[0],
             "functional_block": proposed_block if proposed_block in block_values else "UNKNOWN",
+            "functional_block_id": proposed_block_id,
             "reason": reason[:500],
             "supporting_evidence_ids": supports, "opposing_evidence_ids": opposes,
             "missing_information": missing,

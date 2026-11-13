@@ -423,6 +423,7 @@ def _prepare_photo_component_snapshot(
         project_id=project.project_id, board_id=project.board_id, photo_id=photo_id,
         image_sha256=hashlib.sha256(image_data).hexdigest(), components=[
             {"component_id": row.get("component_id"), "component_type": row.get("소자 종류", "unknown"),
+             "user_component_type_id": row.get("user_component_type_id"),
              "bbox_xyxy": [row.get("x1", 0), row.get("y1", 0), row.get("x2", 0), row.get("y2", 0)]}
             for row in rows if isinstance(row, dict)
         ],
@@ -437,7 +438,9 @@ def _prepare_photo_component_snapshot(
         project_id=project.project_id, board_id=project.board_id or "", board_side=side,
         component_id=str(row.get("component_id") or f"auto-{review_hash}-{index + 1}"),
         component_type=str(review_taxonomy(row)["effective_class"]),
-        display_label=(f"AI 제안 · {review_taxonomy(row)['effective_class']}" if row.get("source") == "qwen_suggestion"
+        display_label=(f"{row['user_component_type_name']} · {review_taxonomy(row)['effective_class']}"
+                       if row.get("user_component_type_name") else
+                       f"AI 제안 · {review_taxonomy(row)['effective_class']}" if row.get("source") == "qwen_suggestion"
                        else f"수동 · {review_taxonomy(row)['effective_class']}" if row.get("source") == "manual"
                        else f"{index + 1} · {review_taxonomy(row)['effective_class']}"),
         canonical_frame_id=photo_id, coordinate_frame="SOURCE_PHOTO_PIXEL",
@@ -477,7 +480,8 @@ def _prepare_photo_component_snapshot(
     ) for model in review_models)
     scope = AnalysisScope(project.project_id, project.board_id or "", str(photo_id))
     image_fingerprint = hashlib.sha256(image_data).hexdigest()
-    review_payload = [{"id": item.component_id, "type": item.component_type, "bbox": item.bbox_xyxy,
+    review_payload = [{"id": item.component_id, "type": item.component_type,
+                       "label": item.display_label, "bbox": item.bbox_xyxy,
                        "marking": item.ocr_marking, "info": item.component_info,
                        "presence": item.presence_status, "type_status": item.component_type_status,
                        "identity": item.part_identity_status,
@@ -505,6 +509,9 @@ def _prepare_photo_component_snapshot(
                     "presence_status": ("EXCLUDED" if row.get("상태") == "제외" else
                                         "CONFIRMED" if row.get("상태") == "확인" else "UNCONFIRMED"),
                     "component_type_status": review_taxonomy(row)["component_type_status"],
+                    "user_component_type_id": row.get("user_component_type_id"),
+                    "user_component_type_name": row.get("user_component_type_name"),
+                    "user_component_parent_class": row.get("user_component_parent_class"),
                     "ocr_marking": row.get("body_marking"),
                     "body_marking": row.get("body_marking"),
                     "ocr_candidates": row.get("ocr_candidates", []),
@@ -963,6 +970,7 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         model, fault_candidate_status=None, diagnosis_display_status="DIAGNOSIS_NOT_RUN",
         fault_hypothesis=None, fault_role_status=None, measurement_status=None,
         solder_status=None, fault_score=None, fault_evidence=(), recommended_tests=(),
+        functional_block_roles=(),
     ) for model in component_models)
     candidate_state_by_scope = st.session_state.get("circuitcare_v6_diagnosis_candidates_by_scope", {})
     scoped_overlay = (candidate_state_by_scope.get(analysis_scope.key)
@@ -1056,6 +1064,23 @@ def _render_pcb(st: Any, project: ProjectContext, photos: list[dict[str, Any]]) 
         )
     if history_by_id:
         component_models = _attach_verified_history(component_models, history_by_id)
+    block_roles_by_component: dict[str, set[str]] = {}
+    active_groups = (current_result.get("functional_block_groups", [])
+                     if analysis_state.get("status") == AnalysisStatus.CURRENT.value
+                     and isinstance(current_result, dict) else [])
+    for block in active_groups:
+        if not isinstance(block, dict):
+            continue
+        role = str(block.get("role") or "")
+        for component_id in block.get("board_component_ids", block.get("component_ids", [])):
+            if component_id:
+                block_roles_by_component.setdefault(str(component_id), set()).add(role)
+    if block_roles_by_component:
+        component_models = tuple(replace(
+            model,
+            functional_block_roles=tuple(sorted(block_roles_by_component.get(
+                str(model.board_component_id or model.component_id), set()))),
+        ) for model in component_models)
     if review_scope and records_key:
         previous_rows = [dict(row) for row in review_rows]
         component_models, review_rows = _bind_review_models_to_map(
@@ -2157,7 +2182,6 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
         # Viewer. Keep the fragment identity stable for this project session.
         fragment_key = "cc_workbench_" + hashlib.sha256(project.project_id.encode()).hexdigest()[:16]
 
-        @fragment(key=fragment_key)
         def _render_workbench_fragment() -> None:
             state = st.session_state
             fragment_count = int(state.get("cc_debug_fragment_rerun_count", 0)) + 1
@@ -2174,7 +2198,10 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                         fragment_count, cause, causes[cause], time.time_ns())
             _render_workbench_shell_body(st, project)
 
-        _render_workbench_fragment()
+        fragment_decorator = fragment(key=fragment_key)
+        rendered_fragment = (fragment_decorator(_render_workbench_fragment)
+                             if callable(fragment_decorator) else _render_workbench_fragment)
+        rendered_fragment()
         return
 
     # Test doubles and older Streamlit-compatible hosts retain the same renderer.
@@ -2435,15 +2462,19 @@ def _render_workbench_shell_body(st: Any, project: ProjectContext) -> None:
                     st, project, snapshot_components, board_registry, measurement_aliases,
                     suspected_components,
                 )
+                question_scope = question_snapshot.get("scope") or AnalysisScope(
+                    project.project_id, project.board_id or "", analysis_target_id or "board:registry:v1")
                 has_current = (question_snapshot.get("record", {}).get("status") == AnalysisStatus.CURRENT.value
                                and isinstance(question_snapshot.get("result"), dict))
                 symptom_state = st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {})
                 auto_advance = (symptom_state.get("workflow_auto_advance")
                                 if isinstance(symptom_state, dict) else None)
+                question_fingerprints = question_snapshot.get("fingerprints")
+                question_fingerprint = getattr(question_fingerprints, "final_sha256", None)
                 auto_advance_matches = (
                     isinstance(auto_advance, dict)
-                    and auto_advance.get("scope_key") == question_snapshot["scope"].key
-                    and auto_advance.get("fingerprint") == question_snapshot["fingerprints"].final_sha256
+                    and auto_advance.get("scope_key") == question_scope.key
+                    and auto_advance.get("fingerprint") == question_fingerprint
                 )
                 question_status = question_snapshot.get("record", {}).get("status", "NOT_RUN")
                 if auto_advance_matches and has_current:
@@ -2452,8 +2483,8 @@ def _render_workbench_shell_body(st: Any, project: ProjectContext) -> None:
                     LOGGER.info(
                         "workflow_auto_advance project=%s from=QUESTIONS to=INSPECTION "
                         "scope=%s fingerprint=%s result_status=%s",
-                        project.project_id, question_snapshot["scope"].key,
-                        question_snapshot["fingerprints"].final_sha256[:16],
+                        project.project_id, question_scope.key,
+                        str(question_fingerprint or "")[:16],
                         question_snapshot["result"].get("status", "UNKNOWN"),
                     )
                     _advance_workflow(
@@ -2469,20 +2500,20 @@ def _render_workbench_shell_body(st: Any, project: ProjectContext) -> None:
                         "workflow_auto_advance_blocked project=%s status=%s scope_match=%s "
                         "fingerprint_match=%s reason=%s",
                         project.project_id, question_status,
-                        auto_advance.get("scope_key") == question_snapshot["scope"].key,
-                        auto_advance.get("fingerprint") == question_snapshot["fingerprints"].final_sha256,
+                        auto_advance.get("scope_key") == question_scope.key,
+                        auto_advance.get("fingerprint") == question_fingerprint,
                         question_snapshot.get("record", {}).get("reason"),
                     )
                 submitted_fingerprint = (symptom_state.get("last_analysis_attempt_fingerprint")
                                          if isinstance(symptom_state, dict) else None)
-                report_submitted = submitted_fingerprint == question_snapshot["fingerprints"].final_sha256
+                report_submitted = bool(question_fingerprint and submitted_fingerprint == question_fingerprint)
                 LOGGER.info(
                     "workflow_inspection_gate project=%s stage=QUESTIONS diagnosis_status=%s "
                     "has_current=%s submitted_fingerprint_match=%s auto_advance_pending=%s "
                     "scope=%s fingerprint=%s",
                     project.project_id, question_status, has_current, report_submitted,
-                    auto_advance_matches, question_snapshot["scope"].key,
-                    question_snapshot["fingerprints"].final_sha256[:16],
+                    auto_advance_matches, question_scope.key,
+                    str(question_fingerprint or "")[:16],
                 )
                 if st.button("검사 후보 선정", type="primary",
                              disabled=preview or not (has_current or report_submitted),
@@ -3053,6 +3084,31 @@ def _render_cause_dashboard(
         if next_action:
             st.info("다음 검사 · " + str(next_action.get("label") or next_action.get("name") or next_action.get("question") or next_action.get("test_id") or "추가 확인"))
 
+    block_groups = result.get("functional_block_groups", [])
+    if block_groups:
+        st.markdown("#### 기능 블록 후보 · 미확정")
+        st.caption("색상은 부품 정보·각인·실크스크린·배치에 따른 역할 그룹입니다. 전기적 연결을 뜻하지 않습니다.")
+        for block in block_groups[:8]:
+            members = block.get("board_component_ids", block.get("component_ids", []))
+            with st.expander(f"{block.get('title', block.get('role', '기능 블록'))} · {len(members)}개 소자 · 추정", expanded=False):
+                if block.get("supporting_evidence"):
+                    st.caption("근거 · " + " · ".join(block["supporting_evidence"][:4]))
+                st.caption("소자 · " + (" · ".join(str(value) for value in members[:16]) or "없음"))
+                st.caption("연결 상태 · 확인되지 않음")
+                for component_id in members[:8]:
+                    if st.button(f"{component_id} 위치 보기", key=candidate_focus_widget_key(
+                            "functional_block", project.project_id, project.board_id,
+                            str(component_id), str(block.get("block_id")))):
+                        _focus_board_registry_component(st, project, board_registry, str(component_id))
+                        st.rerun()
+
+    ambiguous_groups = result.get("component_candidate_groups", [])
+    if ambiguous_groups:
+        with st.expander(f"구별되지 않은 소자 후보 그룹 · {len(ambiguous_groups)}개", expanded=False):
+            for group in ambiguous_groups[:8]:
+                st.caption(f"{group.get('fault_id')} · " + " · ".join(group.get("component_ids", [])))
+                st.caption(group.get("reason", "동일한 근거 수준의 후보들입니다."))
+
     category_labels = (("component", "소자 내부·기능 블록"), ("board", "기판·납땜"), ("system", "외부 시스템"))
     for group_key, label in category_labels:
         rows = groups.get(group_key, []) if isinstance(groups, dict) else []
@@ -3067,7 +3123,7 @@ def _render_cause_dashboard(
                     st.caption("관련 소자 · " + " · ".join(row["related_component_ids"]))
                 st.caption("검증 상태 · 미확정 가설")
 
-    if result.get("llm_assist") or result.get("llm_component_explanations") or result.get("llm_unverified_suggestions") or result.get("matched_rules") or result.get("functional_blocks") or result.get("measurement_evidence"):
+    if result.get("llm_assist") or result.get("llm_component_explanations") or result.get("llm_unverified_suggestions") or result.get("matched_rules") or result.get("functional_blocks") or result.get("measurement_evidence") or result.get("evidence_gaps"):
         with st.expander("상세 근거 · LLM 설명 · 적용 규칙 · 측정", expanded=False):
             assist = result.get("llm_assist")
             if assist:
@@ -3088,6 +3144,12 @@ def _render_cause_dashboard(
             if result.get("measurement_evidence"):
                 for row in result["measurement_evidence"]:
                     st.caption(f"측정 근거 · {row.get('component_id')} · {row.get('measurement_type')} {row.get('value')} {row.get('unit')} · {row.get('verification_status')}")
+            if result.get("evidence_gaps"):
+                st.markdown("**가설별 부족한 근거와 확인 방법**")
+                for gap in result["evidence_gaps"][:8]:
+                    st.caption(f"{gap.get('fault_id')} · {gap.get('status')} · " +
+                               (" · ".join(item.get("description", "") for item in gap.get("missing_evidence", [])[:3])
+                                or "필수 근거 공백 없음; 고장은 여전히 미확정 가설입니다."))
             for suggestion in result.get("llm_unverified_suggestions", []):
                 st.caption(f"미등록 원인 제안 · {suggestion.get('title')} · {suggestion.get('reason')}")
     questions = [row for row in next_tests if row.get("type") == "question"]

@@ -375,23 +375,35 @@ def ensure_review_row_for_component(rows: list[dict], component: Any) -> dict:
 
 
 def update_review_row(row: dict, *, component_type: str, status: str,
-                      bbox_xyxy: list[int] | tuple[int, int, int, int]) -> None:
-    if component_type not in CLASS_OPTIONS or status not in STATUS_OPTIONS:
+                      bbox_xyxy: list[int] | tuple[int, int, int, int],
+                      custom_types: dict[str, dict[str, str]] | None = None) -> None:
+    custom = (custom_types or {}).get(component_type)
+    if (component_type not in CLASS_OPTIONS and custom is None) or status not in STATUS_OPTIONS:
         raise ValueError("소자 종류 또는 검수 상태가 유효하지 않습니다.")
+    effective_type = str(custom["parent_class"]) if custom else component_type
     x1, y1, x2, y2 = map(int, bbox_xyxy)
     if min(x1, y1) < 0 or x2 - x1 < 4 or y2 - y1 < 4:
         raise ValueError("박스 좌표가 유효하지 않습니다.")
     row.setdefault("detector_class", row.get("소자 종류", "unknown"))
-    row.update({"소자 종류": component_type, "상태": status,
+    row.update({"소자 종류": effective_type, "상태": status,
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "user_edited": True})
     # A manual type edit is an explicit override of any older Qwen extension
     # confirmation. Keep AI evidence for audit, but make the effective class
     # and Registry status follow the user edit.
-    row.update({"confirmed_base_class": component_type, "confirmed_subtype": None,
-                "effective_class": component_type, "diagnosis_class": component_type,
+    row.update({"confirmed_base_class": effective_type, "confirmed_subtype": None,
+                "effective_class": effective_type, "diagnosis_class": effective_type,
                 "component_type_status": "USER_CONFIRMED",
                 "type_confirmation_source": "USER_MANUAL"})
+    if custom:
+        row.update({"user_component_type_id": component_type,
+                    "user_component_type_name": custom["display_name"],
+                    "user_component_parent_class": effective_type,
+                    "training_label_user_confirmed": True})
+    else:
+        row.pop("user_component_type_id", None)
+        row.pop("user_component_type_name", None)
+        row.pop("user_component_parent_class", None)
     row.pop("qwen_user_confirmed_extension", None)
 
 
@@ -633,6 +645,16 @@ def _record(label: str, bbox: list | tuple, status: str = "검수 필요", confi
 def _store_predictions(state: Any, records_key: str, result: dict) -> None:
     old_rows = state.get(records_key, [])
     detections = [row for row in result.get("detections", []) if isinstance(row, dict)]
+    from circuitcare.vision.review_learning import user_component_types
+
+    custom_types = {row["type_id"]: row for row in user_component_types()}
+    for detection in detections:
+        custom = custom_types.get(str(detection.get("class_name") or ""))
+        if custom:
+            detection.update({"user_component_type_id": custom["type_id"],
+                              "user_component_type_name": custom["display_name"],
+                              "user_component_parent_class": custom["parent_class"],
+                              "class_name": custom["parent_class"]})
     rows = preserve_review_rows(old_rows, detections)
     for row in rows:
         if not row.get("component_id"):

@@ -23,6 +23,7 @@ from circuitcare.symptom_diagnosis.llm_assist import (
 from circuitcare.symptom_diagnosis.pcb_context import build_pcb_context
 from circuitcare.symptom_diagnosis.candidate_fusion import fuse_inspection_candidates
 from circuitcare.symptom_diagnosis.evidence_strategy import rank_by_verified_evidence
+from circuitcare.symptom_diagnosis.evidence_ledger import build_evidence_ledger
 from circuitcare.symptom_diagnosis.observation_store import ObservationStore
 from circuitcare.symptom_diagnosis.diagnosis_state import build_overlay_state
 from circuitcare.symptom_diagnosis.schemas import ComponentRecord, Observation
@@ -508,6 +509,7 @@ def _render_simple_diagnosis_result(
     if any(result.get(key) for key in (
         "llm_assist", "llm_component_explanations", "llm_unverified_suggestions",
         "matched_rules", "functional_blocks", "measurement_evidence", "hypothesis_groups",
+        "functional_block_groups", "hierarchical_hypotheses", "evidence_gaps", "evidence_ledger",
     )):
         with st.expander("전체 근거와 추가 진단 정보", expanded=False):
             assist = result.get("llm_assist")
@@ -526,6 +528,21 @@ def _render_simple_diagnosis_result(
                 st.caption("적용 규칙 · " + str(row.get("name", row.get("rule_id", "규칙"))))
             for block in result.get("functional_blocks", []):
                 st.caption(f"기능 역할 후보 · {block.get('component_id')} · {', '.join(block.get('candidate_blocks', []))} · 미확정")
+            for block in result.get("functional_block_groups", [])[:12]:
+                st.caption(f"기능 블록 그룹 · {block.get('role')} · " +
+                           " · ".join(block.get("component_ids", [])[:12]) +
+                           " · 추정이며 연결 확정 아님")
+            for gap in result.get("evidence_gaps", [])[:8]:
+                missing = [item.get("description", "") for item in gap.get("missing_evidence", [])[:3]]
+                st.caption(f"부족 근거 · {gap.get('fault_id')} · " +
+                           (" · ".join(missing) if missing else "검증 전 가설"))
+            ledger = result.get("evidence_ledger", [])
+            if ledger:
+                status_counts: dict[str, int] = {}
+                for item in ledger:
+                    status = str(item.get("status", "UNKNOWN"))
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                st.caption("근거 출처 상태 · " + " · ".join(f"{key} {value}" for key, value in sorted(status_counts.items())))
             for row in result.get("measurement_evidence", []):
                 st.caption(f"측정 근거 · {row.get('component_id')} · {row.get('measurement_type')} {row.get('value')} {row.get('unit')} · {row.get('verification_status')}")
             for suggestion in result.get("llm_unverified_suggestions", []):
@@ -946,6 +963,12 @@ def _apply_qwen_pcb_assist(
                     "MODEL_OR_TRANSPORT_ERROR")
         result["qwen_fault_proposals"] = {"proposals": [], "status": "FAILED",
                                           "failure_category": category, "error": message[:400]}
+    qwen_proposals = result.get("qwen_fault_proposals", {}).get("proposals", [])
+    if qwen_proposals:
+        ledger_rows = [*result.get("evidence_ledger", []), *build_evidence_ledger(
+            ai_suggestions=qwen_proposals,
+            source_version=str(result.get("input_fingerprint") or "") or None)]
+        result["evidence_ledger"] = list({row["evidence_id"]: row for row in ledger_rows}.values())
     result["candidate_fusion"] = fuse_inspection_candidates(
         rule_candidates=result.get("all_component_candidates", result.get("component_candidates", [])),
         qwen_proposals=result.get("qwen_fault_proposals", {}).get("proposals", []),

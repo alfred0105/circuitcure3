@@ -61,7 +61,7 @@ def _render_component_knowledge_form(st: Any, component: ComponentOverlayViewMod
         default_type = component_type if component_type in options else options[0]
         kind = st.selectbox("확인한 소자 종류", options, index=options.index(default_type), key=f"{key}_type")
         marking = st.text_input("소자 각인", value=str(component.ocr_marking or ""), key=f"{key}_marking")
-        part_number = st.text_input("부품번호", value=str(component.component_info or ""), key=f"{key}_part")
+        part_number = st.text_input("부품번호", value=str(getattr(component, "component_info", None) or ""), key=f"{key}_part")
         subtype = st.text_input("세부 종류 (선택)", key=f"{key}_subtype")
         role = st.text_input("기능 역할 (선택)", key=f"{key}_role")
         notes = st.text_input("추가 정보 (선택)", key=f"{key}_notes")
@@ -80,6 +80,7 @@ def render_retraining_workspace(st: Any, project: ProjectContext) -> None:
     """Separate, opt-in workspace; reviewed samples are collected silently in the review flow."""
     from circuitcare.vision.review_learning import (
         MIN_UNIQUE_IMAGES, flush_review_samples, refresh_training_jobs, start_retraining, training_summary,
+        save_user_component_type, user_component_types,
     )
 
     save_errors = flush_review_samples()
@@ -90,6 +91,26 @@ def render_retraining_workspace(st: Any, project: ProjectContext) -> None:
                " 재학습 결과는 별도 후보 가중치로 저장되며 현재 탐지 모델을 자동 교체하지 않습니다.")
     st.metric("서로 다른 검수 사진", f"{summary['unique_images']} / {MIN_UNIQUE_IMAGES}")
     st.caption(f"저장된 사용자 확정 박스 · {summary['box_count']}개")
+    st.markdown("#### 사용자 소자 종류")
+    st.caption("기본 YOLO 18종은 그대로 유지합니다. 새 종류는 별도 레이블로 모으고, 진단에는 선택한 상위 종류를 사용합니다. 추가 레이블은 다음 후보 재학습 데이터에 포함됩니다.")
+    with st.form(f"cc_add_user_component_type_{project.project_id}"):
+        new_type_name = st.text_input("새 소자 종류 이름", placeholder="예: 전압 감시기")
+        new_type_parent = st.selectbox("진단에 사용할 상위 종류", COMPONENT_CLASSES)
+        new_type_description = st.text_input("구분 설명 (선택)", placeholder="외관이나 각인으로 구별하는 기준")
+        add_type = st.form_submit_button("소자 종류 추가")
+    if add_type:
+        try:
+            saved_type = save_user_component_type(display_name=new_type_name,
+                                                  parent_class=new_type_parent,
+                                                  description=new_type_description)
+            st.success(f"{saved_type['display_name']} 종류를 추가했습니다. 다음 박스 검수에서 선택할 수 있습니다.")
+        except ValueError as exc:
+            st.warning(str(exc))
+    custom_types = user_component_types()
+    if custom_types:
+        st.dataframe([{"소자 종류": row["display_name"], "진단 상위 종류": row["parent_class"],
+                        "학습 레이블": row["type_id"], "설명": row["description"]}
+                       for row in custom_types], hide_index=True, use_container_width=True)
     for error in save_errors:
         st.warning(f"백그라운드 표본 저장 실패 · {error}")
     weight_root = resolve_pcb_weights_root(APP_DIR)
@@ -216,6 +237,13 @@ def render_inspection_panel(
     compact: bool = False,
     on_focus_component: Any = None,
 ) -> None:
+    from circuitcare.vision.review_learning import user_component_types
+
+    custom_type_rows = user_component_types()
+    custom_types = {str(row["type_id"]): row for row in custom_type_rows}
+    type_options = [*CLASS_OPTIONS, *custom_types]
+    type_labels = {type_id: row["display_name"] for type_id, row in custom_types.items()}
+    type_format = lambda value: type_labels.get(value, "종류 미확정" if value == "unknown" else value)
     owner = f"{project.project_id}|{project.board_id or ''}|{inventory_scope or component_map_version or ''}"
     suspect_owner = f"{project.project_id}|{project.board_id or ''}"
     inventories = st.session_state.setdefault(COMPONENT_INVENTORY_KEY, {})
@@ -347,7 +375,8 @@ def render_inspection_panel(
                 bulk_type_key = f"cc_bulk_review_type_{active_scope}"
                 bulk_status_key = f"cc_bulk_review_status_{active_scope}"
                 bulk_type = st.selectbox("선택 박스 종류 일괄 변경",
-                                         ["변경 안 함", *CLASS_OPTIONS], key=bulk_type_key)
+                                         ["변경 안 함", *type_options], key=bulk_type_key,
+                                         format_func=lambda value: "변경 안 함" if value == "변경 안 함" else type_format(value))
                 bulk_status = st.selectbox("선택 박스 상태 일괄 변경",
                                            ["변경 안 함", "검수 필요", "확인"], key=bulk_status_key)
                 apply_col, exclude_col, clear_col = st.columns(3)
@@ -363,11 +392,12 @@ def render_inspection_panel(
                                 row = ensure_review_row_for_component(active_rows, model)
                             update_review_row(
                                 row,
-                                component_type=(row.get("소자 종류", "unknown")
+                                component_type=(row.get("user_component_type_id") or row.get("소자 종류", "unknown")
                                                 if bulk_type == "변경 안 함" else bulk_type),
                                 status=(row.get("상태", "검수 필요")
                                         if bulk_status == "변경 안 함" else bulk_status),
                                 bbox_xyxy=[row[key] for key in ("x1", "y1", "x2", "y2")],
+                                custom_types=custom_types,
                             )
                             if bulk_type != "변경 안 함" or bulk_status == "확인":
                                 row["training_label_user_confirmed"] = True
@@ -410,7 +440,11 @@ def render_inspection_panel(
             else:
                 component_id = selected_component.component_id
                 board_component_id = str(selected_component.board_component_id or component_id)
-                st.markdown(f"**{selected_component.reference_designators[0] if selected_component.reference_designators else component_id}** · {selected_component.component_type}")
+                compact_rows_key = review_keys(review_scope)[1] if review_scope else None
+                compact_review_row = next((row for row in st.session_state.get(compact_rows_key, [])
+                                           if row.get("component_id") == component_id), {}) if compact_rows_key else {}
+                shown_type = compact_review_row.get("user_component_type_name") or selected_component.component_type
+                st.markdown(f"**{selected_component.reference_designators[0] if selected_component.reference_designators else component_id}** · {shown_type}")
                 if selected_component.ocr_marking:
                     st.caption(f"각인 후보 · {selected_component.ocr_marking}")
                 if review_scope and review_image_bytes is not None:
@@ -531,18 +565,21 @@ def render_inspection_panel(
                 current_type = str(edits.get(component_id, {}).get("component_type") or selected_component.component_type)
                 if review_scope and review_image_bytes is not None:
                     edit_key = f"cc_compact_type_{review_scope}_{component_id}"
-                    if st.session_state.get(edit_key) not in CLASS_OPTIONS:
-                        st.session_state[edit_key] = current_type if current_type in CLASS_OPTIONS else "unknown"
-                    new_type = st.selectbox("소자 종류", CLASS_OPTIONS, key=edit_key,
-                                            format_func=lambda value: "종류 미확정" if value == "unknown" else value)
+                    current_review = next((row for row in st.session_state.get(records_key, [])
+                                           if row.get("component_id") == component_id), {})
+                    current_editor_type = str(current_review.get("user_component_type_id") or current_type)
+                    if st.session_state.get(edit_key) not in type_options:
+                        st.session_state[edit_key] = current_editor_type if current_editor_type in type_options else "unknown"
+                    new_type = st.selectbox("소자 종류", type_options, key=edit_key, format_func=type_format)
                     if new_type == "unknown":
                         st.warning("종류를 지정하지 않고 검수 저장하면 이 박스는 제외됩니다. 제외 메뉴에서 복원할 수 있습니다.")
-                    if new_type != current_type and st.button("종류 변경 저장", key=f"cc_compact_type_save_{review_scope}_{component_id}"):
+                    if new_type != current_editor_type and st.button("종류 변경 저장", key=f"cc_compact_type_save_{review_scope}_{component_id}"):
                         rows = list(st.session_state.get(records_key, []))
                         row = ensure_review_row_for_component(rows, selected_component)
                         update_review_row(row, component_type=new_type, status=row.get("상태", "검수 필요"),
-                                          bbox_xyxy=[row[key] for key in ("x1", "y1", "x2", "y2")])
-                        if new_type in COMPONENT_CLASSES:
+                                          bbox_xyxy=[row[key] for key in ("x1", "y1", "x2", "y2")],
+                                          custom_types=custom_types)
+                        if new_type in COMPONENT_CLASSES or new_type in custom_types:
                             row["training_label_user_confirmed"] = True
                         if new_type == "unknown":
                             record_box_exclusion(st.session_state, scope=review_scope, row=row,
@@ -654,14 +691,16 @@ def render_inspection_panel(
                     st.warning("종류가 미확정입니다. 변경 적용 시 종류를 지정하지 않으면 이 박스는 제외되며, 복원 메뉴에서 되돌릴 수 있습니다.")
                 box = review_row or {"x1": selected_component.bbox_xyxy[0], "y1": selected_component.bbox_xyxy[1],
                                      "x2": selected_component.bbox_xyxy[2], "y2": selected_component.bbox_xyxy[3]}
-                row_signature = (current_type, current_status,
+                current_editor_type = str((review_row or {}).get("user_component_type_id") or current_type)
+                row_signature = (current_editor_type, current_status,
                                  int(box["x1"]), int(box["y1"]), int(box["x2"]), int(box["y2"]))
                 form_version = hashlib.sha1(repr(row_signature).encode()).hexdigest()[:8]
                 form_key = f"cc_review_box_editor_{review_scope}_{selected_component.component_id}_{form_version}"
                 with st.form(form_key):
-                    st.selectbox("소자 종류", CLASS_OPTIONS,
-                                 index=CLASS_OPTIONS.index(current_type if current_type in CLASS_OPTIONS else "unknown"),
+                    st.selectbox("소자 종류", type_options,
+                                 index=type_options.index(current_editor_type if current_editor_type in type_options else "unknown"),
                                  key=f"{form_key}_class",
+                                 format_func=type_format,
                                  help="검수 결과의 소자 종류를 바꾸면 Viewer와 진단 소자 목록에도 반영됩니다.")
                     editable_statuses = [value for value in STATUS_OPTIONS if value != "제외"]
                     status_value = current_status if current_status in editable_statuses else "검수 필요"
@@ -693,7 +732,7 @@ def render_inspection_panel(
                         next_type = st.session_state[f"{form_key}_class"]
                         update_review_row(review_row,
                             component_type=next_type,
-                            status=next_status, bbox_xyxy=coords)
+                            status=next_status, bbox_xyxy=coords, custom_types=custom_types)
                         if next_type != current_type or next_status == "확인":
                             review_row["training_label_user_confirmed"] = True
                         if next_type == "unknown":

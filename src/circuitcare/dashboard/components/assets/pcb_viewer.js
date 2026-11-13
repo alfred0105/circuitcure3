@@ -226,7 +226,7 @@ export default function(component) {
       const id = item.component_id;
       const [x1,y1,x2,y2] = item.bbox_xyxy;
       const visualKey = JSON.stringify([item.bbox_xyxy, item.display_label, item.component_type,
-        item.overlay_status, item.overlay_source, item.fault_candidate_status]);
+        item.overlay_status, item.overlay_source, item.fault_candidate_status, item.functional_block_roles]);
       let entry = state.regionNodes.get(id);
       if (!entry) {
         const shape = svgElement("rect", { "data-component-id":id, tabindex:"0", role:"button" });
@@ -246,6 +246,13 @@ export default function(component) {
         if (item.overlay_source === "qwen_suggestion") classes.push("cc-ai-suggested");
         if (item.overlay_source === "yolo_second_pass") classes.push("cc-second-pass");
         if (item.overlay_source === "manual") classes.push("cc-manual-box");
+        const blockRoleClasses = { power:"cc-block-power", control:"cc-block-control",
+          control_timing:"cc-block-control", control_input:"cc-block-input", input:"cc-block-input",
+          output:"cc-block-output", driver:"cc-block-driver", protection:"cc-block-protection",
+          thermal:"cc-block-protection", buzzer:"cc-block-output", relay:"cc-block-output" };
+        for (const role of (item.functional_block_roles || [])) {
+          if (blockRoleClasses[role]) classes.push(blockRoleClasses[role]);
+        }
         const faultClass = { SUSPECTED_FAULT:"cc-fault-suspected", RELATED_COMPONENT:"cc-fault-related",
           CONFIRMED_FAULT:"cc-fault-confirmed", FAULT_SUPPORTED:"cc-fault-supported",
           FAULT_REFUTED:"cc-fault-refuted", INCONCLUSIVE:"cc-fault-inconclusive" }[item.fault_candidate_status];

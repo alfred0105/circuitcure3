@@ -9,7 +9,7 @@ from circuitcare.dashboard.views import inspection_panel as inspection
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.frontend.workbench_state import (
-    SELECTION_KEY, WORKFLOW_REVIEW, WORKFLOW_QUESTIONS, WORKFLOW_INSPECTION, WORKFLOW_COMPLETE,
+    ACTIVE_PHOTO_KEY, SELECTION_KEY, WORKFLOW_REVIEW, WORKFLOW_QUESTIONS, WORKFLOW_INSPECTION, WORKFLOW_COMPLETE,
     get_workflow_state, transition_workflow, enter_workbench,
 )
 from circuitcare.dashboard.views.symptom_diagnosis_panel import candidate_focus_widget_key
@@ -365,12 +365,13 @@ def test_board_candidate_focus_changes_to_its_source_photo_and_photo_local_box()
     enter_workbench(state, project)
     registry = {"components": [{
         "board_component_id": "bc-1",
-        "source_components": [{"photo_id": "close-2", "component_id": "det-17"}],
-    }]}
+        "source_components": [{"photo_id": "close-2", "component_id": "det-17",
+                               "coordinate_frame": "SOURCE_PHOTO_PIXEL", "bbox_xyxy": [1, 2, 8, 9]}],
+    }], "photos": [{"photo_id": "close-2", "image_size_px": [20, 20]}]}
     st = _StreamlitStub(state=state)
 
     assert workspace._focus_board_registry_component(st, project, registry, "bc-1")
-    assert state["circuitcare_v2_photo_choice"] == "close-2"
+    assert state[ACTIVE_PHOTO_KEY] == "close-2"
     assert state[SELECTION_KEY].active_photo_id == "close-2"
     assert state[SELECTION_KEY].selected_component == "det-17"
 
@@ -1051,7 +1052,9 @@ def test_apptest_questions_next_uses_current_result_and_real_registry_targets(mo
                  if row.get("presence_status") != "EXCLUDED"}
     assert workflow_state["inspection_targets"]
     assert {row["board_component_id"] for row in workflow_state["inspection_targets"]} <= valid_ids
-    assert any(item.label == "검사할 소자" for item in app.selectbox)
+    assert any(button.label == "이 소자 측정" for button in app.button)
+    next(button for button in app.button if button.label == "이 소자 측정").click().run()
+    assert not app.exception
     analysis_button = next(button for button in app.button if button.label == "측정 결과 분석")
     assert analysis_button.disabled  # a previous-cycle measurement cannot trigger reassessment
     next(button for button in app.button if button.label == "Mock: 새로운 측정 저장").click().run()

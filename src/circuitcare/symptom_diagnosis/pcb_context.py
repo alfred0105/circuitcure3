@@ -286,6 +286,7 @@ def build_pcb_context(
         "functional_role_hints": [{"component_id": row["component_id"], "roles": row["functional_roles"],
                                     "status": row["functional_role_status"]} for row in details
                                    if row["functional_roles"]][:12],
+        "functional_block_group_count": len(diagnosis.get("functional_block_groups", [])),
     }
     focus_ids: list[str] = []
     for row in suspects:
@@ -324,6 +325,9 @@ def build_pcb_context(
                        for row in diagnosis.get("hypotheses", [])[:8]],
         "measurement_evidence": [row for row in diagnosis.get("measurement_evidence", [])
                                   if isinstance(row, dict) and row.get("assessment") in {"TEST_NORMAL", "TEST_ABNORMAL"}][:24],
+        "functional_block_groups": [],
+        "evidence_gaps": diagnosis.get("evidence_gaps", [])[:12],
+        "evidence_ledger": diagnosis.get("evidence_ledger", [])[:40],
         "summary": summaries,
         "focus_components": [],
     }
@@ -336,6 +340,13 @@ def build_pcb_context(
             base["focus_components"].pop()
             break
     included = {row["component_id"] for row in base["focus_components"]}
+    for block in diagnosis.get("functional_block_groups", [])[:12]:
+        member_ids = [str(value) for value in block.get("component_ids", []) if str(value) in included]
+        if member_ids:
+            base["functional_block_groups"].append({"block_id": block.get("block_id"),
+                "role": block.get("role"), "component_ids": member_ids[:16],
+                "verification_status": "INFERRED", "connectivity_status": "NOT_INFERRED",
+                "evidence": block.get("supporting_evidence", [])[:4]})
     omitted = [row["component_id"] for row in details if row["component_id"] not in included]
     base["omitted_component_ids"] = omitted[:80]
     base["omitted_component_count"] = len(omitted)
@@ -353,6 +364,12 @@ def build_pcb_context(
             base["summary"]["ocr_hints"].pop()
         elif base["summary"]["functional_role_hints"]:
             base["summary"]["functional_role_hints"].pop()
+        elif base["functional_block_groups"]:
+            base["functional_block_groups"].pop()
+        elif base["evidence_gaps"]:
+            base["evidence_gaps"].pop()
+        elif base["evidence_ledger"]:
+            base["evidence_ledger"].pop()
         elif base["symptom_text"]:
             base["symptom_text"] = base["symptom_text"][:len(base["symptom_text"]) // 2]
         elif isinstance(base.get("observations"), dict) and base["observations"]:

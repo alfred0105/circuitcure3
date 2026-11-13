@@ -52,6 +52,11 @@ def _db() -> sqlite3.Connection:
             functional_role TEXT NOT NULL, notes TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(component_type, marking_key, part_number)
         );
+        CREATE TABLE IF NOT EXISTS user_component_types (
+            type_id TEXT PRIMARY KEY, display_name TEXT NOT NULL UNIQUE,
+            parent_class TEXT NOT NULL, description TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS training_jobs (
             job_id TEXT PRIMARY KEY, dataset_sha256 TEXT NOT NULL, status TEXT NOT NULL,
             pid INTEGER, output_dir TEXT NOT NULL, log_path TEXT NOT NULL,
@@ -93,11 +98,17 @@ def save_reviewed_boxes(image_bytes: bytes, *, project_id: str, photo_id: str,
             source.convert("RGB").save(image_path, format="PNG", optimize=True)
     now = datetime.now(timezone.utc).isoformat()
     annotations = []
+    with _db() as db:
+        custom_types = {row["type_id"] for row in db.execute(
+            "SELECT type_id FROM user_component_types").fetchall()}
     for row in rows:
-        kind = normalize_component_class(row.get("confirmed_base_class") or row.get("effective_class")
-                                         or row.get("소자 종류") or "unknown", allow_not_component=False)
+        custom_type_id = str(row.get("user_component_type_id") or "")
+        kind = (custom_type_id if custom_type_id in custom_types else
+                normalize_component_class(row.get("confirmed_base_class") or row.get("effective_class")
+                                          or row.get("소자 종류") or "unknown", allow_not_component=False))
         explicitly_labeled = row.get("training_label_user_confirmed") is True
-        if (row.get("상태") == "제외" or kind not in COMPONENT_CLASSES or not explicitly_labeled):
+        if (row.get("상태") == "제외" or (kind not in COMPONENT_CLASSES and kind not in custom_types)
+                or not explicitly_labeled):
             continue
         try:
             x1, y1, x2, y2 = (float(row[key]) for key in ("x1", "y1", "x2", "y2"))
@@ -123,6 +134,34 @@ def save_reviewed_boxes(image_bytes: bytes, *, project_id: str, photo_id: str,
         box_count = int(db.execute("SELECT COUNT(*) FROM reviewed_boxes").fetchone()[0])
     return {"image_sha256": fingerprint, "unique_images": unique_images,
             "box_count": box_count, "added_boxes": len(annotations)}
+
+
+def user_component_types() -> list[dict[str, str]]:
+    with _db() as db:
+        return [dict(row) for row in db.execute(
+            "SELECT type_id,display_name,parent_class,description FROM user_component_types "
+            "ORDER BY display_name COLLATE NOCASE").fetchall()]
+
+
+def save_user_component_type(*, display_name: str, parent_class: str, description: str = "") -> dict[str, str]:
+    name = " ".join(str(display_name or "").split())[:80]
+    parent = normalize_component_class(parent_class, allow_not_component=False)
+    if not name:
+        raise ValueError("추가할 소자 종류 이름을 입력해 주세요.")
+    if parent not in COMPONENT_CLASSES:
+        raise ValueError("기존 18종 중 진단에 사용할 상위 종류를 선택해 주세요.")
+    if name.casefold() in set(COMPONENT_CLASSES) | {"unknown", "not_component"}:
+        raise ValueError("기존 분류와 겹치는 이름은 추가할 수 없습니다.")
+    type_id = "user_" + hashlib.sha256(name.casefold().encode("utf-8")).hexdigest()[:12]
+    item = {"type_id": type_id, "display_name": name, "parent_class": parent,
+            "description": " ".join(str(description or "").split())[:300]}
+    try:
+        with _db() as db:
+            db.execute("INSERT INTO user_component_types(type_id,display_name,parent_class,description,created_at) "
+                       "VALUES(?,?,?,?,?)", (*item.values(), datetime.now(timezone.utc).isoformat()))
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("이미 등록된 소자 종류입니다.") from exc
+    return item
 
 
 def queue_reviewed_boxes(image_bytes: bytes, *, project_id: str, photo_id: str,
@@ -239,6 +278,10 @@ def _export_yolo_dataset(images: list[sqlite3.Row], boxes: list[sqlite3.Row], da
     box_by_image: dict[str, list[sqlite3.Row]] = {}
     for box in boxes:
         box_by_image.setdefault(box["image_sha256"], []).append(box)
+    custom_ids = sorted({str(box["class_name"]) for box in boxes
+                         if str(box["class_name"]) not in COMPONENT_CLASSES})
+    class_names = [*COMPONENT_CLASSES, *custom_ids]
+    class_to_id = {name: index for index, name in enumerate(class_names)}
     image_hashes = [row["image_sha256"] for row in images]
     random.Random(21).shuffle(image_hashes)
     val_count = max(1, round(len(image_hashes) * 0.2))
@@ -252,14 +295,16 @@ def _export_yolo_dataset(images: list[sqlite3.Row], boxes: list[sqlite3.Row], da
         width, height = int(row["width"]), int(row["height"])
         label_lines = []
         for box in box_by_image.get(image_hash, []):
-            class_id = COMPONENT_CLASSES.index(box["class_name"])
+            class_id = class_to_id.get(str(box["class_name"]))
+            if class_id is None:
+                raise ValueError(f"학습 표본에 등록되지 않은 소자 종류가 있습니다: {box['class_name']}")
             center_x = (box["x1"] + box["x2"]) / (2 * width)
             center_y = (box["y1"] + box["y2"]) / (2 * height)
             box_width, box_height = (box["x2"] - box["x1"]) / width, (box["y2"] - box["y1"]) / height
             label_lines.append(f"{class_id} {center_x:.8f} {center_y:.8f} {box_width:.8f} {box_height:.8f}")
         (output / "labels" / split / f"{image_hash}.txt").write_text("\n".join(label_lines) + "\n")
     yaml_text = f"path: {output.resolve()}\ntrain: images/train\nval: images/val\nnames:\n"
-    yaml_text += "".join(f"  {index}: {name}\n" for index, name in enumerate(COMPONENT_CLASSES))
+    yaml_text += "".join(f"  {index}: {name}\n" for index, name in enumerate(class_names))
     (output / "data.yaml").write_text(yaml_text)
     return output / "data.yaml"
 
@@ -347,17 +392,23 @@ def _run_training_worker(job_id: str, command: list[str]) -> int:
     output_dir, log_path = Path(job["output_dir"]), Path(job["log_path"])
     try:
         from ultralytics import YOLO
+        import yaml
+
         model = YOLO(command[command.index("--init-weights") + 1])
         names = model.names
         ordered_names = [names[index] for index in sorted(names)] if isinstance(names, dict) else list(names)
         normalized_names = [normalize_component_class(name, allow_not_component=False) for name in ordered_names]
-        missing_classes = set(COMPONENT_CLASSES) - set(normalized_names)
-        if missing_classes:
-            raise ValueError("초기 가중치에 기존 YOLO 분류 체계와 공통인 클래스가 부족합니다: "
-                             + ", ".join(sorted(missing_classes)))
-        if len(normalized_names) == len(COMPONENT_CLASSES) and tuple(normalized_names) != COMPONENT_CLASSES:
+        if len(normalized_names) != len(COMPONENT_CLASSES) or tuple(normalized_names) != COMPONENT_CLASSES:
             raise ValueError("초기 가중치와 현재 18종 분류의 클래스 순서가 다릅니다. "
                              "같은 크기의 출력층을 다른 클래스 의미로 재사용하지 않도록 학습을 중단했습니다.")
+        dataset_config = yaml.safe_load(Path(command[command.index("--data") + 1]).read_text()) or {}
+        dataset_names = dataset_config.get("names", {})
+        class_names = ([dataset_names[index] for index in sorted(dataset_names)]
+                       if isinstance(dataset_names, dict) else list(dataset_names))
+        if class_names[:len(COMPONENT_CLASSES)] != list(COMPONENT_CLASSES):
+            raise ValueError("학습 데이터셋의 기본 18종 클래스 순서가 YOLO 원본과 일치하지 않습니다.")
+        if len(class_names) != len(set(class_names)):
+            raise ValueError("학습 클래스 이름이 중복되어 있습니다.")
         with log_path.open("wb") as log:
             result = subprocess.run([sys.executable, *command], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                                     env=os.environ.copy(), check=False)
@@ -374,8 +425,8 @@ def _run_training_worker(job_id: str, command: list[str]) -> int:
         metadata = {"job_id": job_id, "dataset_sha256": job["dataset_sha256"],
                     "source_checkpoint": command[command.index("--init-weights") + 1],
                     "source_experiment": str(experiment), "candidate_weights": str(candidate),
-                    "class_names": list(COMPONENT_CLASSES), "source_class_names": ordered_names,
-                    "class_head_reinitialized": len(normalized_names) != len(COMPONENT_CLASSES),
+                    "class_names": class_names, "source_class_names": ordered_names,
+                    "class_head_reinitialized": len(class_names) != len(normalized_names),
                     "created_at": datetime.now(timezone.utc).isoformat()}
         (output_dir / "candidate.json").write_text(json.dumps(metadata, indent=2))
         with _db() as db:

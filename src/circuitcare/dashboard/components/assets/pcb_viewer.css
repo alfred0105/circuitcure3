@@ -21,6 +21,12 @@
 .cc-pcb-component.cc-ai-suggested { fill:#ff9d2e1c; stroke:#ff9d2e; stroke-dasharray:3 3; stroke-width:2.2; }
 .cc-pcb-component.cc-second-pass { fill:#55bbdf14; stroke:#75d9ff; stroke-dasharray:6 3; stroke-width:2; }
 .cc-pcb-component.cc-manual-box { fill:#60dfa022; stroke:#60dfa0; stroke-dasharray:6 3; stroke-width:2; }
+.cc-pcb-component.cc-block-power { fill:#f4b94220; stroke:#f4b942; }
+.cc-pcb-component.cc-block-control { fill:#9b8cff20; stroke:#a997ff; }
+.cc-pcb-component.cc-block-input { fill:#4db6ac20; stroke:#4db6ac; }
+.cc-pcb-component.cc-block-output { fill:#f078a020; stroke:#f078a0; }
+.cc-pcb-component.cc-block-driver { fill:#60a5fa20; stroke:#60a5fa; }
+.cc-pcb-component.cc-block-protection { fill:#fb923c20; stroke:#fb923c; }
 .cc-pcb-component.cc-draw-preview { fill:#60dfa033; stroke:#60dfa0; stroke-width:2; stroke-dasharray:6 4; pointer-events:none; }
 .cc-pcb-component.cc-bulk-selected { fill:#b68cff48; stroke:#c8a9ff; stroke-width:3; }
 .cc-pcb-component.cc-fault-suspected { fill:#ffbd5530; stroke:#ffbd55; stroke-width:3; }
