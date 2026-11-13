@@ -8,15 +8,18 @@ import json
 import logging
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel, display_identity_status
 from circuitcare.frontend.models import ProjectContext
 from circuitcare.vision.component_recognition_panel import (
-    CLASS_OPTIONS, LAST_EXCLUDED_KEY, STATUS_OPTIONS, ensure_review_row_for_component,
+    APP_DIR, CLASS_OPTIONS, LAST_EXCLUDED_KEY, STATUS_OPTIONS, ensure_review_row_for_component,
     invalidate_component_review_state, record_box_exclusion, restore_review_row,
     review_keys, undo_last_box_exclusion, update_review_row,
 )
+from circuitcare.vision.weight_paths import resolve_pcb_weights_root
+from circuitcare.component_taxonomy import COMPONENT_CLASSES
 from circuitcare.frontend.workbench_state import (
     ACTIVE_PHOTO_KEY, SELECTION_KEY, update_component_selection, update_selection,
 )
@@ -38,6 +41,95 @@ COMPONENT_LABELS = {
     "relay": "릴레이", "fuse": "퓨즈", "battery": "배터리", "buzzer": "부저",
     "led": "LED", "unknown": "미확정",
 }
+
+
+def _persist_review_learning(st: Any, project: ProjectContext, image_bytes: bytes | None,
+                             rows: list[dict[str, Any]]) -> None:
+    if not image_bytes:
+        return
+    from circuitcare.vision.review_learning import queue_reviewed_boxes
+
+    queue_reviewed_boxes(image_bytes, project_id=project.project_id,
+                         photo_id=str(st.session_state.get(ACTIVE_PHOTO_KEY) or "unknown"), rows=rows)
+
+
+def _render_component_knowledge_form(st: Any, component: ComponentOverlayViewModel,
+                                     component_type: str, *, key: str) -> None:
+    with st.expander("다음 분류를 위한 소자 정보 추가", expanded=False):
+        st.caption("사용자가 확인한 각인·부품번호 정보를 로컬에 저장해, 다음에 같은 표시가 읽히면 Qwen 분류 참고자료로 제공합니다.")
+        options = [value for value in CLASS_OPTIONS if value in COMPONENT_CLASSES]
+        default_type = component_type if component_type in options else options[0]
+        kind = st.selectbox("확인한 소자 종류", options, index=options.index(default_type), key=f"{key}_type")
+        marking = st.text_input("소자 각인", value=str(component.ocr_marking or ""), key=f"{key}_marking")
+        part_number = st.text_input("부품번호", value=str(component.component_info or ""), key=f"{key}_part")
+        subtype = st.text_input("세부 종류 (선택)", key=f"{key}_subtype")
+        role = st.text_input("기능 역할 (선택)", key=f"{key}_role")
+        notes = st.text_input("추가 정보 (선택)", key=f"{key}_notes")
+        if st.button("확인한 정보를 다음 분류에 저장", key=f"{key}_save", use_container_width=True):
+            try:
+                from circuitcare.vision.review_learning import save_component_knowledge
+
+                save_component_knowledge(component_type=kind, marking=marking, part_number=part_number,
+                                         subtype=subtype, functional_role=role, notes=notes)
+                st.success("사용자 확인 정보가 로컬에 저장됐습니다. 동일 각인이 보이면 이후 Qwen 검수에 참고로 전달됩니다.")
+            except ValueError as exc:
+                st.warning(str(exc))
+
+
+def render_retraining_workspace(st: Any, project: ProjectContext) -> None:
+    """Separate, opt-in workspace; reviewed samples are collected silently in the review flow."""
+    from circuitcare.vision.review_learning import (
+        MIN_UNIQUE_IMAGES, flush_review_samples, refresh_training_jobs, start_retraining, training_summary,
+    )
+
+    save_errors = flush_review_samples()
+    refresh_training_jobs()
+    summary = training_summary()
+    st.markdown("### 검수 데이터로 별도 재학습")
+    st.caption("사용자가 확정한 박스만 로컬에 자동 축적됩니다. 동일한 픽셀 이미지의 재업로드는 표본 수를 늘리지 않습니다."
+               " 재학습 결과는 별도 후보 가중치로 저장되며 현재 탐지 모델을 자동 교체하지 않습니다.")
+    st.metric("서로 다른 검수 사진", f"{summary['unique_images']} / {MIN_UNIQUE_IMAGES}")
+    st.caption(f"저장된 사용자 확정 박스 · {summary['box_count']}개")
+    for error in save_errors:
+        st.warning(f"백그라운드 표본 저장 실패 · {error}")
+    weight_root = resolve_pcb_weights_root(APP_DIR)
+    checkpoint = weight_root / "external" / "pcb-yolov8s-detection" / "best.pt"
+    same_training = summary.get("already_trained")
+    active_training = summary.get("active_job")
+    if not checkpoint.is_file():
+        st.warning(f"재학습용 초기 가중치가 로컬에 없습니다 · {checkpoint}")
+    can_start = (summary["unique_images"] >= MIN_UNIQUE_IMAGES and checkpoint.is_file()
+                 and same_training is None and active_training is None)
+    if st.button("별도 재학습 시작", key=f"cc_review_retraining_start_{project.project_id}",
+                 type="primary", disabled=not can_start):
+        try:
+            result = start_retraining(checkpoint=checkpoint, epochs=50)
+            if result.get("status") == "RUNNING":
+                st.success(f"재학습을 별도 작업으로 시작했습니다 · 작업 {result['job_id']}")
+            elif result.get("status") == "ALREADY_TRAINED":
+                st.info("현재와 같은 검수 표본 묶음으로 이미 학습했습니다. 새 고유 이미지나 수정된 검수 박스가 모인 뒤 다시 시작하세요.")
+        except (OSError, ValueError, RuntimeError) as exc:
+            st.error(f"재학습을 시작하지 못했습니다 · {exc}")
+    if same_training:
+        st.info("현재 표본 묶음은 이미 학습했습니다. 같은 사진을 다시 저장해도 재학습하지 않습니다.")
+    if active_training:
+        st.info(f"재학습 진행 중 · 작업 {active_training['job_id']}")
+        if st.button("재학습 상태 새로고침", key=f"cc_review_retraining_refresh_{project.project_id}"):
+            st.rerun()
+    last_job = summary.get("last_job")
+    if last_job:
+        st.caption(f"최근 작업 · {last_job['status']} · {last_job['job_id']}")
+        if last_job.get("status") == "SUCCEEDED":
+            metadata = Path(last_job["output_dir"]) / "candidate.json"
+            if metadata.is_file():
+                candidate = json.loads(metadata.read_text()).get("candidate_weights")
+                st.code(str(candidate), language=None)
+        elif last_job.get("status") == "FAILED":
+            st.error(f"학습 실패 · {last_job.get('error') or '로그 확인 필요'}")
+            log_path = Path(last_job["log_path"])
+            if log_path.is_file():
+                with st.expander("학습 오류 자세히 보기"):
+                    st.code(log_path.read_text(errors="replace")[-6000:], language=None)
 
 
 def board_suspects(state: Any, project: ProjectContext) -> list[dict[str, Any]]:
@@ -277,7 +369,13 @@ def render_inspection_panel(
                                         if bulk_status == "변경 안 함" else bulk_status),
                                 bbox_xyxy=[row[key] for key in ("x1", "y1", "x2", "y2")],
                             )
+                            if bulk_type != "변경 안 함" or bulk_status == "확인":
+                                row["training_label_user_confirmed"] = True
+                            if row.get("소자 종류") == "unknown":
+                                record_box_exclusion(st.session_state, scope=active_scope, row=row,
+                                                     reason="unconfirmed_component_not_assigned")
                         st.session_state[active_records_key] = active_rows
+                        _persist_review_learning(st, project, review_image_bytes, active_rows)
                         invalidate_component_review_state(
                             st.session_state, scope=active_scope,
                             project_id=project.project_id, board_id=project.board_id,
@@ -392,7 +490,10 @@ def render_inspection_panel(
                                     if target is not None:
                                         confirm_qwen_component_type(target, base_class=candidate_type,
                                             subtype=selected_source.get("qwen_component_subtype_candidate"))
+                                        if candidate_type in COMPONENT_CLASSES:
+                                            target["training_label_user_confirmed"] = True
                                         st.session_state[records_key] = rows
+                                        _persist_review_learning(st, project, review_image_bytes, rows)
                                         invalidate_component_review_state(st.session_state, scope=review_scope,
                                             project_id=project.project_id, board_id=project.board_id)
                                         st.rerun()
@@ -404,6 +505,7 @@ def render_inspection_panel(
                                         confirm_qwen_component_type(target, base_class=candidate_type,
                                             subtype=selected_source.get("qwen_component_subtype_candidate"))
                                         st.session_state[records_key] = rows
+                                        _persist_review_learning(st, project, review_image_bytes, rows)
                                         invalidate_component_review_state(st.session_state, scope=review_scope,
                                             project_id=project.project_id, board_id=project.board_id)
                                         st.rerun()
@@ -433,12 +535,20 @@ def render_inspection_panel(
                         st.session_state[edit_key] = current_type if current_type in CLASS_OPTIONS else "unknown"
                     new_type = st.selectbox("소자 종류", CLASS_OPTIONS, key=edit_key,
                                             format_func=lambda value: "종류 미확정" if value == "unknown" else value)
+                    if new_type == "unknown":
+                        st.warning("종류를 지정하지 않고 검수 저장하면 이 박스는 제외됩니다. 제외 메뉴에서 복원할 수 있습니다.")
                     if new_type != current_type and st.button("종류 변경 저장", key=f"cc_compact_type_save_{review_scope}_{component_id}"):
                         rows = list(st.session_state.get(records_key, []))
                         row = ensure_review_row_for_component(rows, selected_component)
-                        row["소자 종류"] = new_type
-                        row["user_edited"] = True
+                        update_review_row(row, component_type=new_type, status=row.get("상태", "검수 필요"),
+                                          bbox_xyxy=[row[key] for key in ("x1", "y1", "x2", "y2")])
+                        if new_type in COMPONENT_CLASSES:
+                            row["training_label_user_confirmed"] = True
+                        if new_type == "unknown":
+                            record_box_exclusion(st.session_state, scope=review_scope, row=row,
+                                                 reason="unconfirmed_component_not_assigned")
                         st.session_state[records_key] = rows
+                        _persist_review_learning(st, project, review_image_bytes, rows)
                         invalidate_component_review_state(st.session_state, scope=review_scope,
                             project_id=project.project_id, board_id=project.board_id)
                         st.rerun()
@@ -495,6 +605,10 @@ def render_inspection_panel(
                             project_id=project.project_id, board_id=project.board_id)
                         update_component_selection(st.session_state, project=project, selected_component=None)
                         st.rerun()
+                _render_component_knowledge_form(
+                    st, selected_component, current_type,
+                    key=f"cc_compact_knowledge_{review_scope}_{component_id}",
+                )
             return
         if selected_component is None:
             st.caption("PCB에서 박스를 누르면 이곳에 인식 정보가 표시됩니다.")
@@ -536,6 +650,8 @@ def render_inspection_panel(
                                                selected_component=None)
                     st.rerun()
             if review_scope and records_key and review_image_bytes is not None:
+                if current_type == "unknown":
+                    st.warning("종류가 미확정입니다. 변경 적용 시 종류를 지정하지 않으면 이 박스는 제외되며, 복원 메뉴에서 되돌릴 수 있습니다.")
                 box = review_row or {"x1": selected_component.bbox_xyxy[0], "y1": selected_component.bbox_xyxy[1],
                                      "x2": selected_component.bbox_xyxy[2], "y2": selected_component.bbox_xyxy[3]}
                 row_signature = (current_type, current_status,
@@ -574,12 +690,23 @@ def render_inspection_panel(
                         rows = list(st.session_state.get(records_key, []))
                         review_row = ensure_review_row_for_component(rows, selected_component)
                         next_status = st.session_state[f"{form_key}_status"]
+                        next_type = st.session_state[f"{form_key}_class"]
                         update_review_row(review_row,
-                            component_type=st.session_state[f"{form_key}_class"],
+                            component_type=next_type,
                             status=next_status, bbox_xyxy=coords)
+                        if next_type != current_type or next_status == "확인":
+                            review_row["training_label_user_confirmed"] = True
+                        if next_type == "unknown":
+                            st.warning("미확정 소자는 검수 저장 후 제외됩니다. 상단 복원 메뉴에서 되돌릴 수 있습니다.")
+                            record_box_exclusion(st.session_state, scope=review_scope, row=review_row,
+                                                 reason="unconfirmed_component_not_assigned")
                         st.session_state[records_key] = rows
-                        inventory_item["presence_status"] = "CONFIRMED" if review_row["상태"] == "확인" else "UNCONFIRMED"
-                        inventory_item["component_type_status"] = "USER_CONFIRMED" if review_row["상태"] == "확인" else "UNCONFIRMED"
+                        _persist_review_learning(st, project, review_image_bytes, rows)
+                        inventory_item["presence_status"] = (
+                            "CONFIRMED" if review_row["상태"] == "확인" else
+                            "EXCLUDED" if review_row["상태"] == "제외" else "UNCONFIRMED")
+                        inventory_item["component_type_status"] = (
+                            "USER_CONFIRMED" if review_row["상태"] == "확인" else "UNCONFIRMED")
                         st.session_state[COMPONENT_INVENTORY_KEY] = inventories
                         invalidate_component_review_state(st.session_state, scope=review_scope,
                             project_id=project.project_id, board_id=project.board_id)
@@ -771,6 +898,10 @@ def render_inspection_panel(
                 st.caption(f"자동 판독 상태 · {display_identity_status(selected_component.identification_status)}")
             if selected_component.reference_designators:
                 st.caption("주변 실크스크린 Reference 후보 · " + " · ".join(selected_component.reference_designators))
+            _render_component_knowledge_form(
+                st, selected_component, current_type,
+                key=f"cc_component_knowledge_{review_scope or owner}_{selected_component.component_id}",
+            )
             if selected_component.ocr_marking:
                 st.caption("소자 본체 각인 후보 · " + selected_component.ocr_marking)
             if selected_marking_context and selected_component.component_id.startswith("auto-"):

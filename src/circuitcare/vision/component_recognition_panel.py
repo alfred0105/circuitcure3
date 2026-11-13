@@ -714,6 +714,15 @@ def _run_selected_classification(st_api: Any, *, image_bytes: bytes, scope: str,
     if not targets:
         raise ValueError("선택한 사진에서 분류할 수 있는 활성 박스를 찾지 못했습니다.")
     detections = _selected_classification_detections(rows, selected_ids)
+    from circuitcare.vision.review_learning import matching_component_knowledge
+
+    for detection in detections:
+        markings = list(detection.get("ocr_candidates") or [])
+        markings.extend(detection.get("marking_candidates") or [])
+        markings.extend([detection.get("body_marking"), detection.get("marking_ocr"),
+                         detection.get("possible_part_number")])
+        detection["user_component_knowledge"] = matching_component_knowledge(
+            markings, str(detection.get("class_name") or ""))
     fingerprint = _selected_classification_fingerprint(image_bytes, detections, selected_ids)
     batch_cache_key = f"cc_component_qwen_batches_{scope}"
     batch_cache = st_api.session_state.setdefault(batch_cache_key, {})

@@ -597,6 +597,11 @@ def current_analysis_snapshot(
             observations["POWER_OFF_CONFIRMED"] = True
         else:
             observations.pop("POWER_OFF_CONFIRMED", None)
+    # `None` means unknown and the rule engine ignores it. Hidden simple-workflow
+    # widgets can contribute explicit None values while reassessment uses only
+    # persisted observations; normalize both paths so they share one fingerprint.
+    if isinstance(observations, dict):
+        observations = {code: value for code, value in observations.items() if value is not None}
     inventory = component_inventory or {}
     rows = _component_rows(components, inventory)
     confirmed_ids = sorted(row["component_id"] for row in rows if row.get("presence_status") == "CONFIRMED")
@@ -1017,6 +1022,7 @@ def render_symptom_diagnosis_panel(
     simple_ui: bool = False,
     workflow_stage: str | None = None,
     left_progress_slot: Any = None,
+    reassessment_run_requested: bool = False,
 ) -> None:
     """Collect symptoms, run local rules, and render candidates and safe next questions."""
     kb = load_knowledge()
@@ -1154,7 +1160,18 @@ def render_symptom_diagnosis_panel(
             st.caption("Ollama를 사용할 수 없어 규칙 기반 분석으로 실행합니다.")
     elif reassessment_view:
         observations = dict(state.get("manual_observations", {}))
-        inventory_complete = bool(state.get("inventory_complete", False))
+        inventory_complete = bool(st.session_state.get(
+            f"{key}_simple_inventory_complete", state.get("inventory_complete", False)))
+        for fact in ("POWER_SOURCE_VERIFIED", "BUZZER_VERIFIED_FAILED", "BUZZER_VERIFIED_WORKING",
+                     "BUZZER_DRIVE_ABNORMAL", "BUZZER_DRIVE_VERIFIED_NORMAL", "VISIBLE_SOLDER_DAMAGE"):
+            widget_value = st.session_state.get(f"{key}_simple_{fact}")
+            widget_value = {"예": True, "아니오": False, "모름": None}.get(widget_value, widget_value)
+            if widget_value in {True, False, None}:
+                observations[fact] = widget_value
+        if st.session_state.get(f"{key}_simple_power_off", False):
+            observations["POWER_OFF_CONFIRMED"] = True
+        else:
+            observations.pop("POWER_OFF_CONFIRMED", None)
         qwen_pcb_strategy = bool(state.get("qwen_pcb_strategy", True))
     else:
         observations = dict(state.get("manual_observations", {}))
@@ -1261,17 +1278,42 @@ def render_symptom_diagnosis_panel(
     if not reassessment_view:
         run_clicked = st.button("AI 진단 시작" if not current_result else "다시 분석",
                                 type="primary", disabled=preview, key=f"{key}_run")
-    elif current_result is None:
-        st.info("현재 증상과 측정으로 재판정 결과를 준비하고 있습니다.")
+    elif (current_result is None and central_state.get("status") in {
+            AnalysisStatus.NOT_RUN.value, AnalysisStatus.FAILED.value, AnalysisStatus.STALE.value,
+    }):
+        run_clicked = st.button("재판정 실행" if state.get("last_analysis_attempt_fingerprint")
+                                != analysis_fingerprints.final_sha256 else "재판정 다시 시도",
+                                type="primary", disabled=preview,
+                                key=f"{key}_reassessment_retry")
     run_after_measurement_change = _consume_measurement_change_rerun(state, measurement_fingerprint)
     run_after_initial_answer = bool(state.pop("run_after_initial_answer", False))
-    run_requested = bool(run_clicked or run_after_initial_answer or run_after_measurement_change)
+    # A stage transition requests one automatic run. Failures and stale commits
+    # must wait for an explicit retry click; otherwise every rerun can enqueue
+    # another diagnosis for the same input version.
+    run_after_reassessment = bool(
+        reassessment_view and reassessment_run_requested and current_result is None
+        and central_state.get("status") != AnalysisStatus.RUNNING.value and not preview
+    )
+    run_requested = bool(run_clicked or run_after_initial_answer or run_after_measurement_change
+                         or run_after_reassessment)
+    if run_requested:
+        LOGGER.info(
+            "diagnosis_run_requested project=%s stage=%s scope=%s trigger=%s symptoms=%d "
+            "symptom_text=%s current_before_run=%s model=%s",
+            project.project_id, workflow_stage or "standalone", analysis_scope.key,
+            "button" if run_clicked else "measurement_change" if run_after_measurement_change
+            else "reassessment_missing_current" if run_after_reassessment
+            else "initial_symptom_answer", len(selected_codes), bool(symptom_text.strip()),
+            bool(current_result), selected_model or "rules_only",
+        )
     if run_requested:
         if left_progress_slot is not None:
             progress_container = left_progress_slot.container()
-            analysis_progress = progress_container.status("고장 후보 분석 중", expanded=True)
+            analysis_progress = progress_container.status(
+                "측정 결과 재판정 중" if reassessment_view else "고장 후보 분석 중", expanded=True)
         else:
-            analysis_progress = st.status("고장 후보 분석 중", expanded=True)
+            analysis_progress = st.status(
+                "측정 결과 재판정 중" if reassessment_view else "고장 후보 분석 중", expanded=True)
         # The simple workflow intentionally does not start Ollama merely by
         # opening the page. Start it only after the user requests diagnosis;
         # otherwise the earlier non-starting model probe leaves Qwen disabled
@@ -1356,6 +1398,13 @@ def render_symptom_diagnosis_panel(
         # inconclusive or a model/commit fails; this is never treated as a
         # confirmed fault or a normal-board result.
         state["last_analysis_attempt_fingerprint"] = analysis_fingerprints.final_sha256
+        if simple_ui and workflow_stage == "QUESTIONS" and run_clicked:
+            # The next workbench run advances only after it sees this exact
+            # fingerprint committed as CURRENT. A stale/failed run stays here.
+            state["workflow_auto_advance"] = {
+                "scope_key": analysis_scope.key,
+                "fingerprint": analysis_fingerprints.final_sha256,
+            }
         st.session_state[key] = state
         run_id = begin_analysis(
             st.session_state, scope=analysis_scope, fingerprints=analysis_fingerprints,
@@ -1488,6 +1537,14 @@ def render_symptom_diagnosis_panel(
                                      state="error", expanded=True)
             st.warning(state["invalidated_reason"])
             return
+        LOGGER.info(
+            "diagnosis_result_committed project=%s stage=%s scope=%s run_id=%s "
+            "fingerprint=%s result_status=%s hypotheses=%d component_candidates=%d next_tests=%d",
+            project.project_id, workflow_stage or "standalone", analysis_scope.key, run_id,
+            analysis_fingerprints.final_sha256[:16], result.get("status", "UNKNOWN"),
+            len(result.get("hypotheses", [])), len(result.get("component_candidates", [])),
+            len(result.get("next_tests", [])),
+        )
         state["analysis_target_id"] = analysis_scope.target_id
         st.session_state["circuitcare_v7_analysis_target_id"] = analysis_scope.target_id
         _persist_diagnosis(project, state, result, components, combined_observations)
@@ -1513,7 +1570,8 @@ def render_symptom_diagnosis_panel(
         st.rerun()
     result = current_result
     if not result:
-        st.info("증상 입력을 마치고 **AI 진단 시작**을 누르세요.")
+        if not reassessment_view:
+            st.info("증상 입력을 마치고 **AI 진단 시작**을 누르세요.")
         return
     if simple_ui:
         _render_simple_diagnosis_result(

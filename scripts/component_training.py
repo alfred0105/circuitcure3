@@ -105,7 +105,7 @@ def _dataset_fingerprint(data_yaml: Path) -> tuple[str, list[str]]:
 def _new_experiment(data: Path, profile: str, resume: Path | None = None, epochs: int | None = None,
                    init_weights: Path | None = None, model_override: str | None = None,
                    seed: int = 21, patience: int = 20, workers: int = 0,
-                   batch_override: int | None = None):
+                   batch_override: int | None = None, output_root: Path | None = None):
     import psutil
     import torch
     from ultralytics import __version__ as ultra_version
@@ -140,7 +140,7 @@ def _new_experiment(data: Path, profile: str, resume: Path | None = None, epochs
     if psutil.virtual_memory().available < 4 * 2**30:
         raise RuntimeError("Less than 4 GiB system memory is available; close other workloads before training.")
     dataset_hash, dataset_files = _dataset_fingerprint(data)
-    project = DATA_ROOT / "runs"
+    project = (output_root or DATA_ROOT / "runs").resolve()
     if resume and not resume.is_file():
         raise FileNotFoundError(f"resume checkpoint does not exist: {resume}")
     if resume:
@@ -295,13 +295,14 @@ def main():
     p.add_argument("--patience", type=int, default=20)
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--batch", type=int, help="override initial batch size; OOM fallback is recorded")
+    p.add_argument("--output-root", type=Path, help="write isolated candidate runs under this directory")
     p = subs.add_parser("export"); p.add_argument("--weights", type=Path, required=True)
     p.add_argument("--imgsz", type=int, default=640); p.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.command == "doctor": return doctor()
     if args.command == "smoke": return smoke(args.data)
     if args.command == "train": return _new_experiment(args.data, args.profile, args.resume, args.epochs,
-        args.init_weights, args.model, args.seed, args.patience, args.workers, args.batch)
+        args.init_weights, args.model, args.seed, args.patience, args.workers, args.batch, args.output_root)
     if args.command == "export":
         from ultralytics import YOLO
         from ultralytics import __version__ as version
