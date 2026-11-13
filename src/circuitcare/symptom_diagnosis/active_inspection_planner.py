@@ -221,24 +221,43 @@ def plan_active_inspections(
                 # note or a generic power-off checkbox cannot satisfy this gate.
                 safety_blocked = False
                 missing_by_target = []
+                missing_required_conditions: set[str] = set()
+                missing_location = False
+                missing_reference = False
                 for target_id in scoped_ids:
                     target_ready = False
                     for fault_id in applies_to:
                         condition_key = f"{target_id}|{fault_id}"
                         actual = inspection_conditions.get(condition_key, {})
-                        if all(actual.get(field) == expected for field, expected in required.items()):
+                        if (all(actual.get(field) == expected for field, expected in required.items())
+                                and actual.get("measurement_location_verified") is True
+                                and actual.get("reference_source_verified") is True):
                             target_ready = True
                             break
                     if not target_ready:
                         safety_blocked = True
                         missing_by_target.append(target_id)
-                if "power_state" in required:
-                    prerequisites.append("전원 분리 상태 확인" if safety_blocked else "전원 분리 확인됨")
-                if "stored_energy_status" in required:
-                    prerequisites.append("잔류 에너지 안전 확인" if safety_blocked else "잔류 에너지 안전 확인됨")
-                if "component_isolation_status" in required:
-                    prerequisites.append("측정 대상 분리 확인" if safety_blocked else "측정 대상 분리 확인됨")
-                prerequisites.extend(["실제 측정 단자·정상 기준 출처를 기록해야 함"])
+                        target_conditions = [inspection_conditions.get(f"{target_id}|{fault_id}", {})
+                                             for fault_id in applies_to]
+                        missing_required_conditions.update(
+                            field for field, expected in required.items()
+                            if not any(row.get(field) == expected for row in target_conditions)
+                        )
+                        missing_location = missing_location or not any(
+                            row.get("measurement_location_verified") is True for row in target_conditions)
+                        missing_reference = missing_reference or not any(
+                            row.get("reference_source_verified") is True for row in target_conditions)
+                required_labels = {
+                    "power_state": "전원 분리 상태 확인",
+                    "stored_energy_status": "잔류 에너지 안전 확인",
+                    "component_isolation_status": "측정 대상 분리 확인",
+                }
+                prerequisites.extend(required_labels[field] for field in required
+                                     if field in missing_required_conditions and field in required_labels)
+                if missing_location:
+                    prerequisites.append("측정 위치·단자를 먼저 확인해야 함")
+                if missing_reference:
+                    prerequisites.append("정상 기준·출처를 먼저 확인해야 함")
                 if missing_by_target:
                     prerequisites.append("해당 소자별 안전 상태가 아직 확인되지 않음")
         else:

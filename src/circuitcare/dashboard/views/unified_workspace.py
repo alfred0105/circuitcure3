@@ -1261,7 +1261,7 @@ def _inspection_targets(
     suspected_components: list[dict[str, Any]] | None, *, knowledge: dict[str, Any] | None = None,
     inspection_history: list[dict[str, Any]] | None = None,
     measurements: list[Any] | None = None, allow_retest: bool = False,
-    symptoms: list[str] | None = None,
+    symptoms: list[str] | None = None, limit: int | None = 3,
 ) -> list[dict[str, Any]]:
     """Choose real targets, preferring compatible and not-yet-completed test profiles."""
     rows = registry.get("components", []) if isinstance(registry, dict) else []
@@ -1394,7 +1394,7 @@ def _inspection_targets(
              "completed_test_count": details.get("completed_test_count", 0),
              "presence_status": by_id[board_id].get("presence_status"),
              "source_components": list(by_id[board_id].get("source_components", []))}
-            for board_id, details, reason, _ordinal in ordered[:3]]
+            for board_id, details, reason, _ordinal in (ordered if limit is None else ordered[:max(0, limit)])]
 
 
 def _measurement_record_dict(row: Any) -> dict[str, Any]:
@@ -1677,6 +1677,7 @@ def _render_workflow_candidates(
         registry, candidates, suspects, inspection_history=workflow.get("inspection_history", []),
         measurements=all_measurements, allow_retest=allow_retest,
         symptoms=(current_result.get("symptom_codes", []) if isinstance(current_result, dict) else []),
+        limit=None,
     )
     from circuitcare.symptom_diagnosis.active_inspection_planner import plan_active_inspections
     knowledge = load_knowledge()
@@ -1701,12 +1702,15 @@ def _render_workflow_candidates(
             fault_ids = [str(details.get("fault_id") or "general")]
         for fault_id in fault_ids:
             owner = f"{project.project_id}-{project.board_id or ''}-{board_component_id}-{fault_id}"
+            selected_test_id = str(st.session_state.get(f"cc_v5_test_{owner}") or "")
+            safety_scope = f"{selected_test_id}|{registry.get('version') or ''}"
+            scope_matches = st.session_state.get(f"cc_v5_safety_scope_{owner}") == safety_scope
             inspection_conditions[f"{board_component_id}|{fault_id}"] = {
-                "power_state": st.session_state.get(f"cc_v5_power_state_{owner}", "UNKNOWN"),
-                "stored_energy_status": st.session_state.get(f"cc_v5_stored_energy_{owner}", "UNKNOWN"),
-                "component_isolation_status": st.session_state.get(f"cc_v5_isolation_{owner}", "UNKNOWN"),
-                "measurement_location_verified": st.session_state.get(f"cc_v5_location_verified_{owner}", False),
-                "reference_source_verified": st.session_state.get(f"cc_v5_reference_verified_{owner}", False),
+                "power_state": st.session_state.get(f"cc_v5_power_state_{owner}", "UNKNOWN") if scope_matches else "UNKNOWN",
+                "stored_energy_status": st.session_state.get(f"cc_v5_stored_energy_{owner}", "UNKNOWN") if scope_matches else "UNKNOWN",
+                "component_isolation_status": st.session_state.get(f"cc_v5_isolation_{owner}", "UNKNOWN") if scope_matches else "UNKNOWN",
+                "measurement_location_verified": st.session_state.get(f"cc_v5_location_verified_{owner}", False) if scope_matches else False,
+                "reference_source_verified": st.session_state.get(f"cc_v5_reference_verified_{owner}", False) if scope_matches else False,
             }
             cycle_id = int((workflow.get("inspection_cycle") or {}).get("cycle_id", 0))
             widget_instance = f"{project.project_id}_{board_component_id}_cycle{cycle_id}"
@@ -1753,7 +1757,9 @@ def _render_workflow_candidates(
         allow_retest=allow_retest,
     )
     workflow["active_inspection_plan"] = active_plan
-    planner_rows = [*active_plan.get("candidates", []), *active_plan.get("blocked", [])]
+    ready_plan_rows = [row for row in active_plan.get("candidates", []) if isinstance(row, dict)]
+    blocked_plan_rows = [row for row in active_plan.get("blocked", []) if isinstance(row, dict)]
+    planner_rows = [*ready_plan_rows, *blocked_plan_rows]
     planned_targets = list(dict.fromkeys(
         str(component_id)
         for item in planner_rows
@@ -1761,18 +1767,28 @@ def _render_workflow_candidates(
     ))
     if planned_targets:
         planned_rank = {component_id: index for index, component_id in enumerate(planned_targets)}
-        targets.sort(key=lambda row: planned_rank.get(str(row.get("board_component_id") or ""),
-                                                      len(planned_rank) + len(targets)))
+        selected_target = str(st.session_state.get(f"cc_wf_inspection_target_{project.project_id}")
+                              or workflow.get("selected_target_id") or "")
+        targets.sort(key=lambda row: (
+            str(row.get("board_component_id") or "") != selected_target,
+            planned_rank.get(str(row.get("board_component_id") or ""), len(planned_rank) + len(targets)),
+        ))
     planned_test_rank = {}
-    for plan_item in planner_rows:
+    for plan_rank, plan_item in enumerate(ready_plan_rows):
         for target_id in plan_item.get("target_component_ids", []):
-            planned_test_rank.setdefault(str(target_id), {})[str(plan_item.get("test_id"))] = len(planned_test_rank)
+            target_ranks = planned_test_rank.setdefault(str(target_id), {})
+            target_ranks.setdefault(str(plan_item.get("test_id")), plan_rank)
+    blocked_plan_by_target: dict[str, list[dict[str, Any]]] = {}
+    for plan_item in blocked_plan_rows:
+        for target_id in plan_item.get("target_component_ids", []):
+            blocked_plan_by_target.setdefault(str(target_id), []).append(plan_item)
     for target in targets:
         ranks = planned_test_rank.get(str(target.get("board_component_id") or ""), {})
         target.get("available_tests", []).sort(key=lambda item: (
             ranks.get(str(item.get("test_id") or ""), len(ranks)),
             str(item.get("test_id") or ""),
         ))
+    targets = targets[:3]
     workflow["candidate_ids"] = [str(row.get("board_component_id") or row.get("component_id"))
                                   for row in candidates]
     workflow["inspection_targets"] = targets
@@ -1797,17 +1813,6 @@ def _render_workflow_candidates(
                               reason="현재 Registry에서 측정·검사 대상으로 해석 가능한 소자가 없습니다.")
         return
 
-    plan_candidates = active_plan.get("candidates", [])
-    plan_blocked = active_plan.get("blocked", [])
-    if plan_candidates or plan_blocked:
-        st.markdown("#### 가설을 구분할 다음 검사")
-        for plan_item in plan_candidates[:3]:
-            st.markdown(f"**{plan_item['name']}** · 가설 쌍 구분 {plan_item['separation_count']}개")
-            st.caption(plan_item["reason"] + (" · " + " · ".join(plan_item["prerequisites"])
-                                               if plan_item.get("prerequisites") else ""))
-        for plan_item in plan_blocked[:3]:
-            st.info(f"{plan_item['name']} · 안전/조건 확인 필요: " +
-                    (" · ".join(plan_item.get("prerequisites", [])) or "검사 조건 검토"))
     st.markdown("#### 우선 확인할 검사 대상 · 최대 3개")
     measurable = sum(target.get("inspection_kind") == "MEASUREMENT" for target in targets)
     st.caption(f"측정 가능 {measurable}개 · 추가 확인 대상 {len(targets) - measurable}개")
@@ -1823,7 +1828,6 @@ def _render_workflow_candidates(
             label_parts.append(str(ref[0]))
         if target.get("component_type_confirmed") and target.get("component_type") not in {None, "", "unknown"}:
             label_parts.append(str(target["component_type"]))
-        fault_title = hypothesis.get("fault_title") or hypothesis.get("fault_id")
         label = " · ".join(label_parts)
         selected_target_id = st.session_state.get(
             f"cc_wf_inspection_target_{project.project_id}", workflow.get("selected_target_id")
@@ -1835,7 +1839,39 @@ def _render_workflow_candidates(
                         else "근거 충돌" if hypothesis.get("visual_status") == "CONFLICTED"
                         else "판단 보류" if hypothesis.get("visual_status") == "INCONCLUSIVE"
                         else "미확정")
-        st.caption(f"원인 · {fault_title or '미확정'} · {cause_status}")
+        if hypothesis:
+            fault_title = hypothesis.get("fault_title") or hypothesis.get("fault_id")
+            if target.get("reason") == "사용자가 의심 소자로 지정":
+                why_selected = "사용자가 의심 소자로 지정해 확인 대상으로 올렸습니다."
+            elif fault_title:
+                why_selected = f"{fault_title} 가능성을 확인하기 위해 선정됐습니다. 고장 확정은 아닙니다."
+            else:
+                why_selected = "증상·측정·규칙 분석과 관련된 확인 대상입니다. 고장 확정은 아닙니다."
+            supporting = hypothesis.get("supporting_evidence") or []
+            opposing = hypothesis.get("opposing_evidence") or []
+            if isinstance(supporting, str):
+                supporting = [supporting]
+            if isinstance(opposing, str):
+                opposing = [opposing]
+        elif target.get("reason") == "사용자가 의심 소자로 지정":
+            why_selected = "사용자가 의심 소자로 지정해 확인 대상으로 올렸습니다."
+            supporting = opposing = []
+        elif target.get("reason") == "증상·측정·규칙 분석 후보":
+            why_selected = "증상·측정·규칙 분석에서 관련 확인 대상으로 선정됐습니다. 고장 확정은 아닙니다."
+            supporting = opposing = []
+        else:
+            why_selected = "현재 근거만으로 원인이 특정되지 않아 추가 확인 대상으로 유지 중입니다."
+            supporting = opposing = []
+        st.caption(f"확인 이유 · {why_selected}")
+        if supporting:
+            st.caption("관련 근거 · " + " · ".join(str(item) for item in supporting[:3]))
+        if opposing:
+            st.caption("반대 근거 · " + " · ".join(str(item) for item in opposing[:2]))
+        st.caption(f"검증 상태 · {cause_status}")
+        for blocked_item in blocked_plan_by_target.get(str(target.get("board_component_id") or ""), []):
+            prerequisites = [str(value) for value in blocked_item.get("prerequisites", []) if value]
+            st.warning(f"검사 대기 · {blocked_item.get('name', blocked_item.get('test_id', '검사'))} · "
+                       + (" · ".join(prerequisites) if prerequisites else "필수 검사 조건 미확인"))
         focus_col, measure_col = st.columns([1, 1])
         with focus_col:
             if target.get("measurement_available") and st.button(
@@ -1883,6 +1919,10 @@ def _render_workflow_candidates(
         matching_tests = {str(item["test_id"]): item["profile"] for item in available_tests
                           if isinstance(item, dict) and item.get("test_id") and
                           (not fault_id or fault_id in item.get("fault_ids", []))}
+        target_ranks = planned_test_rank.get(selected_id, {})
+        ordered_tests = sorted(matching_tests, key=lambda test_id: (
+            target_ranks.get(test_id, len(ready_plan_rows)), test_id))
+        matching_tests = {test_id: matching_tests[test_id] for test_id in ordered_tests}
         recommended = next((test_id for test_id in matching_tests), None)
         if not recommended and hypothesis.get("recommended_tests"):
             st.caption("추가 검사 안내 · " + " · ".join(str(item) for item in hypothesis["recommended_tests"][:2]))

@@ -111,12 +111,16 @@ def build_evidence_ledger(
             continue
         block_id = str(item.get("block_id") or item.get("functional_block_id") or "")
         if item.get("component_ids"):
+            membership_status = ("VERIFIED" if item.get("verified") is True else
+                                 "AI_SUGGESTED" if item.get("verification_status") == "AI_SUGGESTED"
+                                 or item.get("status") == "AI_SUGGESTED" else "INFERRED")
             for component_id in item.get("component_ids", []):
                 append("functional_block_membership", str(component_id),
                        {"block_id": block_id, "role": item.get("role"),
                         "partition_status": item.get("partition_status"),
                         "connectivity_status": "NOT_INFERRED"},
-                       "functional_block_builder", "VERIFIED" if item.get("verified") is True else "INFERRED",
+                       "qwen" if membership_status == "AI_SUGGESTED" else "functional_block_builder",
+                       membership_status,
                        block_id or None, str(item.get("version") or "") or None)
 
     for item in ai_suggestions or []:

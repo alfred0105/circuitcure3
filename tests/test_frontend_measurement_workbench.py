@@ -184,12 +184,19 @@ def test_measurement_profile_and_fault_are_saved_through_real_streamlit_widgets(
     assert next(item for item in app.selectbox if item.label == "검증할 고장 가설").value == "RESISTOR_FAILURE"
     assert next(item for item in app.selectbox if item.label == "부품별 검사 항목").value == "isolated_resistance"
 
-    app.text_input(key="cc_v5_value_f5-profile-apptest-f5-profile-board-BC-R1-RESISTOR_FAILURE").set_value("10")
+    owner = "f5-profile-apptest-f5-profile-board-BC-R1-RESISTOR_FAILURE"
+    app.selectbox(key=f"cc_v5_power_state_{owner}").select("POWER_OFF_CONFIRMED").run()
+    app.selectbox(key=f"cc_v5_stored_energy_{owner}").select("SAFE_CONFIRMED").run()
+    app.selectbox(key=f"cc_v5_isolation_{owner}").select("ISOLATED_CONFIRMED").run()
+    app.checkbox(key=f"cc_v5_location_verified_{owner}").check().run()
+    app.checkbox(key=f"cc_v5_reference_verified_{owner}").check().run()
+
+    app.text_input(key=f"cc_v5_value_{owner}").set_value("10")
     next(item for item in app.text_input if item.label == "측정 대상/단자").set_value("R1 양단")
     condition = next(item for item in app.text_input if item.label == "측정 조건 (선택)")
     condition.set_value("전원 차단 · 주변 25 °C")
     assert sum(item.label in {"측정 조건", "측정 조건 (선택)"} for item in app.text_input) == 1
-    app.button(key="FormSubmitter:cc_v5_add_measurement_f5-profile-apptest-f5-profile-board-BC-R1-RESISTOR_FAILURE-측정 기록 저장").click().run()
+    app.button(key=f"FormSubmitter:cc_v5_add_measurement_{owner}-측정 기록 저장").click().run()
 
     assert not app.exception
     records = app.session_state[MEASUREMENTS_KEY]

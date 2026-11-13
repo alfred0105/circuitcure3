@@ -128,8 +128,13 @@ def build_functional_block_groups(
     components: list[dict[str, Any]], component_roles: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Group reviewed components by inferred role; membership never implies wiring."""
-    roles_by_id = {str(row.get("component_id")): row for row in component_roles
-                   if isinstance(row, dict) and row.get("component_id")}
+    roles_by_id = {}
+    for role_row in component_roles:
+        if not isinstance(role_row, dict):
+            continue
+        for alias in (role_row.get("component_id"), role_row.get("board_component_id")):
+            if alias:
+                roles_by_id[str(alias)] = role_row
     groups: list[dict[str, Any]] = []
     valid_components = [component for component in components if isinstance(component, dict)
                         and str(component.get("component_type") or "").casefold() != "not_component"
@@ -150,10 +155,11 @@ def build_functional_block_groups(
                  "output", "driver", "protection", "thermal", "buzzer", "relay", "input_output"):
         members = []
         for component in valid_components:
-            component_id = str(component.get("board_component_id") or component.get("component_id") or "")
+            local_component_id = str(component.get("component_id") or "")
+            component_id = str(component.get("board_component_id") or local_component_id)
             if not component_id:
                 continue
-            role_row = roles_by_id.get(component_id, {})
+            role_row = roles_by_id.get(local_component_id) or roles_by_id.get(component_id, {})
             if role not in role_row.get("candidate_blocks", []):
                 continue
             identity_verified = (
@@ -174,6 +180,7 @@ def build_functional_block_groups(
                     center = None
             members.append({"board_component_id": str(component.get("board_component_id") or component_id),
                             "component_id": component_id,
+                            "local_component_id": local_component_id or component_id,
                             "component_type": component.get("component_type", "unknown"),
                             "identity_status": "VERIFIED" if identity_verified else "UNKNOWN",
                             "evidence_status": "VERIFIED" if identity_verified else "UNKNOWN",
@@ -192,17 +199,19 @@ def build_functional_block_groups(
         # evidence, never proof of electrical connectivity. Without coordinates
         # keep separate unresolved instances instead of merging by role alone.
         diagonal = board_diagonal
-        clusters: list[list[dict[str, Any]]] = []
+        explicit_clusters: list[list[dict[str, Any]]] = []
+        unlabelled_clusters: list[list[dict[str, Any]]] = []
         named_clusters: dict[str, list[dict[str, Any]]] = {}
         for member in members:
             instance_id = str(member.get("functional_instance_id") or "").strip()
             if instance_id:
                 named_clusters.setdefault(instance_id, []).append(member)
             else:
-                clusters.append([member])
-        clusters.extend(named_clusters[key] for key in sorted(named_clusters))
-        located = [cluster for cluster in clusters if all(member.get("center_xy") for member in cluster)]
-        unlocated = [cluster for cluster in clusters if cluster not in located]
+                unlabelled_clusters.append([member])
+        explicit_clusters = [named_clusters[key] for key in sorted(named_clusters)]
+        located = [cluster for cluster in unlabelled_clusters
+                   if all(member.get("center_xy") for member in cluster)]
+        unlocated = [cluster for cluster in unlabelled_clusters if cluster not in located]
         merged: list[list[dict[str, Any]]] = []
         for cluster in sorted(located, key=lambda group: group[0]["component_id"]):
             for existing in merged:
@@ -213,7 +222,9 @@ def build_functional_block_groups(
                     break
             else:
                 merged.append(list(cluster))
-        clusters = merged + unlocated
+        # Explicit instance IDs are authoritative partitions: proximity may
+        # combine only unlabelled layout hints, never distinct named instances.
+        clusters = explicit_clusters + merged + unlocated
         for cluster in clusters:
             cluster.sort(key=lambda row: row["component_id"])
             member_ids = sorted({row["board_component_id"] for row in cluster})
@@ -224,7 +235,12 @@ def build_functional_block_groups(
             partition_status = ("EXPLICIT_INSTANCE" if all(member.get("functional_instance_id") for member in cluster)
                                 else "LAYOUT_CLUSTER" if all(member.get("center_xy") for member in cluster)
                                 else "UNRESOLVED_NO_POSITION")
+            version_seed = json.dumps([role, partition_status, member_ids,
+                                       [(member["component_id"], member["role_status"], member["role_evidence"])
+                                        for member in cluster]], ensure_ascii=False, separators=(",", ":"))
+            block_version = hashlib.sha256(version_seed.encode()).hexdigest()[:16]
             groups.append({"block_id": block_id, "functional_block_id": block_id, "role": role,
+                           "version": block_version,
                            "title": role.replace("_", " ").title(), "component_ids": member_ids,
                            "board_component_ids": member_ids, "members": cluster,
                            "supporting_evidence": evidence, "opposing_evidence": [],

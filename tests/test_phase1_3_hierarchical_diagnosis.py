@@ -48,6 +48,63 @@ def test_position_clusters_same_role_blocks_but_keeps_role_verification_separate
                for row in power for member in row["members"])
 
 
+def test_distinct_explicit_functional_instances_never_merge_by_distance():
+    components = [
+        {"component_id": "J1", "board_component_id": "BC-J1", "component_type": "connector",
+         "functional_instance_id": "input-power", "bbox_xyxy": [0, 0, 10, 10]},
+        {"component_id": "C1", "board_component_id": "BC-C1", "component_type": "capacitor",
+         "functional_instance_id": "input-power", "bbox_xyxy": [1, 0, 11, 10]},
+        {"component_id": "J2", "board_component_id": "BC-J2", "component_type": "connector",
+         "functional_instance_id": "aux-power", "bbox_xyxy": [2, 0, 12, 10]},
+        {"component_id": "X1", "board_component_id": "BC-X1", "component_type": "ic",
+         "bbox_xyxy": [900, 700, 910, 710]},
+    ]
+    roles = [{"component_id": cid, "candidate_blocks": ["power"], "role_evidence": {"power": [cid]}}
+             for cid in ("J1", "C1", "J2")]
+    power = [row for row in build_functional_block_groups(components, roles) if row["role"] == "power"]
+    assert {tuple(row["component_ids"]) for row in power} == {
+        ("BC-C1", "BC-J1"), ("BC-J2",),
+    }
+    repeated = [row for row in build_functional_block_groups(components, roles) if row["role"] == "power"]
+    assert {row["block_id"]: row["version"] for row in power} == {
+        row["block_id"]: row["version"] for row in repeated
+    }
+
+
+def test_unknown_and_not_component_confirmations_stay_out_of_diagnosis_inputs():
+    rows = [
+        {"component_id": "X-UNKNOWN", "component_type": "unknown",
+         "component_type_status": "USER_CONFIRMED", "presence_status": "USER_CONFIRMED"},
+        {"component_id": "X-NOT", "component_type": "not_component",
+         "component_type_status": "USER_CONFIRMED", "presence_status": "USER_CONFIRMED"},
+    ]
+    result = diagnose(symptoms=["LOCALIZED_HEATING"], components=rows,
+                      confirmed_component_ids={"X-UNKNOWN", "X-NOT"})
+    assert result["all_component_candidates"] == []
+    assert not any(member.get("board_component_id") in {"X-UNKNOWN", "X-NOT"}
+                   for block in result["functional_block_groups"] for member in block["members"])
+
+
+def test_verified_power_reference_resolves_only_matching_hypothesis_gap():
+    from circuitcare.symptom_diagnosis.evidence_gaps import analyze_evidence_gaps
+
+    knowledge = {"fault_modes": {"fault_modes": {"F_POWER": {
+        "functional_roles": ["power"], "level": "functional_block",
+    }}}, "test_catalog": {"tests": {}}}
+    gap = analyze_evidence_gaps(
+        hypotheses=[{"fault_id": "F_POWER", "level": "functional_block",
+                     "related_component_ids": ["BC-P1"]}],
+        knowledge=knowledge, confirmed_types={"resistor"}, functional_blocks=[],
+        component_candidates=[], measurement_evidence=[{
+            "measurement_id": "m1", "component_id": "BC-P1", "fault_hypothesis": "F_POWER",
+            "used_for_ranking": True, "reference_min": 4.8, "reference_max": 5.2,
+            "reference_source": "보드 사양", "reference_source_id": "PWR-5V",
+            "reference_verification_status": "BOARD_SPEC_VERIFIED",
+        }], evidence_ledger=[],
+    )[0]
+    assert not any(item.get("kind") == "power_specification" for item in gap["missing_evidence"])
+
+
 def test_evidence_ledger_preserves_reported_inferred_ai_and_conflicting_sources():
     rows = build_evidence_ledger(
         observations=[{"id": "o1", "code": "NO_POWER", "value": True,

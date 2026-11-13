@@ -144,6 +144,23 @@ def test_validated_qwen_role_proposal_enters_structure_as_ai_suggested_only(monk
     assert result["functional_blocks"][0]["ai_suggested_functional_roles"] == ["power"]
     assert any(row["kind"] == "component_functional_role" and row["status"] == "AI_SUGGESTED"
                for row in result["evidence_ledger"])
+    assert any(row["kind"] == "functional_block_membership" and row["status"] == "AI_SUGGESTED"
+               for row in result["evidence_ledger"])
+    assert result["active_inspection_plan"]["status"] == "NO_HYPOTHESES"
+
+    unknown_result = {"functional_blocks": [], "functional_block_groups": [],
+                      "all_component_candidates": [], "component_candidates": [],
+                      "hypotheses": [], "next_tests": [], "evidence_ledger": []}
+    unknown = {"component_id": "bc-unknown", "board_component_id": "bc-unknown",
+               "component_type": "unknown", "component_type_status": "USER_CONFIRMED"}
+    monkeypatch.setattr(panel, "suggest_pcb_fault_candidates", lambda *_args, **_kwargs: {
+        "proposals": [{**proposal, "component_id": "bc-unknown", "board_component_id": "bc-unknown"}],
+        "status": "LOCAL_LLM_PROPOSED_UNVERIFIED", "model": "qwen-test"})
+    panel._apply_qwen_pcb_assist(unknown_result, project=ProjectContext("p", "b"),
+        components=[unknown], suspected_components=[], selected_model="qwen-test",
+        knowledge=load_knowledge(), answered_test_ids=[])
+    assert unknown_result["functional_block_groups"] == []
+    assert unknown_result["candidate_fusion"]["top_candidates"] == []
 
 
 def test_qwen_rejects_wrong_fault_component_pair_and_unconfirmed_component():

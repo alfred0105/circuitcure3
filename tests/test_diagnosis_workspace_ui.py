@@ -878,9 +878,19 @@ def test_streamlit_measurement_submission_automatically_reexecutes_diagnosis(mon
     assert not app.exception
     assert len(calls) == 1
 
-    app.text_input(key="cc_v5_value_f5-reanalysis-apptest-f5-reanalysis-board-BC-R1-RESISTOR_FAILURE").set_value("10")
+    owner = "f5-reanalysis-apptest-f5-reanalysis-board-BC-R1-RESISTOR_FAILURE"
+    submit_key = f"FormSubmitter:cc_v5_add_measurement_{owner}-측정 기록 저장"
+    assert app.button(key=submit_key).proto.disabled is True
+    app.selectbox(key=f"cc_v5_power_state_{owner}").select("POWER_OFF_CONFIRMED").run()
+    app.selectbox(key=f"cc_v5_stored_energy_{owner}").select("SAFE_CONFIRMED").run()
+    app.selectbox(key=f"cc_v5_isolation_{owner}").select("ISOLATED_CONFIRMED").run()
+    app.checkbox(key=f"cc_v5_location_verified_{owner}").check().run()
+    app.checkbox(key=f"cc_v5_reference_verified_{owner}").check().run()
+    assert app.button(key=submit_key).proto.disabled is False
+
+    app.text_input(key=f"cc_v5_value_{owner}").set_value("10")
     next(item for item in app.text_input if item.label == "측정 대상/단자").set_value("R1 양단")
-    app.button(key="FormSubmitter:cc_v5_add_measurement_f5-reanalysis-apptest-f5-reanalysis-board-BC-R1-RESISTOR_FAILURE-측정 기록 저장").click().run()
+    app.button(key=submit_key).click().run()
 
     assert not app.exception
     assert len(calls) == 2

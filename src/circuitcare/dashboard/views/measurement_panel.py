@@ -238,6 +238,46 @@ def render_measurement_panel(
     if selected_test_id and selected_fault_id not in profile_relations:
         st.warning("선택한 검사 프로파일은 이 고장 가설과 연결되지 않습니다. 호환되는 검사만 저장할 수 있습니다.")
         selected_test_id = ""
+    registry_version = str((board_registry or {}).get("version") or component_map_version or "")
+    safety_scope = f"{selected_test_id}|{registry_version}"
+    safety_scope_key = f"cc_v5_safety_scope_{owner}"
+    if st.session_state.get(safety_scope_key) != safety_scope:
+        st.session_state[safety_scope_key] = safety_scope
+        st.session_state[f"cc_v5_power_state_{owner}"] = "UNKNOWN"
+        st.session_state[f"cc_v5_stored_energy_{owner}"] = "UNKNOWN"
+        st.session_state[f"cc_v5_isolation_{owner}"] = "UNKNOWN"
+        st.session_state[f"cc_v5_location_verified_{owner}"] = False
+        st.session_state[f"cc_v5_reference_verified_{owner}"] = False
+    st.caption("검사 전 확인 · 선택한 검사 조건을 저장 전에 확인합니다. 이 확인은 현장 측정의 안전을 보증하지 않습니다.")
+    measurement_conditions = {
+        "power_state": st.selectbox("전원 상태 확인", ("UNKNOWN", "POWER_OFF_CONFIRMED", "POWER_ON_CONFIRMED"),
+            format_func=lambda value: {"UNKNOWN": "미확인", "POWER_OFF_CONFIRMED": "전원 분리 확인", "POWER_ON_CONFIRMED": "전원 연결됨"}[value],
+            key=f"cc_v5_power_state_{owner}"),
+        "stored_energy_status": st.selectbox("잔류 에너지 확인", ("UNKNOWN", "SAFE_CONFIRMED", "NOT_SAFE_OR_UNKNOWN"),
+            format_func=lambda value: {"UNKNOWN": "미확인", "SAFE_CONFIRMED": "안전 여부 확인", "NOT_SAFE_OR_UNKNOWN": "안전 확인 불가/위험"}[value],
+            key=f"cc_v5_stored_energy_{owner}"),
+        "component_isolation_status": st.selectbox("소자 분리 상태 확인", ("UNKNOWN", "ISOLATED_CONFIRMED", "NOT_ISOLATED"),
+            format_func=lambda value: {"UNKNOWN": "미확인", "ISOLATED_CONFIRMED": "측정 대상 분리 확인", "NOT_ISOLATED": "회로에 연결됨"}[value],
+            key=f"cc_v5_isolation_{owner}"),
+    }
+    location_verified = st.checkbox("측정 위치와 지정 단자를 확인함",
+                                    key=f"cc_v5_location_verified_{owner}")
+    reference_source_verified = st.checkbox("정상 기준과 출처를 확인함",
+                                             key=f"cc_v5_reference_verified_{owner}")
+    measurement_conditions.update({
+        "measurement_location_verified": bool(location_verified),
+        "reference_source_verified": bool(reference_source_verified),
+    })
+    required_conditions = selected_profile.get("required_conditions", {})
+    profile_safe_to_offer = bool(
+        selected_profile.get("safety_protocol") and required_conditions
+        and str(selected_profile.get("risk_level", "unknown")).casefold() in {"low", "none"}
+    ) if selected_test_id else True
+    safety_confirmed = (profile_safe_to_offer and all(
+        measurement_conditions.get(field) == expected for field, expected in required_conditions.items())
+        and location_verified and reference_source_verified) if selected_test_id else True
+    if selected_test_id and not safety_confirmed:
+        st.warning("검사 조건이 모두 확인되기 전에는 이 프로파일의 측정 기록을 저장할 수 없습니다.")
     measurement_type = st.selectbox(
         "측정 종류", TYPE_OPTIONS, format_func=MEASUREMENT_TYPE_LABELS.get,
         key=type_key,
@@ -259,31 +299,13 @@ def render_measurement_panel(
         reference_min = reference_max = reference_source = reference_source_id = ""
         reference_status = "UNVERIFIED"
         operating_conditions = reference_conditions = ""
-        measurement_conditions = {
-            "power_state": "UNKNOWN",
-            "stored_energy_status": "UNKNOWN",
-            "component_isolation_status": "UNKNOWN",
-        }
-        location_verified = False
         source_label = SOURCE_OPTIONS[0]
         if compact:
-            location_verified = st.checkbox("측정 지점과 단자를 직접 확인함", key=f"cc_v5_compact_location_{owner}")
             operating_conditions = st.text_input(
                 "측정 조건 (선택)", key=f"cc_v5_condition_{owner}",
                 placeholder="예: 전원 차단, 주변 온도",
             )
-        st.caption("안전 상태는 선택한 검사에 필요한 조건을 모두 확인해야 저장 기록이 검증 후보가 됩니다.")
-        measurement_conditions = {
-            "power_state": st.selectbox("전원 상태", ("UNKNOWN", "POWER_OFF_CONFIRMED", "POWER_ON_CONFIRMED"),
-                format_func=lambda value: {"UNKNOWN": "미확인", "POWER_OFF_CONFIRMED": "전원 분리 확인", "POWER_ON_CONFIRMED": "전원 연결됨"}[value],
-                key=f"cc_v5_power_state_{owner}"),
-            "stored_energy_status": st.selectbox("잔류 에너지", ("UNKNOWN", "SAFE_CONFIRMED", "NOT_SAFE_OR_UNKNOWN"),
-                format_func=lambda value: {"UNKNOWN": "미확인", "SAFE_CONFIRMED": "안전 확인 완료", "NOT_SAFE_OR_UNKNOWN": "안전 확인 불가/위험"}[value],
-                key=f"cc_v5_stored_energy_{owner}"),
-            "component_isolation_status": st.selectbox("소자 분리 상태", ("UNKNOWN", "ISOLATED_CONFIRMED", "NOT_ISOLATED"),
-                format_func=lambda value: {"UNKNOWN": "미확인", "ISOLATED_CONFIRMED": "측정 대상 분리 확인", "NOT_ISOLATED": "회로에 연결됨"}[value],
-                key=f"cc_v5_isolation_{owner}"),
-        }
+        st.caption("필수 조건을 충족하지 못한 기록은 검증된 판정 근거가 되지 않습니다.")
         with st.expander("가설 검증 정보 추가" if compact else "검증 정보 · 정상 범위 · 출처", expanded=False):
             uncertainty = st.text_input(
                 f"측정 불확실도 σ ({BASE_UNITS[measurement_type]})",
@@ -310,20 +332,21 @@ def render_measurement_panel(
                 )
             reference_conditions = st.text_input("기준 조건", placeholder="실제 측정 조건과 동일하게")
             if not compact:
-                location_verified = st.checkbox("측정 지점이 지정 단자임을 확인함")
                 source_label = st.selectbox("측정 출처", SOURCE_OPTIONS, key=f"cc_v5_source_{owner}")
             else:
                 st.caption("검사 기준·출처 등 검증 정보가 부족하면 기록은 남지만 판정은 보류됩니다.")
-        reference_source_verified = bool(
+        reference_details_verified = bool(
             reference_status in {"DATASHEET_VERIFIED", "BOARD_SPEC_VERIFIED"}
             and str(reference_min).strip() and str(reference_max).strip()
             and str(reference_source).strip() and str(reference_source_id).strip()
         )
+        reference_source_verified = bool(reference_source_verified and reference_details_verified)
         measurement_conditions.update({
             "measurement_location_verified": bool(location_verified),
             "reference_source_verified": reference_source_verified,
         })
-        submitted = st.form_submit_button("측정 기록 저장", type="primary")
+        submitted = st.form_submit_button("측정 기록 저장", type="primary",
+                                          disabled=bool(selected_test_id and not safety_confirmed))
     if submitted:
         try:
             if selected_test_id and selected_fault_id not in profile_relations:
@@ -363,8 +386,6 @@ def render_measurement_panel(
                 measurement_conditions=measurement_conditions,
             )
             save_measurement(st.session_state, record)
-            st.session_state[f"cc_v5_location_verified_{owner}"] = bool(location_verified)
-            st.session_state[f"cc_v5_reference_verified_{owner}"] = reference_source_verified
             st.success("측정 기록을 저장했습니다. 저장은 측정 검증 완료를 뜻하지 않습니다.")
             st.rerun()
         except ValueError as exc:

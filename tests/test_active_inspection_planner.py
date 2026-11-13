@@ -54,6 +54,20 @@ def test_planner_ranks_deterministic_question_by_hypothesis_separation_without_p
     assert "information_gain" not in item
 
 
+def test_equal_separation_checks_use_declared_safety_then_duration_and_cost_order():
+    knowledge = _knowledge()
+    fast = dict(knowledge["test_catalog"]["tests"]["ASK_SPLIT"],
+                name="빠른 구분 질문", estimated_duration_seconds=10, estimated_cost=1)
+    slow = dict(knowledge["test_catalog"]["tests"]["ASK_SPLIT"],
+                name="느린 구분 질문", estimated_duration_seconds=40, estimated_cost=0)
+    knowledge["test_catalog"]["tests"]["FAST"] = fast
+    knowledge["test_catalog"]["tests"]["SLOW"] = slow
+    knowledge["fault_modes"]["fault_modes"]["F1"]["recommended_tests"] = ["SLOW", "FAST"]
+    knowledge["fault_modes"]["fault_modes"]["F2"]["recommended_tests"] = ["SLOW", "FAST"]
+    result = _plan(knowledge=knowledge)
+    assert [row["test_id"] for row in result["candidates"][:2]] == ["FAST", "SLOW"]
+
+
 def test_measurement_separation_requires_declared_relations_for_both_hypotheses():
     knowledge = _knowledge()
     knowledge["test_catalog"]["tests"]["OHMS"] = {
@@ -101,10 +115,56 @@ def test_profiled_measurement_becomes_actionable_only_after_each_safety_gate_is_
             "power_state": "POWER_OFF_CONFIRMED",
             "stored_energy_status": "SAFE_CONFIRMED",
             "component_isolation_status": "ISOLATED_CONFIRMED",
+            "measurement_location_verified": True,
+            "reference_source_verified": True,
         }})
     item = next(row for row in ready["candidates"] if row["test_id"] == "OHMS")
     assert item["blocked_until_safe"] is False
     assert item["status"] == "READY_FOR_USER_REVIEW"
+
+
+def test_profiled_measurement_stays_blocked_until_location_and_reference_are_confirmed():
+    knowledge = _knowledge()
+    knowledge["test_catalog"]["tests"]["OHMS"] = {
+        "name": "저항 측정", "type": "measurement", "risk_level": "low", "results": {},
+    }
+    knowledge["fault_modes"]["fault_modes"]["F1"]["recommended_tests"] = ["OHMS"]
+    knowledge["component_test_profiles"]["profiles"] = {"resistor": {"tests": {"OHMS": {
+        "safety_protocol": "DEENERGIZED_ISOLATED_PASSIVE", "risk_level": "low",
+        "required_conditions": {"power_state": "POWER_OFF_CONFIRMED"},
+        "fault_relations": {"F1": {"TEST_NORMAL": "supports", "TEST_ABNORMAL": "refutes"}},
+    }}}}
+    candidate = [{"board_component_id": "bc-r1", "component_type": "resistor", "fault_hypothesis": "F1"}]
+    checked_electrical = {"power_state": "POWER_OFF_CONFIRMED"}
+    plan = _plan(knowledge=knowledge, component_candidates=candidate,
+                 inspection_conditions={"bc-r1|F1": checked_electrical})
+    blocked = next(row for row in plan["blocked"] if row["test_id"] == "OHMS")
+    assert "측정 위치·단자를 먼저 확인해야 함" in blocked["prerequisites"]
+    assert "정상 기준·출처를 먼저 확인해야 함" in blocked["prerequisites"]
+    checked_electrical.update(measurement_location_verified=True, reference_source_verified=True)
+    ready = _plan(knowledge=knowledge, component_candidates=candidate,
+                  inspection_conditions={"bc-r1|F1": checked_electrical})
+    assert any(row["test_id"] == "OHMS" for row in ready["candidates"])
+
+
+def test_profile_blocker_names_only_the_unconfirmed_safety_condition():
+    knowledge = _knowledge()
+    knowledge["test_catalog"]["tests"]["OHMS"] = {
+        "name": "저항 측정", "type": "measurement", "risk_level": "low", "results": {},
+    }
+    knowledge["fault_modes"]["fault_modes"]["F1"]["recommended_tests"] = ["OHMS"]
+    knowledge["component_test_profiles"]["profiles"] = {"resistor": {"tests": {"OHMS": {
+        "safety_protocol": "DEENERGIZED_ISOLATED_PASSIVE", "risk_level": "low",
+        "required_conditions": {"power_state": "POWER_OFF_CONFIRMED"},
+        "fault_relations": {"F1": {"TEST_NORMAL": "supports", "TEST_ABNORMAL": "refutes"}},
+    }}}}
+    plan = _plan(knowledge=knowledge, component_candidates=[{
+        "board_component_id": "bc-r1", "component_type": "resistor", "fault_hypothesis": "F1",
+    }], inspection_conditions={"bc-r1|F1": {
+        "power_state": "POWER_OFF_CONFIRMED", "measurement_location_verified": True,
+    }})
+    blocked = next(row for row in plan["blocked"] if row["test_id"] == "OHMS")
+    assert blocked["prerequisites"] == ["정상 기준·출처를 먼저 확인해야 함", "해당 소자별 안전 상태가 아직 확인되지 않음"]
 
 
 def test_completed_inspection_is_not_recommended_again_without_retest():

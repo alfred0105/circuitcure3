@@ -61,9 +61,21 @@ def analyze_evidence_gaps(
                             "test_id": test_id, "verification_methods": [test.get("question") or test.get("name") or test_id],
                             "risk_level": test.get("risk_level", "unknown"),
                             "requires_power_off": bool(test.get("requires_power_off", False))})
-        if required_roles & {"power", "protection"} or any(
+        needs_power_spec = bool(required_roles & {"power", "protection"}) or any(
             str(test_id).casefold() in {"voltage", "power", "supply", "rail"}
-            for test_id in required_tests):
+            for test_id in required_tests)
+        reference_basis_present = any(
+            row.get("fault_hypothesis") == fault_id
+            and row.get("used_for_ranking") is True
+            and row.get("reference_verification_status") in {"DATASHEET_VERIFIED", "BOARD_SPEC_VERIFIED"}
+            and row.get("reference_min") is not None and row.get("reference_max") is not None
+            and str(row.get("reference_source") or "").strip()
+            and str(row.get("reference_source_id") or "").strip()
+            for row in measurement_evidence
+            if isinstance(row, dict)
+            and (not related_ids or str(row.get("board_component_id") or row.get("component_id") or "") in related_ids)
+        )
+        if needs_power_spec and not reference_basis_present:
             missing.append({"kind": "power_specification", "status": "UNKNOWN",
                             "description": "보드 전원 규격·정상 기준 출처가 확인되지 않았습니다.",
                             "verification_methods": ["제조사 데이터시트 또는 보드 사양 확인"]})
