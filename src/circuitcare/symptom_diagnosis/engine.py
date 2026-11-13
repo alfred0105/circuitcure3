@@ -745,7 +745,8 @@ def diagnose(
                          ("USER_CONFIRMED" if str(part.get("component_id") or "") in confirmed_ids else "UNCONFIRMED")),
                          presence_status="CONFIRMED" if str(part.get("component_id") or "") in confirmed_ids else "UNCONFIRMED")
                     for part in detected_parts],
-        functional_blocks=functional_blocks, measurements=measurements or [],
+        functional_blocks=functional_block_groups, functional_roles=functional_blocks,
+        measurements=measurements or [],
         source_version=str((current_context or {}).get("component_map_version") or "") or None)
     functional_hypotheses = []
     for hypothesis in ranked:
@@ -777,7 +778,8 @@ def diagnose(
     }
     evidence_gaps = analyze_evidence_gaps(
         hypotheses=ranked, knowledge=kb, confirmed_types=detected_types,
-        functional_blocks=confirmed_functional_blocks, component_candidates=all_component_candidates,
+        functional_blocks=functional_block_groups, component_roles=confirmed_functional_blocks,
+        component_candidates=all_component_candidates,
         measurement_evidence=measurement_evidence, evidence_ledger=evidence_ledger,
         connectivity_status=connectivity_status,
     )

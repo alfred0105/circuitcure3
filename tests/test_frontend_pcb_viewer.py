@@ -295,9 +295,9 @@ def test_pcb_viewer_uses_shared_hit_test_from_real_click_and_does_not_capture_pl
     from pathlib import Path
 
     source = (Path(__file__).parents[1] / "src/circuitcare/dashboard/components/assets/pcb_viewer.js").read_text()
-    assert 'listen(viewport,"click"' in source
-    assert "const hits=hitComponents(event)" in source
-    assert "[pcb-selection] click" in source
+    assert 'listen(viewport,"pointerup"' in source
+    assert 'const hits=hitComponents(event)' in source
+    assert "[pcb-selection] pointerup_select" in source
     assert "viewport.setPointerCapture(event.pointerId)" in source
     # Pointer capture is acquired only after the movement crosses the drag threshold.
     pointerdown = source.split('listen(viewport,"pointerdown"', 1)[1].split('listen(viewport,"pointermove"', 1)[0]
@@ -420,8 +420,6 @@ def test_photo_component_snapshots_are_prepared_without_rendering_the_viewer(mon
 
     from circuitcare.dashboard.views import unified_workspace
     monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
-    monkeypatch.setattr(unified_workspace, "queue_ai_component_review",
-                        lambda *_args, **_kwargs: (None, "", "COMPLETE"))
     photos = [{"image_id": "photo-1", "data": image_bytes[0]},
               {"image_id": "photo-2", "data": image_bytes[1]}]
     first = _prepare_photo_component_snapshot(st, project, photos)
@@ -485,7 +483,6 @@ def test_initial_yolo_status_uses_dedicated_slot_and_finishes_explicitly(monkeyp
         return {"detections": [], "image_width": 32, "image_height": 24}, None
 
     monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
-    monkeypatch.setattr(unified_workspace, "_queue_ai_review", lambda *_a, **_kwargs: ("job-1", "PENDING"))
     unified_workspace._prepare_photo_component_snapshot(
         st, project, [{"image_id": "photo-status", "data": photo}],
         workflow_status_slot=Slot(),
@@ -650,8 +647,6 @@ def test_board_registry_prioritizes_selected_photo_and_reuses_processed_snapshot
 
     from circuitcare.dashboard.views import unified_workspace
     monkeypatch.setattr(unified_workspace, "ensure_component_detection", fake_detection)
-    monkeypatch.setattr(unified_workspace, "queue_ai_component_review",
-                        lambda *_args, **_kwargs: (None, "", "COMPLETE"))
     photos = [{"image_id": photo_id, "data": data}
               for photo_id, data in zip(photo_ids, image_bytes)]
 

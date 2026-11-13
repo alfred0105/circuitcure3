@@ -75,7 +75,7 @@ def validate_component_selection_event(
             and component_id in allowed_ids
             and isinstance(overlap_ids, list)
             and component_id in overlap_ids
-            and all(isinstance(item, str) and item in allowed_ids for item in overlap_ids)
+            and all(isinstance(item, str) for item in overlap_ids)
             and (action != "bulk-select" or bool(overlap_ids))):
         return True, None
     if action == "clear" and component_id is None:

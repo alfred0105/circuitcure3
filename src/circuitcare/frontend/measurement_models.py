@@ -70,6 +70,7 @@ class MeasurementRecord:
     source_component_id: str | None = None
     measurement_location: str | None = None
     identity_resolution_status: str = "UNRESOLVED"
+    measurement_conditions: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -107,6 +108,7 @@ def create_measurement_record(
     source_observation_fingerprint: str | None = None,
     measurement_location: str | None = None,
     identity_resolution_status: str = "UNRESOLVED",
+    measurement_conditions: dict[str, Any] | None = None,
 ) -> MeasurementRecord:
     if not project_id.strip() or not board_id.strip() or not component_id.strip():
         raise ValueError("프로젝트, 보드, 부품 정보가 필요합니다.")
@@ -176,6 +178,7 @@ def create_measurement_record(
         source_component_id=(source_component_id or component_id).strip() or None,
         measurement_location=(measurement_location or measurement_target or "").strip() or None,
         identity_resolution_status=str(identity_resolution_status or "UNRESOLVED"),
+        measurement_conditions=(dict(measurement_conditions) if isinstance(measurement_conditions, dict) else None),
     )
 
 

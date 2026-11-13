@@ -113,6 +113,39 @@ def test_qwen_block_proposals_and_evidence_ledger_ids_are_allowlisted():
     assert schema["functional_block_id"]["enum"] == ["block-abc123", "__none__"]
 
 
+def test_validated_qwen_role_proposal_enters_structure_as_ai_suggested_only(monkeypatch):
+    import circuitcare.dashboard.views.symptom_diagnosis_panel as panel
+    proposal = {"component_id": "bc-c1", "board_component_id": "bc-c1",
+        "suspected_fault_id": "CAPACITOR_SHORT", "functional_block": "power",
+        "functional_block_id": None, "reason": "전원 입력 인접 정보",
+        "supporting_evidence_ids": [], "opposing_evidence_ids": [],
+        "missing_information": [], "recommended_next_action": "전원 기준 확인",
+        "uncertainty_status": "UNVERIFIED", "evidence_status": "UNVERIFIED"}
+    monkeypatch.setattr(panel, "build_pcb_context", lambda **_kwargs: {
+        "summary": {}, "focus_components": [{"component_id": "bc-c1"}],
+        "omitted_component_ids": [], "context_token_estimate": 20,
+    })
+    monkeypatch.setattr(panel, "suggest_pcb_fault_candidates", lambda *_args, **_kwargs: {
+        "proposals": [proposal], "status": "LOCAL_LLM_PROPOSED_UNVERIFIED", "model": "qwen-test"})
+    monkeypatch.setattr(panel, "OllamaClient", lambda **_kwargs: object())
+    component = {"component_id": "bc-c1", "board_component_id": "bc-c1",
+                 "component_type": "capacitor", "component_type_status": "USER_CONFIRMED"}
+    result = {"functional_blocks": [{"component_id": "bc-c1", "candidate_blocks": [],
+                "role_evidence": {}}], "functional_block_groups": [],
+              "all_component_candidates": [], "component_candidates": [],
+              "hypotheses": [], "next_tests": [], "evidence_ledger": []}
+    panel._apply_qwen_pcb_assist(result, project=ProjectContext("p", "b"),
+        components=[component], suspected_components=[], selected_model="qwen-test",
+        knowledge=load_knowledge(), answered_test_ids=[])
+    group = result["functional_block_groups"][0]
+    assert group["component_ids"] == ["bc-c1"]
+    assert group["role"] == "power" and group["verification_status"] == "AI_SUGGESTED"
+    assert group["connectivity_status"] == "NOT_INFERRED"
+    assert result["functional_blocks"][0]["ai_suggested_functional_roles"] == ["power"]
+    assert any(row["kind"] == "component_functional_role" and row["status"] == "AI_SUGGESTED"
+               for row in result["evidence_ledger"])
+
+
 def test_qwen_rejects_wrong_fault_component_pair_and_unconfirmed_component():
     knowledge = load_knowledge()
     resistor_fault = next(key for key, row in knowledge["fault_modes"]["fault_modes"].items()

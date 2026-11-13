@@ -8,7 +8,10 @@ profiles:
       isolated_resistance:
         measurement_type: resistance
         target_keywords: [양단, 단자, terminal]
-        condition_keywords: [전원 차단, power off, 회로에서 분리, isolated]
+        required_conditions: {power_state: POWER_OFF_CONFIRMED, stored_energy_status: SAFE_CONFIRMED, component_isolation_status: ISOLATED_CONFIRMED, measurement_location_verified: true, reference_source_verified: true}
+        safety_protocol: DEENERGIZED_ISOLATED_PASSIVE
+        risk_level: low
+        requires_reference_verification: true
         fault_relations:
           RESISTOR_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
   fuse:
@@ -16,7 +19,10 @@ profiles:
       continuity:
         measurement_type: resistance
         target_keywords: [양단, 단자, continuity, terminal]
-        condition_keywords: [전원 차단, power off, 회로에서 분리, isolated]
+        required_conditions: {power_state: POWER_OFF_CONFIRMED, stored_energy_status: SAFE_CONFIRMED, component_isolation_status: ISOLATED_CONFIRMED, measurement_location_verified: true, reference_source_verified: true}
+        safety_protocol: DEENERGIZED_ISOLATED_PASSIVE
+        risk_level: low
+        requires_reference_verification: true
         fault_relations:
           FUSE_OPEN: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
   switch:
@@ -24,7 +30,10 @@ profiles:
       contact_resistance:
         measurement_type: resistance
         target_keywords: [접점, 단자, contact, terminal]
-        condition_keywords: [전원 차단, power off]
+        required_conditions: {power_state: POWER_OFF_CONFIRMED, stored_energy_status: SAFE_CONFIRMED, component_isolation_status: ISOLATED_CONFIRMED, measurement_location_verified: true, reference_source_verified: true}
+        safety_protocol: DEENERGIZED_ISOLATED_PASSIVE
+        risk_level: low
+        requires_reference_verification: true
         fault_relations:
           SWITCH_CONTACT_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
           SWITCH_STUCK: {TEST_NORMAL: non_diagnostic, TEST_ABNORMAL: supports}
@@ -33,13 +42,19 @@ profiles:
       forward_drop:
         measurement_type: voltage
         target_keywords: [순방향, forward, 애노드, anode, 캐소드, cathode]
-        condition_keywords: [전원 차단, power off, 회로에서 분리, isolated]
+        required_conditions: {power_state: POWER_OFF_CONFIRMED, stored_energy_status: SAFE_CONFIRMED, component_isolation_status: ISOLATED_CONFIRMED, measurement_location_verified: true, reference_source_verified: true}
+        safety_protocol: DEENERGIZED_ISOLATED_PASSIVE
+        risk_level: low
+        requires_reference_verification: true
         fault_relations:
           DIODE_SHORT_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
           DIODE_OPEN_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}
       reverse_leakage:
         measurement_type: current
         target_keywords: [역방향 누설, reverse leakage, 역누설]
-        condition_keywords: [전원 차단, power off, 회로에서 분리, isolated]
+        required_conditions: {power_state: POWER_OFF_CONFIRMED, stored_energy_status: SAFE_CONFIRMED, component_isolation_status: ISOLATED_CONFIRMED, measurement_location_verified: true, reference_source_verified: true}
+        safety_protocol: DEENERGIZED_ISOLATED_PASSIVE
+        risk_level: low
+        requires_reference_verification: true
         fault_relations:
           DIODE_LEAKAGE_FAILURE: {TEST_NORMAL: refutes, TEST_ABNORMAL: supports}

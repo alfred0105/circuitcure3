@@ -908,10 +908,6 @@ def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
     selected_ids = sorted({str(value) for value in (selected_component_ids or [])})
     if not selected_ids:
         return None, job_owner, "SELECT_COMPONENT_REQUIRED"
-    known_ids = {str(row.get("component_id")) for row in rows
-                 if isinstance(row, dict) and row.get("상태") != "제외"}
-    if not set(selected_ids) <= known_ids:
-        return None, job_owner, "STALE_SELECTION"
     fingerprint = _observation_fingerprint(rows)
     ocr_key, qwen_key = review_aux_keys(scope)
     cached = state.get(qwen_key)
@@ -937,6 +933,10 @@ def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
                 status = "STALE"
             state[f"cc_ai_review_job_status_{scope}"] = status
             return previous_job_id, job_owner, status
+    known_ids = {str(row.get("component_id")) for row in rows
+                 if isinstance(row, dict) and row.get("상태") != "제외"}
+    if not set(selected_ids) <= known_ids:
+        return None, job_owner, "STALE_SELECTION"
     review_fingerprint = _review_fingerprint(rows, None)
     ocr_fingerprint = _ocr_evidence_fingerprint(state.get(ocr_key))
     allowed = (records_key, ocr_key, qwen_key, f"cc_component_marking_ocr_{scope}",

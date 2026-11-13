@@ -15,12 +15,14 @@ def plan_active_inspections(
     functional_block_groups: list[dict[str, Any]], evidence_gaps: list[dict[str, Any]],
     measurements: list[dict[str, Any]], observations: dict[str, Any],
     inspection_history: list[dict[str, Any]], knowledge: dict[str, Any],
+    inspection_conditions: dict[str, dict[str, Any]] | None = None,
     allow_retest: bool = False, limit: int = 5,
 ) -> dict[str, Any]:
     """Return deterministic inspection candidates and their safety prerequisites."""
     modes = knowledge.get("fault_modes", {}).get("fault_modes", {})
     tests = knowledge.get("test_catalog", {}).get("tests", {})
     profiles = knowledge.get("component_test_profiles", {}).get("profiles", {})
+    inspection_conditions = inspection_conditions or {}
     active_hypotheses = [row for row in hypotheses if isinstance(row, dict) and row.get("fault_id")]
     fault_ids = list(dict.fromkeys(str(row["fault_id"]) for row in active_hypotheses))
     if not active_hypotheses:
@@ -190,14 +192,55 @@ def plan_active_inspections(
         if test.get("type") == "visual_inspection":
             if risk not in {"none", "low"}:
                 prerequisites.append("검사 위험 수준 검토")
-            safety_blocked = risk not in {"none", "low"} or bool(
-                test.get("requires_power_off") or test.get("requires_stored_energy_safe"))
+            safety_blocked = risk not in {"none", "low"}
+            power_ok = True
+            energy_ok = True
+            safety_targets = ["board"] if test.get("target_scope") == "board" else (scoped_ids or ["board"])
+            for target_id in safety_targets:
+                for fault_id in applies_to:
+                    actual = inspection_conditions.get(f"{target_id}|{fault_id}|{test_id}", {})
+                    if test.get("requires_power_off") and actual.get("power_state") != "POWER_OFF_CONFIRMED":
+                        power_ok = False
+                    if test.get("requires_stored_energy_safe") and actual.get("stored_energy_status") != "SAFE_CONFIRMED":
+                        energy_ok = False
+            safety_blocked = safety_blocked or not power_ok or not energy_ok
+            if test.get("requires_power_off"):
+                prerequisites.append("전원 분리 확인됨" if power_ok else "전원 분리 확인")
+            if test.get("requires_stored_energy_safe"):
+                prerequisites.append("잔류 에너지 안전 확인됨" if energy_ok else "잔류 에너지 안전 확인")
         elif profile_defs:
-            # Profiles describe a measurement relation, not a complete safe work
-            # instruction; do not imply a person can safely perform it yet.
-            prerequisites.extend(["실제 소자·측정 단자 확인", "측정 조건 및 정상 기준 출처 확인",
-                                  "검사 프로파일의 안전 조건 검토"])
-            safety_blocked = True
+            profile = profile_defs[0][2]
+            protocol = profile.get("safety_protocol")
+            required = profile.get("required_conditions", {})
+            if not protocol or not required or str(profile.get("risk_level", "unknown")).casefold() not in {"low", "none"}:
+                prerequisites.extend(["검사 프로파일의 완전한 안전 절차 확인", "실제 소자·측정 단자 확인",
+                                      "정상 기준 및 출처 확인"])
+                safety_blocked = True
+            else:
+                # Safety is per component and per fault hypothesis. A free-text
+                # note or a generic power-off checkbox cannot satisfy this gate.
+                safety_blocked = False
+                missing_by_target = []
+                for target_id in scoped_ids:
+                    target_ready = False
+                    for fault_id in applies_to:
+                        condition_key = f"{target_id}|{fault_id}"
+                        actual = inspection_conditions.get(condition_key, {})
+                        if all(actual.get(field) == expected for field, expected in required.items()):
+                            target_ready = True
+                            break
+                    if not target_ready:
+                        safety_blocked = True
+                        missing_by_target.append(target_id)
+                if "power_state" in required:
+                    prerequisites.append("전원 분리 상태 확인" if safety_blocked else "전원 분리 확인됨")
+                if "stored_energy_status" in required:
+                    prerequisites.append("잔류 에너지 안전 확인" if safety_blocked else "잔류 에너지 안전 확인됨")
+                if "component_isolation_status" in required:
+                    prerequisites.append("측정 대상 분리 확인" if safety_blocked else "측정 대상 분리 확인됨")
+                prerequisites.extend(["실제 측정 단자·정상 기준 출처를 기록해야 함"])
+                if missing_by_target:
+                    prerequisites.append("해당 소자별 안전 상태가 아직 확인되지 않음")
         else:
             safety_blocked = risk not in {"none", "low"}
 

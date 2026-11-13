@@ -1686,6 +1686,53 @@ def _render_workflow_candidates(
                     if isinstance(current_result, dict) else [])
         if isinstance(row, dict) and row.get("measurement_id")
     }
+    inspection_conditions = {}
+    for target_row in registry.get("components", []) if isinstance(registry, dict) else []:
+        if not isinstance(target_row, dict):
+            continue
+        board_component_id = str(target_row.get("board_component_id") or "")
+        if not board_component_id:
+            continue
+        details = next((row for row in candidates
+                        if str(row.get("board_component_id") or "") == board_component_id), {})
+        fault_rows = details.get("fault_hypotheses", []) if isinstance(details, dict) else []
+        fault_ids = [str(row.get("fault_id") or "") for row in fault_rows if isinstance(row, dict)]
+        if not fault_ids:
+            fault_ids = [str(details.get("fault_id") or "general")]
+        for fault_id in fault_ids:
+            owner = f"{project.project_id}-{project.board_id or ''}-{board_component_id}-{fault_id}"
+            inspection_conditions[f"{board_component_id}|{fault_id}"] = {
+                "power_state": st.session_state.get(f"cc_v5_power_state_{owner}", "UNKNOWN"),
+                "stored_energy_status": st.session_state.get(f"cc_v5_stored_energy_{owner}", "UNKNOWN"),
+                "component_isolation_status": st.session_state.get(f"cc_v5_isolation_{owner}", "UNKNOWN"),
+                "measurement_location_verified": st.session_state.get(f"cc_v5_location_verified_{owner}", False),
+                "reference_source_verified": st.session_state.get(f"cc_v5_reference_verified_{owner}", False),
+            }
+            cycle_id = int((workflow.get("inspection_cycle") or {}).get("cycle_id", 0))
+            widget_instance = f"{project.project_id}_{board_component_id}_cycle{cycle_id}"
+            for test_id, test in knowledge.get("test_catalog", {}).get("tests", {}).items():
+                if not isinstance(test, dict) or test.get("type") != "visual_inspection":
+                    continue
+                inspection_conditions[f"{board_component_id}|{fault_id}|{test_id}"] = {
+                    "power_state": ("POWER_OFF_CONFIRMED" if st.session_state.get(
+                        f"cc_wf_visual_power_off_{widget_instance}_{test_id}") else "UNKNOWN"),
+                    "stored_energy_status": ("SAFE_CONFIRMED" if st.session_state.get(
+                        f"cc_wf_visual_energy_safe_{widget_instance}_{test_id}") else "UNKNOWN"),
+                }
+    cycle_id = int((workflow.get("inspection_cycle") or {}).get("cycle_id", 0))
+    for fault_id in [str(row.get("fault_id") or "") for row in (
+            current_result.get("hypotheses", []) if isinstance(current_result, dict) else [])
+            if isinstance(row, dict) and row.get("fault_id")]:
+        for test_id, test in knowledge.get("test_catalog", {}).get("tests", {}).items():
+            if not isinstance(test, dict) or test.get("type") != "visual_inspection" or test.get("target_scope") != "board":
+                continue
+            widget_instance = f"{project.project_id}_board_cycle{cycle_id}"
+            inspection_conditions[f"board|{fault_id}|{test_id}"] = {
+                "power_state": ("POWER_OFF_CONFIRMED" if st.session_state.get(
+                    f"cc_wf_visual_power_off_{widget_instance}_{test_id}") else "UNKNOWN"),
+                "stored_energy_status": ("SAFE_CONFIRMED" if st.session_state.get(
+                    f"cc_wf_visual_energy_safe_{widget_instance}_{test_id}") else "UNKNOWN"),
+            }
     active_plan = plan_active_inspections(
         hypotheses=current_result.get("hypotheses", []) if isinstance(current_result, dict) else [],
         component_candidates=(current_result.get("all_component_candidates",
@@ -1702,18 +1749,30 @@ def _render_workflow_candidates(
         ],
         observations=current_result.get("observations", {}) if isinstance(current_result, dict) else {},
         inspection_history=workflow.get("inspection_history", []), knowledge=knowledge,
+        inspection_conditions=inspection_conditions,
         allow_retest=allow_retest,
     )
     workflow["active_inspection_plan"] = active_plan
+    planner_rows = [*active_plan.get("candidates", []), *active_plan.get("blocked", [])]
     planned_targets = list(dict.fromkeys(
         str(component_id)
-        for item in active_plan.get("candidates", [])
+        for item in planner_rows
         for component_id in item.get("target_component_ids", [])
     ))
     if planned_targets:
         planned_rank = {component_id: index for index, component_id in enumerate(planned_targets)}
         targets.sort(key=lambda row: planned_rank.get(str(row.get("board_component_id") or ""),
                                                       len(planned_rank) + len(targets)))
+    planned_test_rank = {}
+    for plan_item in planner_rows:
+        for target_id in plan_item.get("target_component_ids", []):
+            planned_test_rank.setdefault(str(target_id), {})[str(plan_item.get("test_id"))] = len(planned_test_rank)
+    for target in targets:
+        ranks = planned_test_rank.get(str(target.get("board_component_id") or ""), {})
+        target.get("available_tests", []).sort(key=lambda item: (
+            ranks.get(str(item.get("test_id") or ""), len(ranks)),
+            str(item.get("test_id") or ""),
+        ))
     workflow["candidate_ids"] = [str(row.get("board_component_id") or row.get("component_id"))
                                   for row in candidates]
     workflow["inspection_targets"] = targets

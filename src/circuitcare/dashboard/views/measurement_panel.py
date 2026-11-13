@@ -259,6 +259,11 @@ def render_measurement_panel(
         reference_min = reference_max = reference_source = reference_source_id = ""
         reference_status = "UNVERIFIED"
         operating_conditions = reference_conditions = ""
+        measurement_conditions = {
+            "power_state": "UNKNOWN",
+            "stored_energy_status": "UNKNOWN",
+            "component_isolation_status": "UNKNOWN",
+        }
         location_verified = False
         source_label = SOURCE_OPTIONS[0]
         if compact:
@@ -267,6 +272,18 @@ def render_measurement_panel(
                 "측정 조건 (선택)", key=f"cc_v5_condition_{owner}",
                 placeholder="예: 전원 차단, 주변 온도",
             )
+        st.caption("안전 상태는 선택한 검사에 필요한 조건을 모두 확인해야 저장 기록이 검증 후보가 됩니다.")
+        measurement_conditions = {
+            "power_state": st.selectbox("전원 상태", ("UNKNOWN", "POWER_OFF_CONFIRMED", "POWER_ON_CONFIRMED"),
+                format_func=lambda value: {"UNKNOWN": "미확인", "POWER_OFF_CONFIRMED": "전원 분리 확인", "POWER_ON_CONFIRMED": "전원 연결됨"}[value],
+                key=f"cc_v5_power_state_{owner}"),
+            "stored_energy_status": st.selectbox("잔류 에너지", ("UNKNOWN", "SAFE_CONFIRMED", "NOT_SAFE_OR_UNKNOWN"),
+                format_func=lambda value: {"UNKNOWN": "미확인", "SAFE_CONFIRMED": "안전 확인 완료", "NOT_SAFE_OR_UNKNOWN": "안전 확인 불가/위험"}[value],
+                key=f"cc_v5_stored_energy_{owner}"),
+            "component_isolation_status": st.selectbox("소자 분리 상태", ("UNKNOWN", "ISOLATED_CONFIRMED", "NOT_ISOLATED"),
+                format_func=lambda value: {"UNKNOWN": "미확인", "ISOLATED_CONFIRMED": "측정 대상 분리 확인", "NOT_ISOLATED": "회로에 연결됨"}[value],
+                key=f"cc_v5_isolation_{owner}"),
+        }
         with st.expander("가설 검증 정보 추가" if compact else "검증 정보 · 정상 범위 · 출처", expanded=False):
             uncertainty = st.text_input(
                 f"측정 불확실도 σ ({BASE_UNITS[measurement_type]})",
@@ -297,6 +314,15 @@ def render_measurement_panel(
                 source_label = st.selectbox("측정 출처", SOURCE_OPTIONS, key=f"cc_v5_source_{owner}")
             else:
                 st.caption("검사 기준·출처 등 검증 정보가 부족하면 기록은 남지만 판정은 보류됩니다.")
+        reference_source_verified = bool(
+            reference_status in {"DATASHEET_VERIFIED", "BOARD_SPEC_VERIFIED"}
+            and str(reference_min).strip() and str(reference_max).strip()
+            and str(reference_source).strip() and str(reference_source_id).strip()
+        )
+        measurement_conditions.update({
+            "measurement_location_verified": bool(location_verified),
+            "reference_source_verified": reference_source_verified,
+        })
         submitted = st.form_submit_button("측정 기록 저장", type="primary")
     if submitted:
         try:
@@ -334,8 +360,11 @@ def render_measurement_panel(
                 reference_conditions=reference_conditions,
                 location_verified=location_verified,
                 uncertainty_source=uncertainty_source,
+                measurement_conditions=measurement_conditions,
             )
             save_measurement(st.session_state, record)
+            st.session_state[f"cc_v5_location_verified_{owner}"] = bool(location_verified)
+            st.session_state[f"cc_v5_reference_verified_{owner}"] = reference_source_verified
             st.success("측정 기록을 저장했습니다. 저장은 측정 검증 완료를 뜻하지 않습니다.")
             st.rerun()
         except ValueError as exc:
@@ -447,6 +476,21 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
             if edit_type == record.measurement_type and record.uncertainty is not None:
                 sigma_default = f"{record.uncertainty:g}"
             with st.expander("고급 검증 조건 수정", expanded=False):
+                previous_conditions = record.measurement_conditions or {}
+                measurement_conditions = {
+                    "power_state": st.selectbox("전원 상태", ("UNKNOWN", "POWER_OFF_CONFIRMED", "POWER_ON_CONFIRMED"),
+                        index=("UNKNOWN", "POWER_OFF_CONFIRMED", "POWER_ON_CONFIRMED").index(previous_conditions.get("power_state", "UNKNOWN")),
+                        format_func=lambda value: {"UNKNOWN": "미확인", "POWER_OFF_CONFIRMED": "전원 분리 확인", "POWER_ON_CONFIRMED": "전원 연결됨"}[value],
+                        key=f"cc_v5_edit_power_state_{record.measurement_id}"),
+                    "stored_energy_status": st.selectbox("잔류 에너지", ("UNKNOWN", "SAFE_CONFIRMED", "NOT_SAFE_OR_UNKNOWN"),
+                        index=("UNKNOWN", "SAFE_CONFIRMED", "NOT_SAFE_OR_UNKNOWN").index(previous_conditions.get("stored_energy_status", "UNKNOWN")),
+                        format_func=lambda value: {"UNKNOWN": "미확인", "SAFE_CONFIRMED": "안전 확인 완료", "NOT_SAFE_OR_UNKNOWN": "안전 확인 불가/위험"}[value],
+                        key=f"cc_v5_edit_stored_energy_{record.measurement_id}"),
+                    "component_isolation_status": st.selectbox("소자 분리 상태", ("UNKNOWN", "ISOLATED_CONFIRMED", "NOT_ISOLATED"),
+                        index=("UNKNOWN", "ISOLATED_CONFIRMED", "NOT_ISOLATED").index(previous_conditions.get("component_isolation_status", "UNKNOWN")),
+                        format_func=lambda value: {"UNKNOWN": "미확인", "ISOLATED_CONFIRMED": "측정 대상 분리 확인", "NOT_ISOLATED": "회로에 연결됨"}[value],
+                        key=f"cc_v5_edit_isolation_{record.measurement_id}"),
+                }
                 uncertainty = st.text_input(
                     f"불확실도 σ ({BASE_UNITS[edit_type]})", value=sigma_default,
                     key=f"cc_v5_edit_sigma_{record.measurement_id}",
@@ -519,6 +563,15 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
                     "측정 지점이 지정 단자임을 확인함", value=record.location_verified,
                     key=f"cc_v5_edit_location_{record.measurement_id}",
                 )
+            reference_source_verified = bool(
+                reference_status in {"DATASHEET_VERIFIED", "BOARD_SPEC_VERIFIED"}
+                and str(reference_min).strip() and str(reference_max).strip()
+                and str(reference_source).strip() and str(reference_source_id).strip()
+            )
+            measurement_conditions.update({
+                "measurement_location_verified": bool(location_verified),
+                "reference_source_verified": reference_source_verified,
+            })
             edit = st.form_submit_button("변경 저장")
             delete = st.form_submit_button("측정값 삭제")
         if edit:
@@ -545,6 +598,7 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
                     reference_conditions=reference_conditions,
                     location_verified=location_verified,
                     uncertainty_source=uncertainty_source,
+                    measurement_conditions=measurement_conditions,
                 )
                 updated = replace(
                     updated, board_component_id=record.board_component_id,
@@ -558,6 +612,8 @@ def _render_record_editor(st: Any, *, project: ProjectContext, record: Measureme
                 )
                 updated = replace(updated, changed_at=datetime.now(timezone.utc).isoformat())
                 update_measurement(st.session_state, updated)
+                st.session_state[f"cc_v5_location_verified_{owner}"] = bool(location_verified)
+                st.session_state[f"cc_v5_reference_verified_{owner}"] = reference_source_verified
                 st.success("측정 기록을 수정했습니다. 기존 진단 결과는 무효화되었습니다.")
                 st.rerun()
             except ValueError as exc:

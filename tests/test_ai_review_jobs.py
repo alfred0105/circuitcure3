@@ -10,7 +10,7 @@ def test_ai_review_worker_uses_isolated_state_adapter_and_returns_result(monkeyp
 
     observed = {}
 
-    def fake_review(api, *, image_bytes, scope, rows, records_key, progress):
+    def fake_review(api, *, image_bytes, scope, rows, records_key, progress, selected_component_ids=None):
         observed["thread"] = current_thread().name
         observed["api_type"] = type(api).__name__
         observed["image_bytes"] = image_bytes
@@ -23,7 +23,7 @@ def test_ai_review_worker_uses_isolated_state_adapter_and_returns_result(monkeyp
     result = ai_review_jobs._run({
         "state": {"cc_rows": [{"component_id": "c1"}]}, "image_bytes": b"image",
         "scope": "scope", "rows": [{"component_id": "c1"}],
-        "records_key": "cc_rows", "fingerprint": "fp",
+        "records_key": "cc_rows", "fingerprint": "fp", "selected_component_ids": ["c1"],
     })
     assert observed == {"thread": current_thread().name, "api_type": "_WorkerAPI",
                         "image_bytes": b"image", "scope": "scope"}
@@ -142,8 +142,11 @@ def test_commit_merges_ai_evidence_after_user_edit_without_overwriting_review_or
     job = {"status": "COMPLETE", "job_id": job_id, "fingerprint": fingerprint,
            "review_fingerprint": state[f"cc_ai_review_job_review_fingerprint_{scope}"],
            "user_version": _review_user_version(worker_rows), "duration_ms": 12,
+           "selected_component_ids": ["r1"],
            "state": {records_key: worker_rows,
                      review_aux_keys(scope)[1]: {"source_fingerprint": fingerprint,
+                                                   "review_mode": "selected_class_only",
+                                                   "selected_component_ids": ["r1"],
                                                    "verification_status": "AI_SUGGESTIONS_ONLY"}}}
     monkeypatch.setattr(unified_workspace, "get_ai_review_job", lambda **_kwargs: job)
     assert unified_workspace._commit_review_job(type("St", (), {"session_state": state})(), scope=scope)
@@ -180,9 +183,11 @@ def test_commit_accepts_ocr_evidence_created_inside_the_same_review_job(monkeypa
              f"cc_ai_review_job_ocr_fingerprint_{scope}": _ocr_evidence_fingerprint(None)}
     job = {"status": "COMPLETE", "job_id": "job-ocr", "fingerprint": fingerprint,
            "review_fingerprint": review_fingerprint, "user_version": _review_user_version(rows),
-           "duration_ms": 20,
+           "duration_ms": 20, "selected_component_ids": ["r1"],
            "state": {records_key: worker_rows, ocr_key: ocr_result,
-                     qwen_key: {"verification_status": "AI_SUGGESTIONS_ONLY"}}}
+                     qwen_key: {"verification_status": "AI_SUGGESTIONS_ONLY",
+                                "review_mode": "selected_class_only",
+                                "selected_component_ids": ["r1"]}}}
     monkeypatch.setattr(unified_workspace, "get_ai_review_job", lambda **_kwargs: job)
     assert unified_workspace._commit_review_job(type("St", (), {"session_state": state})(), scope=scope)
     assert state[f"cc_ai_review_job_status_{scope}"] == "COMPLETE"

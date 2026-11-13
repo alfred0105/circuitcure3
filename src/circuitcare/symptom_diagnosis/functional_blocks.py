@@ -33,6 +33,10 @@ def analyze_functional_blocks(
         component_id = component.get("component_id")
         kind = str(component.get("component_type", "unknown"))
         own_roles = set(taxonomy.get(kind, []))
+        own_roles.update(str(role) for role in component.get("confirmed_functional_roles", [])
+                         if str(role).strip())
+        own_roles.update(str(role) for role in component.get("ai_suggested_functional_roles", [])
+                         if str(role).strip())
         identity = None
         if kind == "ic" and component.get("ocr_marking"):
             identity = resolve_ic_identity(str(component["ocr_marking"]), ic_catalog)
@@ -127,39 +131,108 @@ def build_functional_block_groups(
     roles_by_id = {str(row.get("component_id")): row for row in component_roles
                    if isinstance(row, dict) and row.get("component_id")}
     groups: list[dict[str, Any]] = []
-    for role in ("power", "control", "control_timing", "control_input", "input",
-                 "output", "driver", "protection", "thermal", "buzzer", "relay"):
-        members = []
-        for component in components:
-            component_id = str(component.get("board_component_id") or component.get("component_id") or "")
-            role_row = roles_by_id.get(component_id, {})
-            if (str(component.get("component_type") or "").casefold() == "not_component"
-                    or str(component.get("presence_status") or "").upper() == "EXCLUDED"):
+    valid_components = [component for component in components if isinstance(component, dict)
+                        and str(component.get("component_type") or "").casefold() != "not_component"
+                        and str(component.get("presence_status") or "").upper() != "EXCLUDED"]
+    board_points = []
+    for component in valid_components:
+        box = component.get("bbox_xyxy", component.get("bbox"))
+        if isinstance(box, (list, tuple)) and len(box) == 4:
+            try:
+                board_points.append(((float(box[0]) + float(box[2])) / 2,
+                                     (float(box[1]) + float(box[3])) / 2))
+            except (TypeError, ValueError, OverflowError):
                 continue
+    board_diagonal = (max(hypot(max(point[0] for point in board_points) - min(point[0] for point in board_points),
+                                max(point[1] for point in board_points) - min(point[1] for point in board_points)), 1.0)
+                      if board_points else 1.0)
+    for role in ("power", "control", "control_timing", "control_input", "input",
+                 "output", "driver", "protection", "thermal", "buzzer", "relay", "input_output"):
+        members = []
+        for component in valid_components:
+            component_id = str(component.get("board_component_id") or component.get("component_id") or "")
+            if not component_id:
+                continue
+            role_row = roles_by_id.get(component_id, {})
             if role not in role_row.get("candidate_blocks", []):
                 continue
+            identity_verified = (
+                str(component.get("component_type_status") or "").upper() == "USER_CONFIRMED"
+                and str(component.get("presence_status") or "").upper() in {"CONFIRMED", "USER_CONFIRMED"}
+            )
+            role_verified = role in {str(value) for value in component.get("confirmed_functional_roles", [])}
+            role_source = ("USER_CONFIRMED" if role_verified else
+                           "AI_SUGGESTED" if role in {str(value) for value in component.get("ai_suggested_functional_roles", [])}
+                           else "INFERRED")
+            box = component.get("bbox_xyxy", component.get("bbox"))
+            center = None
+            if isinstance(box, (list, tuple)) and len(box) == 4:
+                try:
+                    center = ((float(box[0]) + float(box[2])) / 2,
+                              (float(box[1]) + float(box[3])) / 2)
+                except (TypeError, ValueError, OverflowError):
+                    center = None
             members.append({"board_component_id": str(component.get("board_component_id") or component_id),
                             "component_id": component_id,
                             "component_type": component.get("component_type", "unknown"),
-                            "evidence_status": ("VERIFIED" if str(component.get("component_type_status") or "").upper() == "USER_CONFIRMED"
-                                                and str(component.get("presence_status") or "").upper() in {"CONFIRMED", "USER_CONFIRMED"}
-                                                else "UNKNOWN"),
+                            "identity_status": "VERIFIED" if identity_verified else "UNKNOWN",
+                            "evidence_status": "VERIFIED" if identity_verified else "UNKNOWN",
+                            "role_status": role_source,
+                            "role_verified": role_verified,
                             "photo_id": component.get("photo_id"),
-                            "bbox_xyxy": component.get("bbox_xyxy", component.get("bbox")),
-                            "role_evidence": role_row.get("role_evidence", {}).get(role, [])})
+                            "bbox_xyxy": box, "center_xy": center,
+                            "ocr_marking": component.get("ocr_marking"),
+                            "reference_designators": list(component.get("reference_designators", [])),
+                            "role_evidence": list(role_row.get("role_evidence", {}).get(role, [])),
+                            "functional_instance_id": component.get("functional_instance_id")})
         if not members:
             continue
-        member_ids = sorted({row["board_component_id"] for row in members})
-        seed = json.dumps([role, member_ids], ensure_ascii=False, separators=(",", ":"))
-        block_id = f"block-{hashlib.sha256(seed.encode()).hexdigest()[:12]}"
-        evidence = list(dict.fromkeys(text for member in members for text in member["role_evidence"]))
-        groups.append({"block_id": block_id, "functional_block_id": block_id, "role": role,
-                       "title": role.replace("_", " ").title(), "component_ids": member_ids,
-                       "board_component_ids": member_ids, "members": members,
-                       "supporting_evidence": evidence, "opposing_evidence": [],
-                       "verification_status": "INFERRED", "status": "INFERRED",
-                       "verified": False, "connectivity_status": "NOT_INFERRED",
-                       "unknown_connectivity_component_ids": member_ids,
-                       "unverified_relations": [],
-                       "connectivity_note": "역할 그룹은 전기적 연결 관계를 의미하지 않습니다."})
+        # Use explicit instance labels first. Otherwise, cluster only with a
+        # conservative complete-link distance rule; proximity is grouping
+        # evidence, never proof of electrical connectivity. Without coordinates
+        # keep separate unresolved instances instead of merging by role alone.
+        diagonal = board_diagonal
+        clusters: list[list[dict[str, Any]]] = []
+        named_clusters: dict[str, list[dict[str, Any]]] = {}
+        for member in members:
+            instance_id = str(member.get("functional_instance_id") or "").strip()
+            if instance_id:
+                named_clusters.setdefault(instance_id, []).append(member)
+            else:
+                clusters.append([member])
+        clusters.extend(named_clusters[key] for key in sorted(named_clusters))
+        located = [cluster for cluster in clusters if all(member.get("center_xy") for member in cluster)]
+        unlocated = [cluster for cluster in clusters if cluster not in located]
+        merged: list[list[dict[str, Any]]] = []
+        for cluster in sorted(located, key=lambda group: group[0]["component_id"]):
+            for existing in merged:
+                if all(hypot(left["center_xy"][0] - right["center_xy"][0],
+                             left["center_xy"][1] - right["center_xy"][1]) / diagonal <= 0.12
+                       for left in cluster for right in existing):
+                    existing.extend(cluster)
+                    break
+            else:
+                merged.append(list(cluster))
+        clusters = merged + unlocated
+        for cluster in clusters:
+            cluster.sort(key=lambda row: row["component_id"])
+            member_ids = sorted({row["board_component_id"] for row in cluster})
+            seed = json.dumps([role, member_ids], ensure_ascii=False, separators=(",", ":"))
+            block_id = f"block-{hashlib.sha256(seed.encode()).hexdigest()[:12]}"
+            evidence = list(dict.fromkeys(text for member in cluster for text in member["role_evidence"]))
+            role_verified = bool(cluster) and all(member["role_verified"] for member in cluster)
+            partition_status = ("EXPLICIT_INSTANCE" if all(member.get("functional_instance_id") for member in cluster)
+                                else "LAYOUT_CLUSTER" if all(member.get("center_xy") for member in cluster)
+                                else "UNRESOLVED_NO_POSITION")
+            groups.append({"block_id": block_id, "functional_block_id": block_id, "role": role,
+                           "title": role.replace("_", " ").title(), "component_ids": member_ids,
+                           "board_component_ids": member_ids, "members": cluster,
+                           "supporting_evidence": evidence, "opposing_evidence": [],
+                           "verification_status": "VERIFIED" if role_verified else "INFERRED",
+                           "status": "VERIFIED" if role_verified else "INFERRED",
+                           "verified": role_verified, "partition_status": partition_status,
+                           "connectivity_status": "NOT_INFERRED",
+                           "unknown_connectivity_component_ids": member_ids,
+                           "unverified_relations": [],
+                           "connectivity_note": "역할 그룹은 전기적 연결 관계를 의미하지 않습니다."})
     return groups

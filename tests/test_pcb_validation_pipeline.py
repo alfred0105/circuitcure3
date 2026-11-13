@@ -59,6 +59,34 @@ def test_conflicting_valid_measurements_are_conflicted_but_missing_requirements_
     assert "측정 지점 확인 전" in next(iter(outcome.values()))["reason"]
 
 
+def test_structured_power_state_rejects_negated_or_unconfirmed_safety_text():
+    profiles = {"profiles": {"resistor": {"tests": {"resistance": {
+        "measurement_type": "resistance", "target_keywords": ["A-B"],
+        "required_conditions": {"power_state": "POWER_OFF_CONFIRMED",
+                                "stored_energy_status": "SAFE_CONFIRMED",
+                                "component_isolation_status": "ISOLATED_CONFIRMED"},
+        "safety_protocol": "DEENERGIZED_ISOLATED_PASSIVE",
+        "fault_relations": {"R_FAIL": {"TEST_NORMAL": "refutes", "TEST_ABNORMAL": "supports"}},
+    }}}}}
+    unsafe = _measurement()
+    unsafe["measurement_conditions"] = {
+        "power_state": "POWER_ON_CONFIRMED",
+        "stored_energy_status": "UNKNOWN",
+        "component_isolation_status": "NOT_ISOLATED",
+    }
+    unsafe["operating_conditions"] = "전원 차단 안 함"
+    assert "전원 차단 상태 확인 전" in measurement_verification_gaps(unsafe, profiles=profiles)
+    assert "잔류 에너지 안전 확인 전" in measurement_verification_gaps(unsafe, profiles=profiles)
+    assert "측정 대상 분리 상태 확인 전" in measurement_verification_gaps(unsafe, profiles=profiles)
+    unsafe["measurement_conditions"] = {
+        "power_state": "POWER_OFF_CONFIRMED",
+        "stored_energy_status": "SAFE_CONFIRMED",
+        "component_isolation_status": "ISOLATED_CONFIRMED",
+    }
+    safe_gaps = measurement_verification_gaps(unsafe, profiles=profiles)
+    assert not any("안전 확인 전" in gap or "전원 차단 상태 확인 전" in gap for gap in safe_gaps)
+
+
 def test_observation_fingerprint_blocks_same_photo_reused_id_after_redetection():
     base = {"version": "v1", "image_fingerprint": "photo-sha", "review_version": "review1",
             "registry_components": [{"component_id": "R1", "component_type": "resistor",

@@ -965,8 +965,65 @@ def _apply_qwen_pcb_assist(
                                           "failure_category": category, "error": message[:400]}
     qwen_proposals = result.get("qwen_fault_proposals", {}).get("proposals", [])
     if qwen_proposals:
+        # Feed validated Qwen role hints into the structural hypothesis view,
+        # but keep them explicitly AI_SUGGESTED and separate from rule ranks.
+        component_by_id = {str(row.get("component_id")): row for row in components
+                           if isinstance(row, dict) and row.get("component_id")}
+        groups = result.setdefault("functional_block_groups", [])
+        role_rows = {str(row.get("component_id")): row for row in result.get("functional_blocks", [])
+                     if isinstance(row, dict) and row.get("component_id")}
+        suggested_groups = []
+        allowed_roles = {"power", "input", "control", "control_input", "control_timing",
+                         "driver", "output", "protection", "thermal", "buzzer", "relay"}
+        for proposal in qwen_proposals:
+            component_id = str(proposal.get("component_id") or "")
+            role = str(proposal.get("functional_block") or "UNKNOWN")
+            component = component_by_id.get(component_id)
+            if not component or role not in allowed_roles:
+                continue
+            role_row = role_rows.get(component_id)
+            if role_row is not None:
+                role_row["ai_suggested_functional_roles"] = list(dict.fromkeys([
+                    *role_row.get("ai_suggested_functional_roles", []), role]))
+                role_row["candidate_blocks"] = list(dict.fromkeys([
+                    *role_row.get("candidate_blocks", []), role]))
+                role_row.setdefault("role_evidence", {}).setdefault(role, []).append(
+                    "Qwen 기능 역할 제안 · 사용자 확인 전")
+            block_id = str(proposal.get("functional_block_id") or "")
+            existing_group = next((row for row in groups
+                                   if str(row.get("block_id") or "") == block_id
+                                   and row.get("role") == role), None) if block_id else None
+            member = {"component_id": component_id,
+                      "board_component_id": str(component.get("board_component_id") or component_id),
+                      "component_type": component.get("component_type", component.get("type", "unknown")),
+                      "identity_status": "VERIFIED" if component.get("component_type_status") == "USER_CONFIRMED" else "UNKNOWN",
+                      "evidence_status": "UNKNOWN", "role_status": "AI_SUGGESTED",
+                      "role_verified": False, "role_evidence": ["Qwen 기능 역할 제안 · 사용자 확인 전"]}
+            if existing_group is not None:
+                if component_id not in existing_group.get("component_ids", []):
+                    existing_group.setdefault("component_ids", []).append(component_id)
+                    existing_group.setdefault("board_component_ids", []).append(member["board_component_id"])
+                    existing_group.setdefault("members", []).append(member)
+                existing_group["verification_status"] = "INFERRED"
+                existing_group["verified"] = False
+            else:
+                seed = json.dumps([role, component_id, "qwen"], ensure_ascii=False, separators=(",", ":"))
+                ai_block_id = "ai-block-" + hashlib.sha256(seed.encode()).hexdigest()[:12]
+                suggested_groups.append({"block_id": ai_block_id, "functional_block_id": ai_block_id,
+                    "role": role, "title": role.replace("_", " ").title(),
+                    "component_ids": [component_id], "board_component_ids": [member["board_component_id"]],
+                    "members": [member], "supporting_evidence": ["Qwen 기능 역할 제안 · 사용자 확인 전"],
+                    "opposing_evidence": [], "verification_status": "AI_SUGGESTED",
+                    "status": "AI_SUGGESTED", "verified": False, "partition_status": "AI_SUGGESTED",
+                    "connectivity_status": "NOT_INFERRED", "unknown_connectivity_component_ids": [component_id],
+                    "unverified_relations": [],
+                    "connectivity_note": "AI 역할 제안은 전기적 연결을 의미하지 않습니다."})
+        existing_group_ids = {str(row.get("block_id")) for row in groups if isinstance(row, dict)}
+        groups.extend(row for row in suggested_groups if row["block_id"] not in existing_group_ids)
         ledger_rows = [*result.get("evidence_ledger", []), *build_evidence_ledger(
             ai_suggestions=qwen_proposals,
+            functional_roles=[row for row in role_rows.values()],
+            functional_blocks=groups,
             source_version=str(result.get("input_fingerprint") or "") or None)]
         result["evidence_ledger"] = list({row["evidence_id"]: row for row in ledger_rows}.values())
     result["candidate_fusion"] = fuse_inspection_candidates(

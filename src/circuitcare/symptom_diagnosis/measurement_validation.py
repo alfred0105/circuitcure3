@@ -79,9 +79,31 @@ def measurement_verification_gaps(
             target = str(get("measurement_target") or get("measurement_location") or "").casefold()
             if not any(str(term).casefold() in target for term in test_profile.get("target_keywords", [])):
                 gaps.append("측정 대상이 검사 프로파일에 지정된 단자/위치와 맞지 않습니다.")
-            condition_text = str(conditions).casefold()
-            if not any(str(term).casefold() in condition_text for term in test_profile.get("condition_keywords", [])):
-                gaps.append("운전 조건이 검사 프로파일에서 요구하는 조건을 포함하지 않습니다.")
+            required_conditions = test_profile.get("required_conditions", {})
+            actual_conditions = get("measurement_conditions")
+            if required_conditions:
+                actual_conditions = actual_conditions if isinstance(actual_conditions, dict) else {}
+                for field, required in required_conditions.items():
+                    if actual_conditions.get(field) != required:
+                        labels = {
+                            "power_state": "전원 차단 상태 확인 전",
+                            "stored_energy_status": "잔류 에너지 안전 확인 전",
+                            "component_isolation_status": "측정 대상 분리 상태 확인 전",
+                            "measurement_location_verified": "측정 위치·단자 확인 전",
+                            "reference_source_verified": "검증된 정상 기준·출처 입력 전",
+                        }
+                        gaps.append(labels.get(field, f"측정 안전 조건 미충족 · {field}"))
+            elif test_profile.get("condition_keywords"):
+                # Legacy profiles used free text. Exact token matching avoids
+                # treating negated phrases such as '전원 차단 안 함' as safe.
+                condition_values = {str(value).strip().casefold() for value in
+                                    (conditions if isinstance(conditions, (list, tuple, set)) else [conditions])
+                                    if value is not None}
+                if not condition_values.intersection(str(term).strip().casefold()
+                                                     for term in test_profile.get("condition_keywords", [])):
+                    gaps.append("운전 조건이 검사 프로파일에서 요구하는 조건을 포함하지 않습니다.")
+            if test_profile.get("requires_reference_verification") and get("reference_verification_status") not in VERIFIED_REFERENCE_STATES:
+                gaps.append("검사 프로파일 기준 출처 확인 전")
             fault = str(get("fault_hypothesis") or "")
             if fault not in test_profile.get("fault_relations", {}):
                 gaps.append("이 검사 항목은 선택한 고장 가설을 판별하지 않습니다.")

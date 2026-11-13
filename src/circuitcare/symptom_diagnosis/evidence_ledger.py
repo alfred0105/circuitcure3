@@ -15,6 +15,7 @@ def build_evidence_ledger(
     conflicts: list[dict[str, Any]] | None = None,
     components: list[dict[str, Any]] | None = None,
     functional_blocks: list[dict[str, Any]] | None = None,
+    functional_roles: list[dict[str, Any]] | None = None,
     measurements: list[dict[str, Any]] | None = None,
     ai_suggestions: list[dict[str, Any]] | None = None,
     source_version: str | None = None,
@@ -85,13 +86,38 @@ def build_evidence_ledger(
             append("ocr_candidate", component_id, candidate, "rapidocr", "UNKNOWN",
                    str(item.get("ocr_version") or "") or None)
 
+    for item in functional_roles or []:
+        if not isinstance(item, dict):
+            continue
+        component_id = str(item.get("board_component_id") or item.get("component_id") or "")
+        if not component_id:
+            continue
+        confirmed_roles = {str(value) for value in item.get("confirmed_functional_roles", [])}
+        suggested_roles = {str(value) for value in item.get("ai_suggested_functional_roles", [])}
+        evidence_by_role = item.get("role_evidence", {})
+        for role in item.get("candidate_blocks", []):
+            role = str(role)
+            status = ("VERIFIED" if role in confirmed_roles else
+                      "AI_SUGGESTED" if role in suggested_roles else "INFERRED")
+            append("component_functional_role", component_id,
+                   {"role": role, "role_status": status,
+                    "evidence": list(evidence_by_role.get(role, [])) if isinstance(evidence_by_role, dict) else []},
+                   "user" if status == "VERIFIED" else "qwen" if status == "AI_SUGGESTED" else "rule_and_layout_inference",
+                   status, str(item.get("role_observation_id") or component_id) or None,
+                   str(item.get("role_version") or item.get("observation_version") or "") or None)
+
     for item in functional_blocks or []:
         if not isinstance(item, dict):
             continue
-        for component_id in item.get("component_ids", []):
-            append("functional_role", str(component_id), {"block_id": item.get("block_id"),
-                   "role": item.get("role")}, "rule_and_layout_inference", "INFERRED",
-                   str(item.get("block_id") or "") or None)
+        block_id = str(item.get("block_id") or item.get("functional_block_id") or "")
+        if item.get("component_ids"):
+            for component_id in item.get("component_ids", []):
+                append("functional_block_membership", str(component_id),
+                       {"block_id": block_id, "role": item.get("role"),
+                        "partition_status": item.get("partition_status"),
+                        "connectivity_status": "NOT_INFERRED"},
+                       "functional_block_builder", "VERIFIED" if item.get("verified") is True else "INFERRED",
+                       block_id or None, str(item.get("version") or "") or None)
 
     for item in ai_suggestions or []:
         if isinstance(item, dict):

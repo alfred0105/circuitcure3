@@ -62,7 +62,7 @@ def test_qwen_review_validates_detection_ids_and_unverified_boxes():
             self.images = None
             self.schema = None
 
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             self.images = images
             self.schema = output_schema
             return {"model": "qwen3.5:9b", "content": {
@@ -120,7 +120,7 @@ def test_silkscreen_reference_is_attached_as_class_hint_not_applied_as_fact():
     assert rows[0]["ocr_association_status"] == "ASSOCIATED"
 
 
-def test_ai_review_runs_ocr_then_qwen_without_running_yolo(monkeypatch):
+def test_selected_box_review_runs_qwen_without_repeating_ocr_or_yolo(monkeypatch):
     from contextlib import nullcontext
     from types import SimpleNamespace
     import circuitcare.vision.component_recognition_panel as panel
@@ -130,22 +130,21 @@ def test_ai_review_runs_ocr_then_qwen_without_running_yolo(monkeypatch):
     rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
              "신뢰도": .8, "x1": 2, "y1": 2, "x2": 20, "y2": 18}]
     monkeypatch.setattr(panel, "_app_server", lambda: (_ for _ in ()).throw(AssertionError("YOLO called")))
-    def run_ocr(_image):
-        calls.append("ocr")
-        return {"records": []}
-
     def run_qwen(*_args, **_kwargs):
         calls.append("qwen")
-        return {"class_reviews": [], "duplicate_reviews": [], "missed_component_candidates": [], "notes": []}
+        return {"class_reviews": [], "review_image_count": 1,
+                "ollama_metrics": {"total_duration_ns": 0}}
 
-    monkeypatch.setattr("circuitcare.vision.ocr_backend.run_local_ocr", run_ocr)
+    monkeypatch.setattr("circuitcare.vision.ocr_backend.run_local_ocr",
+                        lambda _image: (_ for _ in ()).throw(AssertionError("OCR reran")))
     monkeypatch.setattr("circuitcare.vision.ai_review_service.review_components_with_qwen", run_qwen)
     monkeypatch.setattr("circuitcare.local_llm.OllamaClient", lambda **_kwargs: object())
     st_api = SimpleNamespace(session_state=state, spinner=lambda *_args, **_kwargs: nullcontext(), warning=lambda *_args: None)
     _run_ai_review_workflow(st_api, image_bytes=_png(), scope="scope", rows=rows,
-                            records_key="records", ocr_key="ocr", qwen_key="qwen")
-    assert calls == ["ocr", "qwen"]
-    assert state["records"][0]["component_id"] == "r1"
+                            records_key="records", ocr_key="ocr", qwen_key="qwen",
+                            selected_component_ids=["r1"])
+    assert calls == ["qwen"]
+    assert state["qwen"]["review_mode"] == "selected_class_only"
 
 
 def test_shared_component_taxonomy_matches_detection_review_and_ui():
@@ -175,7 +174,7 @@ def test_removing_second_pass_migrates_existing_reviewed_and_added_boxes():
 
 def test_qwen_uncertain_class_stays_unknown_and_weak_ocr_hint_is_preserved_as_conflict(monkeypatch):
     class TaxonomyClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             allowed = output_schema["properties"]["class_reviews"]["items"]["properties"]["proposed_class"]["enum"]
             assert set(allowed) == set(QWEN_REVIEW_CLASSES)
             return {"model": "qwen3.5:9b", "content": {
@@ -209,7 +208,7 @@ def test_qwen_extension_taxonomy_does_not_change_yolo_18_classes_and_validates_s
                for subtypes in QWEN_SUBTYPES.values() for subtype in subtypes)
 
     class ExtensionClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             return {"model": "qwen3.5:9b", "content": {
                 "class_reviews": [{"detection_id": "j1", "decision": "suggest",
                     "proposed_class": "other_component", "proposed_base_class": "other_component",
@@ -237,7 +236,7 @@ def test_qwen_extension_taxonomy_does_not_change_yolo_18_classes_and_validates_s
 @pytest.mark.parametrize(("detector_class", "qwen_class"), [("ic", "connector"), ("connector", "ic")])
 def test_qwen_class_review_can_reclassify_ic_connector_both_directions(detector_class, qwen_class):
     class IndependentVisionClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             return {"model": "qwen3.5:9b", "content": {"class_reviews": [{
                 "detection_id": "d1", "detector_class": detector_class,
                 "decision": "suggest", "proposed_class": qwen_class,
@@ -281,7 +280,7 @@ def test_duplicate_candidate_search_can_include_pairs_across_review_batches():
 
 def test_qwen_duplicate_pair_override_uses_crops_for_cross_batch_ids():
     class PairClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             payload = _messages[1]["content"]
             import json
             data = json.loads(payload.split("\n", 1)[1])
@@ -305,7 +304,7 @@ def test_qwen_duplicate_pair_override_uses_crops_for_cross_batch_ids():
 
 def test_duplicate_only_review_uses_pair_crops_without_repeating_class_or_tile_review():
     class PairOnlyClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             payload = json.loads(_messages[1]["content"].split("\n", 1)[1])
             assert "do not omit a pair" in _messages[1]["content"]
             assert output_schema["properties"]["class_reviews"]["maxItems"] == 0
@@ -475,7 +474,7 @@ def test_qwen_still_checks_full_photo_when_yolo_has_no_boxes():
         def __init__(self):
             self.called = False
 
-        def chat_json(self, _model, messages, *, output_schema, images):
+        def chat_json(self, _model, messages, *, output_schema, images, output_budget=None):
             self.called = True
             payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
             assert payload["detector_proposals"] == []
@@ -495,7 +494,7 @@ def test_qwen_still_checks_full_photo_when_yolo_has_no_boxes():
 
 def test_qwen_receives_overlapping_native_resolution_tiles_and_maps_tile_box():
     class TileClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             assert len(images) > 1
             return {"model": "qwen3.5:9b", "content": {
                 "class_reviews": [], "duplicate_reviews": [],
@@ -519,7 +518,7 @@ def test_class_review_avoids_redundant_tiles_and_duplicate_pair_crops_on_native_
             self.images = None
             self.schema = None
 
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             self.images = images
             self.schema = output_schema
             return {"model": "qwen3.5:9b", "content": {
@@ -550,7 +549,7 @@ def test_ai_review_prompt_bounds_ocr_candidate_count_and_text_size():
         def __init__(self):
             self.messages = None
 
-        def chat_json(self, _model, messages, *, output_schema, images):
+        def chat_json(self, _model, messages, *, output_schema, images, output_budget=None):
             self.messages = messages
             return {"model": "qwen3.5:9b", "content": {
                 "class_reviews": [], "duplicate_reviews": [], "group_reviews": [],
@@ -635,7 +634,8 @@ def test_ocr_enrichment_keeps_ai_job_request_identity_stable(monkeypatch):
     enriched = [{**initial[0], "ocr_candidates": ["R1"], "reference_designators": ["R1"]}]
     for rows in (initial, enriched):
         panel.queue_ai_component_review(api, image_bytes=b"photo", scope="scope",
-                                        rows=rows, records_key="rows", owner="owner")
+                                        rows=rows, records_key="rows", owner="owner",
+                                        selected_component_ids=["r1"])
     assert len(submitted) == 2
     assert submitted[0]["fingerprint"] == submitted[1]["fingerprint"]
     assert submitted[0]["review_fingerprint"] == submitted[1]["review_fingerprint"]
@@ -696,7 +696,7 @@ def test_qwen_duplicate_exclusion_is_only_enabled_for_confident_same_component()
 
 def test_qwen_duplicate_claim_for_far_apart_objects_is_rejected():
     class FarPairClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             return {"model": "qwen3.5:9b", "content": {
                 "class_reviews": [],
                 "duplicate_reviews": [{"detection_ids": ["r1", "r20"], "decision": "same_component",
@@ -785,7 +785,7 @@ def test_known_class_parent_with_one_much_smaller_child_is_reviewed():
 
 def test_qwen_group_review_uses_focused_crop_and_rejects_unlisted_child_ids():
     class GroupClient:
-        def chat_json(self, _model, messages, *, output_schema, images):
+        def chat_json(self, _model, messages, *, output_schema, images, output_budget=None):
             payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
             assert len(payload["group_candidate_crops"]) == 1
             assert payload["group_candidate_crops"][0]["child_ids"] == ["r1", "c1"]
@@ -811,7 +811,7 @@ def test_qwen_group_review_uses_focused_crop_and_rejects_unlisted_child_ids():
 
 def test_group_review_maps_qwen_new_child_box_to_original_pixels():
     class GroupMissingClient:
-        def chat_json(self, _model, messages, *, output_schema, images):
+        def chat_json(self, _model, messages, *, output_schema, images, output_budget=None):
             payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
             assert payload["group_candidate_crops"][0]["parent_id"] == "outer"
             return {"model": "qwen3.5:9b", "content": {
@@ -838,7 +838,7 @@ def test_group_review_maps_qwen_new_child_box_to_original_pixels():
 
 def test_group_review_rejects_new_box_outside_parent_bounds():
     class OutsideParentClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             return {"model": "qwen3.5:9b", "content": {
                 "class_reviews": [], "duplicate_reviews": [],
                 "group_reviews": [{"parent_id": "outer", "decision": "multiple_components",
@@ -861,7 +861,7 @@ def test_group_review_rejects_new_box_outside_parent_bounds():
 
 def test_qwen_false_split_remains_a_suggestion_until_user_action():
     class IncorrectSplitClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             return {"model": "qwen3.5:9b", "content": {
                 "class_reviews": [], "duplicate_reviews": [],
                 "group_reviews": [{"parent_id": "connector", "decision": "multiple_components",
@@ -884,7 +884,7 @@ def test_qwen_false_split_remains_a_suggestion_until_user_action():
 
 def test_not_component_is_exclusion_review_not_new_box_and_can_be_restored():
     class FalsePositiveClient:
-        def chat_json(self, _model, _messages, *, output_schema, images):
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
             return {"model": "qwen3.5:9b", "content": {
                 "class_reviews": [{"detection_id": "noise", "decision": "suggest",
                                    "proposed_class": "not_component", "confidence": .86,
@@ -971,31 +971,27 @@ def test_qwen_transport_failure_is_reported_as_qwen_stage_error():
     assert "timed out" in str(error.value)
 
 
-def test_review_workflow_stores_distinct_candidate_search_failure_diagnostic(monkeypatch):
-    from contextlib import nullcontext
+def test_selected_classification_failure_is_not_misreported_as_candidate_search(monkeypatch):
     from types import SimpleNamespace
     import circuitcare.vision.component_recognition_panel as panel
 
-    def fail_candidate_search(*_args, **_kwargs):
-        raise AIReviewStageError("candidate_search", "group box search failed")
-
-    monkeypatch.setattr("circuitcare.vision.ocr_backend.run_local_ocr", lambda _image: {"records": []})
-    monkeypatch.setattr("circuitcare.vision.ai_review_service.review_components_with_qwen", fail_candidate_search)
-    monkeypatch.setattr(panel, "_ollama_review_client", lambda: object())
-    monkeypatch.setattr("circuitcare.vision.ocr_backend.run_component_marking_ocr",
-                        lambda *_args, **_kwargs: {"status": "OCR_NO_TEXT", "candidates": []})
-    warnings = []
     state = {}
-    st_api = SimpleNamespace(session_state=state, spinner=lambda *_args, **_kwargs: nullcontext(),
-                             warning=warnings.append)
+    class TestClient:
+        def model_supports_vision(self, _model): return True
+    monkeypatch.setattr(panel, "_ollama_review_client", lambda: TestClient())
+    def fail_classification(*_args, **_kwargs):
+        raise AIReviewStageError("qwen", "selected-box classification failed")
+    monkeypatch.setattr("circuitcare.vision.ai_review_service.review_components_with_qwen", fail_classification)
+    st_api = SimpleNamespace(session_state=state)
     rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
              "신뢰도": .8, "x1": 2, "y1": 2, "x2": 20, "y2": 18}]
-    _run_ai_review_workflow(st_api, image_bytes=_png(), scope="s", rows=rows,
-                            records_key="rows", ocr_key="ocr", qwen_key="qwen")
-    diagnostics = state["qwen"]["review_diagnostics"]
-    assert diagnostics["candidate_search"]["status"] == "failed"
-    assert diagnostics["qwen"]["status"] == "not_reached"
-    assert warnings and "묶음 후보 탐색 실패" in warnings[0]
+    with pytest.raises(AIReviewStageError) as error:
+        _run_ai_review_workflow(st_api, image_bytes=_png(), scope="s", rows=rows,
+                                records_key="rows", ocr_key="ocr", qwen_key="qwen",
+                                selected_component_ids=["r1"])
+    assert error.value.stage == "qwen"
+    assert "qwen" not in state
+    assert "cc_component_ocr_s" not in state
 
 
 def test_unreviewed_legacy_yolo2_rows_removed_but_user_reviewed_rows_remain():
@@ -1012,13 +1008,16 @@ def test_unreviewed_legacy_yolo2_rows_removed_but_user_reviewed_rows_remain():
 def test_automatic_ai_review_is_cached_by_photo_observations(monkeypatch):
     import circuitcare.vision.component_recognition_panel as panel
     calls = []
-    def fake_run(st_api, *, image_bytes, scope, rows, records_key, ocr_key, qwen_key, progress=None):
+    def fake_run(st_api, *, image_bytes, scope, rows, records_key, ocr_key, qwen_key, progress=None,
+                 selected_component_ids=None):
         calls.append((scope, rows[0]["x1"]))
-        ocr = {"records": []}
-        st_api.session_state[ocr_key] = ocr
+        selected = set(selected_component_ids or [])
+        detections = panel._selected_classification_detections(rows, selected)
         st_api.session_state[qwen_key] = {
-            "verification_status": "AI_SUGGESTIONS_ONLY",
-            "source_fingerprint": panel._inference_fingerprint(rows, ocr),
+            "verification_status": "AI_SUGGESTIONS_ONLY", "review_mode": "selected_class_only",
+            "selected_component_ids": sorted(selected),
+            "selected_source_fingerprint": panel._selected_classification_fingerprint(
+                b"pcb", detections, selected),
             "class_reviews": [],
         }
     monkeypatch.setattr(panel, "_run_ai_review_workflow", fake_run)
@@ -1026,27 +1025,30 @@ def test_automatic_ai_review_is_cached_by_photo_observations(monkeypatch):
     rows = [{"component_id": "r1", "소자 종류": "unknown", "상태": "검수 필요",
              "x1": 2, "y1": 2, "x2": 20, "y2": 18}]
     assert panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="s", rows=rows,
-                                            records_key="rows") == "complete"
+                                            records_key="rows", selected_component_ids=["r1"]) == "complete"
     assert panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="s", rows=rows,
-                                            records_key="rows") == "complete"
+                                            records_key="rows", selected_component_ids=["r1"]) == "complete"
     assert len(calls) == 1
     changed = [{**rows[0], "x1": 3}]
     assert panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="s", rows=changed,
-                                            records_key="rows") == "complete"
+                                            records_key="rows", selected_component_ids=["r1"]) == "complete"
     assert len(calls) == 2
 
 
-def test_excluding_and_restoring_box_reuses_cached_ocr_and_qwen(monkeypatch):
+def test_excluding_and_restoring_box_reuses_selected_qwen_cache_without_running_ocr(monkeypatch):
     import circuitcare.vision.component_recognition_panel as panel
     calls = []
 
-    def fake_run(st_api, *, image_bytes, scope, rows, records_key, ocr_key, qwen_key, progress=None):
+    def fake_run(st_api, *, image_bytes, scope, rows, records_key, ocr_key, qwen_key, progress=None,
+                 selected_component_ids=None):
         calls.append(scope)
-        ocr = {"records": []}
-        st_api.session_state[ocr_key] = ocr
+        selected = set(selected_component_ids or [])
+        detections = panel._selected_classification_detections(rows, selected)
         st_api.session_state[qwen_key] = {
-            "verification_status": "AI_SUGGESTIONS_ONLY",
-            "source_fingerprint": panel._inference_fingerprint(rows, ocr),
+            "verification_status": "AI_SUGGESTIONS_ONLY", "review_mode": "selected_class_only",
+            "selected_component_ids": sorted(selected),
+            "selected_source_fingerprint": panel._selected_classification_fingerprint(
+                image_bytes, detections, selected),
             "class_reviews": [],
         }
 
@@ -1056,16 +1058,16 @@ def test_excluding_and_restoring_box_reuses_cached_ocr_and_qwen(monkeypatch):
     active = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
                "x1": 2, "y1": 2, "x2": 20, "y2": 18}]
     panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="photo", rows=active,
-                                     records_key="rows")
+                                     records_key="rows", selected_component_ids=["r1"])
     excluded = [{**active[0], "상태": "제외"}]
     panel.invalidate_component_review_state(state, scope="photo", project_id="p", board_id="b")
     panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="photo", rows=excluded,
-                                     records_key="rows")
+                                     records_key="rows", selected_component_ids=["r1"])
     panel.ensure_ai_component_review(st_api, image_bytes=b"pcb", scope="photo", rows=active,
-                                     records_key="rows")
+                                     records_key="rows", selected_component_ids=["r1"])
     assert calls == ["photo"]
     ocr_key, qwen_key = panel.review_aux_keys("photo")
-    assert ocr_key in state and qwen_key in state
+    assert ocr_key not in state and qwen_key in state
 
 
 def test_reusing_running_job_preserves_submission_versions_without_copying_caches(monkeypatch):
@@ -1074,6 +1076,7 @@ def test_reusing_running_job_preserves_submission_versions_without_copying_cache
              "x1": 1, "y1": 2, "x2": 10, "y2": 20}]
     state = {"cc_ai_review_job_scope": "job", "cc_ai_review_job_owner_scope": "owner",
              "cc_ai_review_job_fingerprint_scope": panel._observation_fingerprint(rows),
+             "cc_ai_review_job_variant_scope": "selected_class_only:r1",
              "cc_ai_review_job_review_fingerprint_scope": panel._review_fingerprint(rows, None),
              "cc_ai_review_job_ocr_fingerprint_scope": panel._ocr_evidence_fingerprint(None)}
     original = state["cc_ai_review_job_review_fingerprint_scope"]
@@ -1084,7 +1087,8 @@ def test_reusing_running_job_preserves_submission_versions_without_copying_cache
     monkeypatch.setattr(panel, "deepcopy", forbidden)
     monkeypatch.setattr(panel, "submit_ai_review", forbidden)
     assert panel.queue_ai_component_review(SimpleNamespace(session_state=state),
-        image_bytes=b"photo", scope="scope", rows=rows, records_key="rows", owner="owner") == (
+        image_bytes=b"photo", scope="scope", rows=rows, records_key="rows", owner="owner",
+        selected_component_ids=["r1"]) == (
             "job", "owner", "RUNNING")
     assert state["cc_ai_review_job_review_fingerprint_scope"] == original
 

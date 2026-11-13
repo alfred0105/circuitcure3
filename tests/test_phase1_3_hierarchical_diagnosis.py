@@ -3,10 +3,10 @@ from circuitcare.symptom_diagnosis.evidence_ledger import build_evidence_ledger
 from circuitcare.symptom_diagnosis.functional_blocks import build_functional_block_groups
 
 
-def test_role_groups_keep_members_but_never_claim_electrical_connectivity():
+def test_role_groups_keep_separate_instances_without_positions_and_never_claim_connectivity():
     components = [
-        {"component_id": "U1", "component_type": "ic", "bbox_xyxy": [1, 1, 5, 5]},
-        {"component_id": "C1", "component_type": "capacitor", "bbox_xyxy": [8, 1, 10, 3]},
+        {"component_id": "U1", "component_type": "ic"},
+        {"component_id": "C1", "component_type": "capacitor"},
     ]
     roles = [
         {"component_id": "U1", "candidate_blocks": ["power", "control"],
@@ -15,11 +15,37 @@ def test_role_groups_keep_members_but_never_claim_electrical_connectivity():
          "role_evidence": {"power": ["nearby silkscreen"]}},
     ]
     groups = build_functional_block_groups(components, roles)
-    power = next(row for row in groups if row["role"] == "power")
-    assert power["component_ids"] == ["C1", "U1"]
-    assert power["verification_status"] == "INFERRED"
-    assert power["connectivity_status"] == "NOT_INFERRED"
-    assert power["block_id"].startswith("block-")
+    power = [row for row in groups if row["role"] == "power"]
+    assert {tuple(row["component_ids"]) for row in power} == {("U1",), ("C1",)}
+    assert all(row["verification_status"] == "INFERRED" for row in power)
+    assert all(row["connectivity_status"] == "NOT_INFERRED" for row in power)
+    assert all(row["partition_status"] == "UNRESOLVED_NO_POSITION" for row in power)
+    assert all(row["block_id"].startswith("block-") for row in power)
+
+
+def test_position_clusters_same_role_blocks_but_keeps_role_verification_separate():
+    components = [
+        {"component_id": "J1", "board_component_id": "J1", "component_type": "connector",
+         "component_type_status": "USER_CONFIRMED", "presence_status": "CONFIRMED",
+         "bbox_xyxy": [0, 0, 10, 10]},
+        {"component_id": "C1", "board_component_id": "C1", "component_type": "capacitor",
+         "component_type_status": "USER_CONFIRMED", "presence_status": "CONFIRMED",
+         "bbox_xyxy": [12, 0, 20, 10]},
+        {"component_id": "J2", "board_component_id": "J2", "component_type": "connector",
+         "component_type_status": "USER_CONFIRMED", "presence_status": "CONFIRMED",
+         "bbox_xyxy": [800, 700, 810, 710]},
+    ]
+    roles = [
+        {"component_id": "J1", "candidate_blocks": ["power"], "role_evidence": {"power": ["J1"]}},
+        {"component_id": "C1", "candidate_blocks": ["power"], "role_evidence": {"power": ["C1"]}},
+        {"component_id": "J2", "candidate_blocks": ["power"], "role_evidence": {"power": ["J2"]}},
+    ]
+    groups = build_functional_block_groups(components, roles)
+    power = [row for row in groups if row["role"] == "power"]
+    assert {tuple(row["component_ids"]) for row in power} == {("C1", "J1"), ("J2",)}
+    assert all(row["verification_status"] == "INFERRED" for row in power)
+    assert all(member["identity_status"] == "VERIFIED" and member["role_status"] == "INFERRED"
+               for row in power for member in row["members"])
 
 
 def test_evidence_ledger_preserves_reported_inferred_ai_and_conflicting_sources():
@@ -28,13 +54,16 @@ def test_evidence_ledger_preserves_reported_inferred_ai_and_conflicting_sources(
                       "status": "observed", "source": "user_report"}],
         conflicts=[{"component_id": "R1", "code": "HOT", "values": [True, False]}],
         functional_blocks=[{"block_id": "b1", "role": "power", "component_ids": ["R1"]}],
+        functional_roles=[{"component_id": "R1", "candidate_blocks": ["power"],
+                           "role_evidence": {"power": ["kind and OCR hint"]}}],
         ai_suggestions=[{"component_id": "R1", "suspected_fault_id": "RESISTOR_FAILURE",
                          "source": "qwen"}],
         source_version="v1",
     )
     statuses = {row["kind"]: row["status"] for row in rows}
     assert statuses["observation"] == "USER_REPORTED"
-    assert statuses["functional_role"] == "INFERRED"
+    assert statuses["component_functional_role"] == "INFERRED"
+    assert statuses["functional_block_membership"] == "INFERRED"
     assert statuses["ai_suggestion"] == "AI_SUGGESTED"
     assert statuses["conflict"] == "CONFLICTED"
     assert all(row["source_version"] == "v1" for row in rows)
@@ -85,8 +114,10 @@ def test_unconfirmed_parts_can_hint_blocks_but_never_become_component_fault_cand
         {"component_id": "Q1", "component_type": "transistor", "component_type_status": "UNCONFIRMED",
          "presence_status": "UNCONFIRMED"},
     ], confirmed_component_ids={"K1"})
-    driver = next(row for row in result["functional_block_groups"] if row["role"] == "driver")
-    assert {"K1", "Q1"} & set(driver["component_ids"])
+    driver_groups = [row for row in result["functional_block_groups"] if row["role"] == "driver"]
+    assert {"K1", "Q1"} <= {component_id for row in driver_groups for component_id in row["component_ids"]}
+    assert len(driver_groups) >= 2  # no positions: do not merge unrelated instances by role alone
+    driver = next(row for row in driver_groups if "Q1" in row["component_ids"])
     q1_member = next(row for row in driver["members"] if row["component_id"] == "Q1")
     assert q1_member["evidence_status"] == "UNKNOWN"
     assert all(row["component_id"] != "Q1" for row in result["all_component_candidates"])
