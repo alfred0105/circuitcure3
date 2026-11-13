@@ -6,6 +6,7 @@ import io
 import hashlib
 import json
 import logging
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -30,6 +31,13 @@ USER_SUSPECTS_DISMISSED_KEY = "circuitcare_v4_user_suspects_dismissed"
 ROLE_OPTIONS = ("power", "control", "control_input", "control_timing", "driver", "output",
                 "input", "input_output", "protection", "thermal", "buzzer", "relay")
 LOGGER = logging.getLogger(__name__)
+COMPONENT_LABELS = {
+    "resistor": "저항", "capacitor": "커패시터", "inductor": "인덕터",
+    "diode": "다이오드", "transistor": "트랜지스터", "ic": "IC",
+    "integrated_circuit": "IC", "connector": "커넥터", "switch": "스위치",
+    "relay": "릴레이", "fuse": "퓨즈", "battery": "배터리", "buzzer": "부저",
+    "led": "LED", "unknown": "미확정",
+}
 
 
 def board_suspects(state: Any, project: ProjectContext) -> list[dict[str, Any]]:
@@ -136,7 +144,8 @@ def render_inspection_panel(
                                        if registry_row else "unknown")
                     fault = suspect.get("suspected_fault_mode")
                     label = suspect.get("reference_designator") or suspect.get("component_id") or board_id
-                    st.markdown(f"**{label}** · {_component_label(str(kind))} · {fault or 'AI가 판단'}" +
+                    kind_label = COMPONENT_LABELS.get(str(kind).casefold(), str(kind))
+                    st.markdown(f"**{label}** · {kind_label} · {fault or 'AI가 판단'}" +
                                 (" · 제외됨" if excluded else ""))
                     if excluded:
                         st.caption("박스 제외로 현재 후보에서 빠져 있습니다. 복원 후 다시 확인할 수 있습니다.")
@@ -201,7 +210,10 @@ def render_inspection_panel(
             undo_key = f"{LAST_EXCLUDED_KEY}_{active_scope}"
             last_excluded = st.session_state.get(undo_key)
             undo_col, restore_col = st.columns(2)
-            undo_id = last_excluded.get("component_id") if isinstance(last_excluded, dict) else None
+            undo_id = None
+            if isinstance(last_excluded, dict):
+                undo_ids = last_excluded.get("component_ids") or []
+                undo_id = last_excluded.get("component_id") or (undo_ids[0] if undo_ids else None)
             if undo_col.button("직전 제외 취소", key=f"cc_component_undo_exclusion_{active_scope}",
                                disabled=not bool(undo_id), use_container_width=True,
                                help="가장 최근에 제외한 박스를 복원합니다."):
@@ -229,6 +241,70 @@ def render_inspection_panel(
                             update_selection(st.session_state, project=project,
                                              selected_component=str(row.get("component_id")))
                             st.rerun()
+            active_viewer_key = st.session_state.get("circuitcare_v4_active_viewer_key")
+            bulk_key = f"cc_pcb_bulk_selection_{active_viewer_key}" if active_viewer_key else None
+            selected_ids = st.session_state.get(bulk_key, []) if bulk_key else []
+            selected_ids = list(dict.fromkeys(str(value) for value in selected_ids))
+            row_by_id = {str(row.get("component_id")): row for row in active_rows if row.get("component_id")}
+            target_ids = [component_id for component_id in selected_ids
+                          if component_id in row_by_id and row_by_id[component_id].get("상태") != "제외"]
+            if selected_ids:
+                st.markdown(f"**PCB에서 드래그 선택 · {len(target_ids)}개**")
+                st.caption(" · ".join(target_ids[:8]) + (f" 외 {len(target_ids) - 8}개" if len(target_ids) > 8 else ""))
+                component_by_id = {str(item.component_id): item for item in components}
+                bulk_type_key = f"cc_bulk_review_type_{active_scope}"
+                bulk_status_key = f"cc_bulk_review_status_{active_scope}"
+                bulk_type = st.selectbox("선택 박스 종류 일괄 변경",
+                                         ["변경 안 함", *CLASS_OPTIONS], key=bulk_type_key)
+                bulk_status = st.selectbox("선택 박스 상태 일괄 변경",
+                                           ["변경 안 함", "검수 필요", "확인"], key=bulk_status_key)
+                apply_col, exclude_col, clear_col = st.columns(3)
+                if apply_col.button("일괄 수정 적용", key=f"cc_bulk_apply_{active_scope}",
+                                    use_container_width=True,
+                                    disabled=(not target_ids or
+                                              (bulk_type == "변경 안 함" and bulk_status == "변경 안 함"))):
+                    try:
+                        for component_id in target_ids:
+                            row = row_by_id[component_id]
+                            model = component_by_id.get(component_id)
+                            if model is not None:
+                                row = ensure_review_row_for_component(active_rows, model)
+                            update_review_row(
+                                row,
+                                component_type=(row.get("소자 종류", "unknown")
+                                                if bulk_type == "변경 안 함" else bulk_type),
+                                status=(row.get("상태", "검수 필요")
+                                        if bulk_status == "변경 안 함" else bulk_status),
+                                bbox_xyxy=[row[key] for key in ("x1", "y1", "x2", "y2")],
+                            )
+                        st.session_state[active_records_key] = active_rows
+                        invalidate_component_review_state(
+                            st.session_state, scope=active_scope,
+                            project_id=project.project_id, board_id=project.board_id,
+                        )
+                        st.rerun()
+                    except (KeyError, ValueError, TypeError) as exc:
+                        st.error(f"일괄 수정에 실패했습니다 · {exc}")
+                if exclude_col.button("선택 박스 제외", key=f"cc_bulk_exclude_{active_scope}",
+                                      use_container_width=True, disabled=not target_ids):
+                    before_rows = {component_id: deepcopy(row_by_id[component_id]) for component_id in target_ids}
+                    for component_id in target_ids:
+                        record_box_exclusion(st.session_state, scope=active_scope, row=row_by_id[component_id])
+                    st.session_state[f"{LAST_EXCLUDED_KEY}_{active_scope}"] = {
+                        "component_ids": list(target_ids), "before_rows": before_rows,
+                    }
+                    st.session_state[active_records_key] = active_rows
+                    st.session_state[bulk_key] = []
+                    invalidate_component_review_state(
+                        st.session_state, scope=active_scope,
+                        project_id=project.project_id, board_id=project.board_id,
+                    )
+                    if selected_component and selected_component.component_id in target_ids:
+                        update_component_selection(st.session_state, project=project, selected_component=None)
+                    st.rerun()
+                if clear_col.button("영역 선택 해제", key=f"cc_bulk_clear_{active_scope}", use_container_width=True):
+                    st.session_state[bulk_key] = []
+                    st.rerun()
         st.markdown("### 선택 부품")
         if compact:
             if selected_component is None:

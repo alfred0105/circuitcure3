@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 import json
+import logging
 import time
 import hashlib
 from pathlib import Path
@@ -36,6 +37,8 @@ from circuitcare.analysis.state_manager import (
     begin_analysis, commit_analysis_result, fail_analysis, get_current_result,
     get_current_state, migrate_legacy_result,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _project_key(project: ProjectContext) -> str:
@@ -1269,6 +1272,60 @@ def render_symptom_diagnosis_panel(
             analysis_progress = progress_container.status("고장 후보 분석 중", expanded=True)
         else:
             analysis_progress = st.status("고장 후보 분석 중", expanded=True)
+        # The simple workflow intentionally does not start Ollama merely by
+        # opening the page. Start it only after the user requests diagnosis;
+        # otherwise the earlier non-starting model probe leaves Qwen disabled
+        # for the entire run even though the client supports on-demand startup.
+        if simple_ui and not selected_model:
+            try:
+                analysis_progress.write("로컬 Qwen 서버 시작 · 진행 중")
+                available_models = [
+                    str(row.get("name") or row.get("model") or "")
+                    for row in OllamaClient(timeout_seconds=30, auto_start=True).list_models()
+                    if isinstance(row, dict)
+                ]
+                qwen_models = [name for name in available_models if name.casefold().startswith("qwen")]
+                selected_model = (
+                    next((name for name in qwen_models if name.casefold() == "qwen3.5:9b"), None)
+                    or next((name for name in qwen_models if "3.5" in name.casefold()), None)
+                    or (qwen_models[0] if qwen_models else None)
+                )
+                state["ollama_models"] = available_models
+                state["ollama_checked_at"] = time.time()
+                state["ollama_error"] = (
+                    None if selected_model else "Ollama에 연결됐지만 사용할 Qwen 모델이 설치되어 있지 않습니다."
+                )
+                llm_enabled = bool(selected_model)
+                qwen_pcb_strategy = bool(selected_model)
+                if selected_model:
+                    analysis_progress.write(f"로컬 Qwen 연결 · {selected_model}")
+                    # The LLM setting is part of the analysis fingerprint. Refresh
+                    # it after on-demand startup so the result commits under the
+                    # exact engine configuration used for this run.
+                    snapshot = current_analysis_snapshot(
+                        st, project, components=components, component_inventory=component_inventory,
+                        symptom_text=symptom_text, selected_codes=selected_codes,
+                        observations=observations, inventory_complete=inventory_complete,
+                        analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
+                        board_registry=board_registry, suspected_components=valid_suspects,
+                        auto_qwen=True,
+                    )
+                    fingerprint = snapshot["input_fingerprint"]
+                    measurement_fingerprint = snapshot["measurement_fingerprint"]
+                    analysis_fingerprints = snapshot["fingerprints"]
+                    analysis_scope = snapshot["scope"]
+                    measurements = snapshot["measurements"]
+                    silkscreen_labels = st.session_state.get("circuitcare_v4_silkscreen_labels", [])
+                    if not isinstance(silkscreen_labels, list):
+                        silkscreen_labels = []
+            except (LocalLLMError, ValueError, OSError) as exc:
+                state["ollama_models"] = []
+                state["ollama_checked_at"] = time.time()
+                state["ollama_error"] = str(exc)[:300]
+                llm_enabled = False
+                selected_model = None
+                qwen_pcb_strategy = False
+                analysis_progress.write("로컬 Qwen 연결 실패 · 규칙 기반 진단은 계속합니다")
         analysis_progress.write("증상·검수·현재 측정 Fingerprint · 확인 완료")
         if simple_ui:
             _save_initial_symptom_answer(state, simple_choice)
@@ -1276,6 +1333,30 @@ def render_symptom_diagnosis_panel(
         state["confirmed_component_ids"] = confirmed_component_ids
         state["inventory_complete"] = inventory_complete
         state["manual_observations"] = {fact: value for fact, value in observations.items() if value is not None}
+        # The initial answer is written above on an explicit button click and
+        # participates in the input fingerprint. Rebuild the run snapshot only
+        # after that write; otherwise commit_analysis_result correctly rejects
+        # every completed run as stale, leaving the next workflow step disabled.
+        st.session_state[key] = state
+        snapshot = current_analysis_snapshot(
+            st, project, components=components, component_inventory=component_inventory,
+            symptom_text=symptom_text, selected_codes=selected_codes,
+            observations=observations, inventory_complete=inventory_complete,
+            analysis_target_id=analysis_target_id, component_id_aliases=component_id_aliases,
+            board_registry=board_registry, suspected_components=valid_suspects,
+            auto_qwen=simple_ui,
+        )
+        fingerprint = snapshot["input_fingerprint"]
+        measurement_fingerprint = snapshot["measurement_fingerprint"]
+        analysis_fingerprints = snapshot["fingerprints"]
+        analysis_scope = snapshot["scope"]
+        measurements = snapshot["measurements"]
+        # Remember that the user explicitly submitted this exact report. The
+        # workflow may still continue to safe inspection when diagnosis is
+        # inconclusive or a model/commit fails; this is never treated as a
+        # confirmed fault or a normal-board result.
+        state["last_analysis_attempt_fingerprint"] = analysis_fingerprints.final_sha256
+        st.session_state[key] = state
         run_id = begin_analysis(
             st.session_state, scope=analysis_scope, fingerprints=analysis_fingerprints,
             result_kind="symptom",
@@ -1290,6 +1371,8 @@ def render_symptom_diagnosis_panel(
                 analysis_progress.write("증상 구조화 · 완료")
             except (LocalLLMError, ValueError, TypeError, OSError) as exc:
                 parsed = {"observations": [], "uncertain_facts": [], "parser_status": "FAILED", "error": str(exc)}
+                LOGGER.warning("diagnosis symptom_structuring_failed project=%s model=%s error=%s",
+                               project.project_id, selected_model, str(exc)[:500])
                 analysis_progress.write("증상 구조화 · 실패 · 규칙 진단 계속")
         state["parsed_observations"] = parsed.get("observations", [])
         combined_observations = _combined_observations(state)
@@ -1391,6 +1474,12 @@ def render_symptom_diagnosis_panel(
             result=result, result_kind="symptom",
         )
         if not committed:
+            LOGGER.warning(
+                "diagnosis result_commit_rejected project=%s scope=%s run_id=%s "
+                "started_fingerprint=%s live_fingerprint=%s",
+                project.project_id, analysis_scope.key, run_id,
+                analysis_fingerprints.final_sha256, live_snapshot["fingerprints"].final_sha256,
+            )
             state["result"] = None
             state["analysis_status"] = "STALE"
             state["invalidated_reason"] = "분석 중 입력이 바뀌어 이전 버전 결과를 저장하지 않았습니다."

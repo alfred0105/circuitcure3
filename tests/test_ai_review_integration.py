@@ -23,6 +23,7 @@ from circuitcare.vision.component_recognition_panel import (
     CLASS_OPTIONS, _legacy_secondary_scope, _migrate_legacy_review_state, _review_fingerprint,
     _run_ai_review_workflow, duplicate_exclusion_enabled, invalidate_qwen_review, review_aux_keys,
     review_keys, review_scope, _review_detection_batches, _marking_ocr_targets,
+    _missing_class_review_ids,
     _make_group_child_row, continue_duplicate_pair_review,
 )
 from circuitcare.component_taxonomy import (
@@ -95,10 +96,10 @@ def test_qwen_review_validates_detection_ids_and_unverified_boxes():
              "reference_candidates": ["C12"]}],
     )
 
-    assert len(client.images) == 4  # annotated photo, two detection crops, and a focused duplicate-pair crop
+    assert len(client.images) == 3  # annotated photo and two detection crops; pairs run in the dedicated queue
     assert client.schema is not None
     assert len(result["class_reviews"]) == 1
-    assert len(result["duplicate_reviews"]) == 1
+    assert result["duplicate_reviews"] == []  # duplicate decisions come from the dedicated pair queue
     assert len(result["missed_component_candidates"]) == 1
     assert result["verification_status"] == "AI_SUGGESTIONS_ONLY"
     candidate = result["missed_component_candidates"][0]
@@ -512,6 +513,59 @@ def test_qwen_receives_overlapping_native_resolution_tiles_and_maps_tile_box():
     assert candidate[0] > 0 and candidate[2] > candidate[0]
 
 
+def test_class_review_avoids_redundant_tiles_and_duplicate_pair_crops_on_native_photo():
+    class ReviewClient:
+        def __init__(self):
+            self.images = None
+            self.schema = None
+
+        def chat_json(self, _model, _messages, *, output_schema, images):
+            self.images = images
+            self.schema = output_schema
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [], "group_reviews": [],
+                "missed_component_candidates": [], "notes": [],
+            }}
+
+    output = io.BytesIO()
+    Image.new("RGB", (1310, 1444), "white").save(output, format="PNG")
+    detections = [
+        {"component_id": "a", "class_name": "resistor", "bbox_xyxy": [100, 100, 180, 150]},
+        {"component_id": "b", "class_name": "resistor", "bbox_xyxy": [110, 105, 190, 155]},
+    ]
+    client = ReviewClient()
+    result = review_components_with_qwen(client, "qwen3.5:9b", output.getvalue(), detections, [])
+
+    # The whole image is already at native resolution under the 1600px overview
+    # cap, so extra overlapping tiles and duplicate-pair crops are redundant here.
+    assert result["review_tiles"] == 0
+    assert result["duplicate_pair_crop_count"] == 0
+    assert len(client.images) == 3  # one overview plus one crop for each box
+    assert client.schema["properties"]["class_reviews"]["maxItems"] == 6
+    assert client.schema["properties"]["duplicate_reviews"]["maxItems"] == 0
+
+
+def test_ai_review_prompt_bounds_ocr_candidate_count_and_text_size():
+    class ReviewClient:
+        def __init__(self):
+            self.messages = None
+
+        def chat_json(self, _model, messages, *, output_schema, images):
+            self.messages = messages
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [], "group_reviews": [],
+                "missed_component_candidates": [], "notes": [],
+            }}
+
+    client = ReviewClient()
+    records = [{"raw_text": "X" * 1000, "bbox_xyxy": [0, 0, 4, 4], "confidence": .5}
+               for _ in range(80)]
+    review_components_with_qwen(client, "qwen3.5:9b", _png(), [], records)
+    payload = json.loads(client.messages[1]["content"].split("\n", 1)[1])
+    assert len(payload["nearby_ocr_text_candidates"]) == 48
+    assert all(len(row["text"]) == 120 for row in payload["nearby_ocr_text_candidates"])
+
+
 def test_cached_qwen_review_is_invalidated_when_source_box_changes():
     rows = [{"component_id": "r1", "소자 종류": "resistor", "상태": "검수 필요",
              "x1": 1, "y1": 1, "x2": 10, "y2": 10}]
@@ -594,9 +648,16 @@ def test_qwen_batch_setting_is_limited_to_benchmarked_sizes(monkeypatch):
         monkeypatch.setenv("CIRCUITCARE_QWEN_BATCH_SIZE", str(size))
         assert _qwen_review_batch_size() == size
     monkeypatch.setenv("CIRCUITCARE_QWEN_BATCH_SIZE", "3")
-    assert _qwen_review_batch_size() == 6
+    assert _qwen_review_batch_size() == 4
     monkeypatch.setenv("CIRCUITCARE_QWEN_BATCH_SIZE", "invalid")
-    assert _qwen_review_batch_size() == 6
+    assert _qwen_review_batch_size() == 4
+
+
+def test_qwen_batch_coverage_detects_omitted_or_unvalidated_ids():
+    batch = [{"component_id": "c1"}, {"component_id": "c2"}]
+    assert _missing_class_review_ids(batch, {"class_reviews": [
+        {"detection_id": "c1"}, {"detection_id": "unknown-id"},
+    ]}) == ["c2"]
 
 
 def test_ai_review_worker_merge_preserves_user_rows_and_only_applies_ai_fields():
@@ -1028,14 +1089,15 @@ def test_reusing_running_job_preserves_submission_versions_without_copying_cache
     assert state["cc_ai_review_job_review_fingerprint_scope"] == original
 
 
-def test_followup_batches_keep_component_crops_without_repeating_board_tiles():
+def test_native_overview_avoids_redundant_tiles_and_followups_keep_component_crops():
     from circuitcare.vision.ai_review_service import _review_images
     output = io.BytesIO()
     Image.new('RGB', (1600, 1400), 'white').save(output, format='PNG')
     detections = [{'detection_id': 'r1', 'bbox_xyxy': [10, 10, 80, 50], 'confidence': .8}]
     first = _review_images(output.getvalue(), detections, include_full_image=True)
     later = _review_images(output.getvalue(), detections, include_full_image=False)
-    assert any(item['kind'] == 'native_resolution_tile' for item in first[2])
+    assert not any(item['kind'] == 'native_resolution_tile' for item in first[2])
+    assert any(item['kind'] == 'annotated_full_image' for item in first[2])
     assert {item['kind'] for item in later[2]} == {'detection_crop'}
     assert later[2][0]['detection_id'] == 'r1'
     assert len(later[0]) < len(first[0])

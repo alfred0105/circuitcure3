@@ -6,7 +6,6 @@ import hashlib
 import base64
 import io
 import json
-import secrets
 import time
 from functools import lru_cache
 from dataclasses import replace
@@ -59,9 +58,9 @@ from circuitcare.dashboard.views.report_panel import render_report_panel
 from circuitcare.reporting.report_builder import build_pcb_diagnostic_snapshot
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
 from circuitcare.vision.component_recognition_panel import (
-    _observation_fingerprint, _ocr_evidence_fingerprint,
+    _observation_fingerprint,
     _review_fingerprint, _review_user_version, ensure_component_detection,
-    merge_ai_review_rows, queue_ai_component_review, render_component_recognition_panel,
+    merge_ai_review_rows, render_component_recognition_panel,
     review_aux_keys, review_keys, review_scope as component_review_scope,
 )
 from circuitcare.vision.box_reconciliation import board_visible_review_rows, same_component_box_pair
@@ -82,34 +81,6 @@ from circuitcare.schematic.geometry import read_svg_view_box
 from circuitcare.schematic.viewer import render_interactive_viewer
 from circuitcare.vision.image_loader import ImageLoadError, load_board_image
 from circuitcare.vision.ai_review_jobs import get_ai_review_job
-
-
-def _review_job_owner(st: Any, project_id: str) -> str:
-    key = "cc_ai_review_session_owner"
-    token = st.session_state.setdefault(key, secrets.token_urlsafe(20))
-    return f"{token}|{project_id}"
-
-
-def _queue_ai_review(st: Any, *, project: ProjectContext, image_bytes: bytes,
-                     scope: str, rows: list[dict[str, Any]], records_key: str,
-                     photo_id: str | None = None) -> tuple[str, str]:
-    """Queue the full OCR/Qwen workflow from a session-owned immutable snapshot."""
-    owner = _review_job_owner(st, project.project_id)
-    previous_job_id = st.session_state.get(f"cc_ai_review_job_{scope}")
-    job_id, _job_owner, status = queue_ai_component_review(
-        st, image_bytes=image_bytes, scope=scope, rows=rows,
-        records_key=records_key, owner=owner,
-    )
-    event = "AI_JOB_SUBMITTED" if job_id and job_id != previous_job_id and status == "PENDING" else "AI_JOB_REUSED"
-    LOGGER.info("%s project=%s photo_id=%s scope_hash=%s status=%s job_id=%s ts_ns=%s",
-                event, project.project_id, photo_id or "unknown",
-                hashlib.sha256(scope.encode()).hexdigest()[:12], status, job_id or "none", time.time_ns())
-    if photo_id:
-        st.session_state[f"cc_ai_review_job_photo_id_{scope}"] = photo_id
-    if status == "QUEUE_FULL":
-        st.session_state[f"cc_ai_review_job_status_{scope}"] = "QUEUE_FULL"
-        st.session_state[f"cc_ai_review_job_message_{scope}"] = "AI 검수 대기열이 가득 찼습니다. 잠시 후 다시 실행해 주세요."
-    return job_id or "", status
 
 
 def _commit_review_job(st: Any, *, scope: str) -> bool:
@@ -136,8 +107,6 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
     current_user_version = _review_user_version(current_rows)
     current_review_fingerprint = _review_fingerprint(current_rows, None)
     submitted_review_fingerprint = state.get(f"cc_ai_review_job_review_fingerprint_{scope}")
-    submitted_ocr_fingerprint = state.get(f"cc_ai_review_job_ocr_fingerprint_{scope}")
-    current_ocr_fingerprint = _ocr_evidence_fingerprint(state.get(review_aux_keys(scope)[0]))
     if (_observation_fingerprint(current_rows) != fingerprint
             or job.get("review_fingerprint") != submitted_review_fingerprint
             or (current_review_fingerprint != submitted_review_fingerprint
@@ -159,12 +128,15 @@ def _commit_review_job(st: Any, *, scope: str) -> bool:
                     hashlib.sha256(scope.encode()).hexdigest()[:12], worker_status, job.get("attempt"))
         return True
     result_state = job.get("state", {})
-    worker_ocr = result_state.get(review_aux_keys(scope)[0]) if isinstance(result_state, dict) else None
-    worker_ocr_fingerprint = _ocr_evidence_fingerprint(worker_ocr)
-    if current_ocr_fingerprint not in {submitted_ocr_fingerprint, worker_ocr_fingerprint}:
+    selected_ids = job.get("selected_component_ids")
+    worker_review = (result_state.get(review_aux_keys(scope)[1])
+                     if isinstance(result_state, dict) else None)
+    if (not selected_ids or not isinstance(worker_review, dict)
+            or worker_review.get("review_mode") != "selected_class_only"
+            or sorted(map(str, selected_ids)) != sorted(map(str, worker_review.get("selected_component_ids", [])))):
         state[f"cc_ai_review_job_status_{scope}"] = "STALE"
         state[f"cc_ai_review_job_committed_{scope}"] = job_id
-        LOGGER.info("AI_JOB_COMMITTED scope_hash=%s status=STALE reason=ocr_evidence_changed",
+        LOGGER.info("AI_JOB_COMMITTED scope_hash=%s status=STALE reason=not_selected_class_review",
                     hashlib.sha256(scope.encode()).hexdigest()[:12])
         return True
     worker_rows = result_state.get(records_key, [])
@@ -217,7 +189,7 @@ def _render_ai_review_progress(st: Any, project_id: str, scope: str | None) -> N
         if (state.get(f"cc_ai_review_job_{scope}") == job_id
                 and state.get(f"cc_ai_review_job_owner_{scope}") == owner
                 and _commit_review_job(st, scope=scope)):
-            state["cc_debug_next_full_script_rerun_cause"] = "ai_review_terminal_commit"
+            state["cc_debug_next_fragment_rerun_cause"] = "ai_review_terminal_commit"
             LOGGER.info("AI_JOB_COMPLETED project=%s job_id=%s transport=sse", project_id, job_id)
     render_review_progress(st, owner=owner, job_id=job_id, job=job, on_completed=completed)
 
@@ -419,20 +391,27 @@ def _prepare_photo_component_snapshot(
     review_state = "unavailable"
     if (auto_result is not None and not auto_error
             and auto_result.get("image_width") and auto_result.get("image_height")):
-        _job_id, job_state = _queue_ai_review(
-            st, project=project, image_bytes=detector_image_bytes, scope=review_scope,
-            rows=rows, records_key=records_key, photo_id=photo_id,
-        )
-        if job_state in {"COMPLETE", "AI_REVIEW_PARTIAL", "FAILED", "UNAVAILABLE"}:
+        # Qwen classification is explicitly user-triggered for the selected box.
+        # Only collect/commit an already submitted job here (for photo switching).
+        job_id = st.session_state.get(f"cc_ai_review_job_{review_scope}")
+        owner = st.session_state.get(f"cc_ai_review_job_owner_{review_scope}")
+        job = get_ai_review_job(owner=owner, job_id=job_id) if owner and job_id else None
+        job_state = str(job.get("status")) if isinstance(job, dict) else "NOT_REQUESTED"
+        if job_state in {"COMPLETE", "AI_REVIEW_PARTIAL", "FAILED", "UNAVAILABLE", "STALE"}:
             # A job may finish while the user views another photo. Commit its
             # result only when this photo is selected again and its input still matches.
             _commit_review_job(st, scope=review_scope)
             rows = list(st.session_state.get(records_key, []))
-        review_state = ("complete" if job_state == "COMPLETE" else
-                        "partial" if job_state == "AI_REVIEW_PARTIAL" else
-                        "failed" if job_state in {"FAILED", "UNAVAILABLE"} else
-                        "pending" if job_state in {"PENDING", "RUNNING"} else
-                        "failed" if job_state == "QUEUE_FULL" else "unavailable")
+        elif job_state in {"PENDING", "RUNNING"}:
+            st.session_state[f"cc_ai_review_job_status_{review_scope}"] = job_state
+        if job_state == "NOT_REQUESTED":
+            review_state = "not_requested"
+        else:
+            review_state = ("complete" if job_state == "COMPLETE" else
+                            "partial" if job_state == "AI_REVIEW_PARTIAL" else
+                            "failed" if job_state in {"FAILED", "UNAVAILABLE"} else
+                            "pending" if job_state in {"PENDING", "RUNNING"} else
+                            "stale" if job_state == "STALE" else "unavailable")
     _ocr_key, qwen_key = (f"cc_component_ocr_{review_scope}", f"cc_component_qwen_review_{review_scope}")
     qwen_result = st.session_state.get(qwen_key, {})
     qwen_types = {str(item.get("detection_id")): item for item in qwen_result.get("class_reviews", [])
@@ -1243,6 +1222,7 @@ def _inspection_targets(
     rows = registry.get("components", []) if isinstance(registry, dict) else []
     active_rows = [row for row in rows if isinstance(row, dict)
                    and row.get("presence_status") != "EXCLUDED"
+                   and row.get("component_type") != "board_feature"
                    and row.get("board_component_id")]
     by_id = {str(row["board_component_id"]): row for row in active_rows}
     ordered: list[tuple[str, dict[str, Any], str, int]] = []
@@ -1268,14 +1248,28 @@ def _inspection_targets(
 
     def add(board_id: str, details: dict[str, Any], reason: str) -> None:
         row = by_id.get(str(board_id))
-        if not row or str(board_id) in used:
+        if (not row or str(board_id) in used
+                or not isinstance(row.get("source_components"), list)
+                or not row.get("source_components")):
             return
-        if measurement_view_model_for_board_component(
+        measurement_component = measurement_view_model_for_board_component(
             registry, board_component_id=str(board_id), preferred_photo_id=None,
-        ) is None:
-            return
-        component_type = str(row.get("component_type") or details.get("component_type") or "unknown")
-        component_profile = profiles_by_type.get(component_type.casefold(), {})
+        )
+        type_confirmed = row.get("component_type_status") == "USER_CONFIRMED"
+        source_rows = row.get("source_components", [])
+        source = next((item for item in source_rows if isinstance(item, dict)
+                       and item.get("review_status") != "EXCLUDED"), {})
+        source_type = str(source.get("confirmed_base_class") or source.get("detector_class")
+                          or source.get("component_type") or "unknown")
+        component_type = str(row.get("component_type") if type_confirmed
+                             else (source_type if source_type != "unknown"
+                                   else details.get("component_type") or "unknown"))
+        # A detector class is useful for identifying the displayed box, but it
+        # is not enough to select an electrical test profile. Only a confirmed
+        # Registry type or an already validated diagnosis candidate may do so.
+        test_component_type = str(row.get("component_type") if type_confirmed
+                                  else details.get("component_type") or "unknown")
+        component_profile = profiles_by_type.get(test_component_type.casefold(), {})
         tests = component_profile.get("tests", {}) if isinstance(component_profile, dict) else {}
         hypotheses = details.get("fault_hypotheses", []) if isinstance(details.get("fault_hypotheses"), list) else []
         fault_ids = [str(item.get("fault_id") or item.get("fault_hypothesis") or "")
@@ -1284,7 +1278,7 @@ def _inspection_targets(
             fault_ids = [str(details.get("fault_id") or details.get("fault_hypothesis") or "")]
         component_subtype = str(row.get("subtype") or row.get("component_subtype") or "").casefold()
         component_visual_checks = _compatible_visual_checks(
-            catalog, target_scope="component", component_type=component_type,
+            catalog, target_scope="component", component_type=test_component_type,
             subtype=component_subtype, fault_ids=fault_ids, symptoms=current_symptoms,
         )
         allowed_tests = []
@@ -1303,8 +1297,10 @@ def _inspection_targets(
                                       "fault_ids": (related_faults if allow_retest else unfinished_faults)})
         ordinal = len(ordered)
         annotated = {**details, "component_type": component_type,
+                     "component_type_confirmed": type_confirmed,
                      "available_tests": allowed_tests,
                      "visual_checks": component_visual_checks,
+                     "measurement_available": measurement_component is not None,
                      "inspection_kind": "MEASUREMENT" if allowed_tests else "VISUAL_ONLY",
                      "component_subtype": component_subtype,
                      "completed_test_count": completed_test_count}
@@ -1329,13 +1325,19 @@ def _inspection_targets(
             "추가 확인 대상 · 원인 미확정")
     ordered.sort(key=lambda item: (item[1].get("inspection_kind") != "MEASUREMENT", item[3]))
     return [{"board_component_id": board_id,
-             "component_type": str(by_id[board_id].get("component_type") or
-                                    details.get("component_type") or "unknown"),
+             "component_type": str(details.get("component_type") or
+                                    by_id[board_id].get("component_type") or "unknown"),
+             "component_type_confirmed": bool(details.get("component_type_confirmed")),
              "reference_designators": list(by_id[board_id].get("reference_designators", [])),
+             "display_label": (list(by_id[board_id].get("reference_designators", [])) or
+                               [next((str(source.get("component_id")) for source in by_id[board_id].get("source_components", [])
+                                      if isinstance(source, dict) and source.get("component_id")
+                                      and source.get("review_status") != "EXCLUDED"), board_id)])[0],
              "reason": reason, "candidate": details,
              "inspection_kind": details.get("inspection_kind"),
              "available_tests": details.get("available_tests", []),
              "visual_checks": details.get("visual_checks", []),
+             "measurement_available": bool(details.get("measurement_available")),
              "completed_test_count": details.get("completed_test_count", 0),
              "presence_status": by_id[board_id].get("presence_status"),
              "source_components": list(by_id[board_id].get("source_components", []))}
@@ -1611,6 +1613,10 @@ def _render_workflow_candidates(
 ) -> None:
     result = analysis_snapshot.get("result")
     current_result = result if analysis_snapshot.get("record", {}).get("status") == AnalysisStatus.CURRENT.value else None
+    if current_result is None:
+        st.warning("현재 유효한 진단 결과가 없습니다. 이는 정상 판정이 아닙니다. 아래에는 확인된 소자에 대한 일반 검사만 표시하며, 특정 고장 가설은 확정하지 않습니다.")
+    elif current_result.get("status") in {"NEEDS_SYMPTOMS", "INCONCLUSIVE"}:
+        st.warning("증상만으로 고장 후보를 좁히지 못했습니다. 정상 판정이 아니며, 아래 검사 대상은 원인 미확정 상태의 추가 확인 항목입니다.")
     candidates = _inspection_candidate_rows(current_result)
     suspects = board_suspects(st.session_state, project)
     all_measurements = get_measurements(st.session_state, project_id=project.project_id,
@@ -1628,7 +1634,7 @@ def _render_workflow_candidates(
     workflow["inspection_targets"] = targets
     workflow["analysis_fingerprint"] = analysis_snapshot.get("input_fingerprint")
     if not targets:
-        st.warning("현재 사진에서 측정·검사 대상으로 연결할 유효 소자가 없습니다. 1단계로 돌아가 소자 탐지와 검수를 확인하세요.")
+        st.warning("검사 대상으로 연결할 활성 소자가 없습니다. 제외 상태가 아닌 탐지 박스가 있는지 1단계에서 확인하세요.")
         if st.button("소자 검수로 돌아가기", key=f"cc_wf_no_targets_{project.project_id}"):
             _advance_workflow(st, project, WORKFLOW_REVIEW, "소자 검수 화면 준비 중",
                               "no_valid_target",
@@ -1643,9 +1649,12 @@ def _render_workflow_candidates(
         hypotheses = candidate.get("fault_hypotheses", []) if isinstance(candidate, dict) else []
         hypothesis = hypotheses[0] if hypotheses else {}
         ref = target.get("reference_designators") or []
-        identity = ref[0] if ref else target["board_component_id"]
+        identity = ref[0] if ref else f"박스 {target.get('display_label') or target['board_component_id']}"
+        type_label = target["component_type"]
+        if not target.get("component_type_confirmed"):
+            type_label += " · 종류 미확정"
         fault_title = hypothesis.get("fault_title") or hypothesis.get("fault_id")
-        label = f"{index}순위 · {identity} · {target['component_type']}"
+        label = f"{index}순위 · {identity} · {type_label}"
         if fault_title:
             label += f" · {fault_title}"
         st.markdown(f"**{label}**")
@@ -1653,12 +1662,15 @@ def _render_workflow_candidates(
         st.caption("검사 방식 · " + ("등록된 검사 프로파일로 측정 가능"
                                      if target.get("inspection_kind") == "MEASUREMENT"
                                      else "검증된 측정 프로파일 없음 · 추가 확인 대상"))
+        if not target.get("measurement_available"):
+            st.caption("사진 좌표를 연결하지 못해 측정 입력은 보류됩니다. 소자 기록은 검사 대상으로 표시합니다.")
         st.caption("검증 상태 · " + ("측정으로 특정 가설을 확인" if hypothesis.get("visual_status") in
                   {"FAULT_SUPPORTED", "FAULT_REFUTED", "CONFLICTED", "INCONCLUSIVE"}
                   else "우선 확인 대상 · 아직 고장 판정 아님"))
         if hypothesis.get("recommended_tests"):
             st.caption("권장 확인 · " + " · ".join(str(item) for item in hypothesis["recommended_tests"][:2]))
-        if st.button("PCB에서 위치 보기", key=f"cc_wf_target_focus_{project.project_id}_{target['board_component_id']}"):
+        if target.get("measurement_available") and st.button(
+                "PCB에서 위치 보기", key=f"cc_wf_target_focus_{project.project_id}_{target['board_component_id']}"):
             if _focus_board_registry_component(st, project, registry, target["board_component_id"]):
                 workflow["viewer_focus_id"] = target["board_component_id"]
                 st.rerun()
@@ -1673,7 +1685,7 @@ def _render_workflow_candidates(
     st.session_state[select_key] = selected_id
     selected_id = st.selectbox(
         "검사할 소자", target_ids, key=select_key,
-        format_func=lambda value: next((f"{i}. {(row.get('reference_designators') or [value])[0]} · {row['component_type']}"
+        format_func=lambda value: next((f"{i}. {row.get('display_label') or value} · {row['component_type']}"
                                         for i, row in enumerate(targets, start=1)
                                         if row["board_component_id"] == value), value),
     )
@@ -2023,7 +2035,7 @@ def _render_workflow_report(
 
 
 def render_workbench_shell(st: Any, project: ProjectContext) -> None:
-    """Keep the PCB Viewer fixed while rendering one selected task panel."""
+    """Render the workbench in a fragment so its interactions stay local."""
     run_count = int(st.session_state.get("cc_debug_full_script_rerun_count", 0)) + 1
     st.session_state["cc_debug_full_script_rerun_count"] = run_count
     active_photo_id = st.session_state.get("circuitcare_v2_photo_choice") or st.session_state.get(ACTIVE_PHOTO_KEY)
@@ -2033,7 +2045,45 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
     LOGGER.info("FULL_SCRIPT_RERUN project=%s photo_id=%s count=%s cause=%s cause_count=%s ts_ns=%s",
                 project.project_id, active_photo_id or "unknown", run_count, rerun_cause,
                 rerun_causes[rerun_cause], time.time_ns())
+    # Keep global CSS outside the fragment so a fragment update never removes
+    # and reinserts the styles that affect the fixed Viewer layout.
     _style(st)
+
+    fragment = getattr(st, "fragment", None)
+    if callable(fragment):
+        # This renderer is nested in ``main`` and redefined on every Streamlit
+        # full rerun. Without an explicit key Streamlit may retire the previous
+        # fragment ID while a component/fragment event is still in flight; the
+        # stale event then falls back to a full-script rerun and flashes the
+        # Viewer. Keep the fragment identity stable for this project session.
+        fragment_key = "cc_workbench_" + hashlib.sha256(project.project_id.encode()).hexdigest()[:16]
+
+        @fragment(key=fragment_key)
+        def _render_workbench_fragment() -> None:
+            state = st.session_state
+            fragment_count = int(state.get("cc_debug_fragment_rerun_count", 0)) + 1
+            state["cc_debug_fragment_rerun_count"] = fragment_count
+            cause = state.pop("cc_debug_next_fragment_rerun_cause", "widget_or_component")
+            last_full_count = state.get("cc_debug_fragment_last_full_count")
+            event = "FRAGMENT_RERUN" if last_full_count == run_count else "FRAGMENT_EXECUTION"
+            state["cc_debug_fragment_last_full_count"] = run_count
+            causes = state.setdefault("cc_debug_fragment_rerun_causes", {})
+            causes[cause] = int(causes.get(cause, 0)) + 1
+            LOGGER.info("%s project=%s photo_id=%s count=%s cause=%s cause_count=%s ts_ns=%s",
+                        event, project.project_id,
+                        state.get("circuitcare_v2_photo_choice") or state.get(ACTIVE_PHOTO_KEY) or "unknown",
+                        fragment_count, cause, causes[cause], time.time_ns())
+            _render_workbench_shell_body(st, project)
+
+        _render_workbench_fragment()
+        return
+
+    # Test doubles and older Streamlit-compatible hosts retain the same renderer.
+    _render_workbench_shell_body(st, project)
+
+
+def _render_workbench_shell_body(st: Any, project: ProjectContext) -> None:
+    """Keep the PCB Viewer fixed while rendering one selected task panel."""
     selection = st.session_state.get(SELECTION_KEY)
     if getattr(selection, "project_id", None) != project.project_id:
         enter_workbench(
@@ -2054,8 +2104,12 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
             with st.container(height=152, border=False, key="cc_workflow_progress"):
                 workflow_status_slot = st.empty()
             qwen_progress_slot = workflow_status_slot
-            viewer_slot = st.empty()
-            viewer_error_slot = st.empty()
+            # Keep the component inside fixed keyed containers. An st.empty()
+            # placeholder is replaced on every fragment execution; when it
+            # owns a Components v2 iframe this tears down the iframe, fires
+            # VIEWER_UNMOUNT, reloads the SVG image, and resets the camera.
+            viewer_slot = st.container(key="cc_pcb_viewer_slot")
+            viewer_error_slot = st.container(key="cc_pcb_viewer_error_slot")
             pending_label = workflow.pop("pending_left_status", None)
             transition_progress = None
             if pending_label:
@@ -2113,7 +2167,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                                            state="error", expanded=True)
             with left:
                 try:
-                    with viewer_slot.container():
+                    with viewer_slot:
                         _render_pcb(st, project, photos)
                 except Exception:
                     pass
@@ -2136,7 +2190,7 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
             elif active_review_scope and active_review_status in {"COMPLETE", "FAILED", "STALE", "UNAVAILABLE", "AI_REVIEW_PARTIAL"}:
                 with qwen_progress_slot.container():
                     if active_review_status == "COMPLETE":
-                        st.caption("RapidOCR · Qwen 검수 완료 · 제안은 사용자 확인 전까지 미확정")
+                        st.caption("선택 소자 Qwen 분류 완료 · 제안은 사용자 확인 전까지 미확정")
                     elif active_review_status == "STALE":
                         st.info("입력 박스가 변경되어 오래된 AI 결과를 적용하지 않았습니다. 검수를 다시 실행할 수 있습니다.")
                     elif active_review_status == "AI_REVIEW_PARTIAL":
@@ -2147,13 +2201,16 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                             "AI 검수가 실패했습니다. ‘AI 소자 검수’를 눌러 다시 시도할 수 있습니다."))
                     else:
                         st.warning("AI 검수가 끝났지만 일부 단계가 실패했습니다. 탐지와 사용자 검수 기록은 보존됩니다.")
+            elif photo_snapshot and (photo_snapshot.get("components") or photo_snapshot.get("review_scope")):
+                with qwen_progress_slot.container():
+                    st.caption("YOLO 탐지 완료 · 사진별 검수 화면입니다. PCB에서 박스를 선택해 Qwen 종류 분류를 실행하세요.")
             try:
-                with viewer_slot.container():
+                with viewer_slot:
                     _render_pcb(st, project, photos)
             except Exception as exc:
                 workflow["transition_status"] = "FAILED"
                 workflow["transition_error"] = f"{type(exc).__name__}: {str(exc)[:400]}"
-                with viewer_error_slot.container():
+                with viewer_error_slot:
                     failed = st.status("PCB Viewer 준비 실패 · 기존 입력은 유지됩니다", state="error", expanded=True)
                     failed.write(f"{type(exc).__name__}: {str(exc)[:300]}")
             if transition_progress is not None:
@@ -2237,11 +2294,18 @@ def render_workbench_shell(st: Any, project: ProjectContext) -> None:
                 )
                 has_current = (question_snapshot.get("record", {}).get("status") == AnalysisStatus.CURRENT.value
                                and isinstance(question_snapshot.get("result"), dict))
-                if st.button("검사 후보 선정", type="primary", disabled=preview or not has_current,
+                symptom_state = st.session_state.get(f"cc_symptom_diagnosis_{project.project_id}", {})
+                submitted_fingerprint = (symptom_state.get("last_analysis_attempt_fingerprint")
+                                         if isinstance(symptom_state, dict) else None)
+                report_submitted = submitted_fingerprint == question_snapshot["fingerprints"].final_sha256
+                if st.button("검사 후보 선정", type="primary",
+                             disabled=preview or not (has_current or report_submitted),
                              key=f"cc_wf_questions_next_{project.project_id}"):
                     workflow["stage_completion"][WORKFLOW_QUESTIONS] = True
                     _advance_workflow(st, project, WORKFLOW_INSPECTION,
-                                      "고장 검사 후보 준비 중 · 현재 규칙 결과와 Registry 확인", "questions_complete")
+                                      ("고장 검사 후보 준비 중 · 현재 결과와 Registry 확인" if has_current
+                                       else "확정 진단 없음 · 안전한 일반 검사 후보 준비 중"),
+                                      "questions_complete")
             elif stage == WORKFLOW_INSPECTION:
                 st.markdown("#### 고장 검사 후보 및 측정")
                 if st.button("이전 단계", key=f"cc_wf_inspection_back_{project.project_id}"):
@@ -2352,7 +2416,7 @@ def _render_component_inspector(st: Any, project: ProjectContext, preview: bool,
     if compact:
         active_review_scope = st.session_state.get("cc_active_component_review_scope")
         if active_review_scope:
-            ocr_key, qwen_key = review_aux_keys(active_review_scope)
+            _ocr_key, qwen_key = review_aux_keys(active_review_scope)
             qwen_review = st.session_state.get(qwen_key)
             review_status = ("일부 확인 필요" if not isinstance(qwen_review, dict)
                              or qwen_review.get("verification_status") == "AI_REVIEW_FAILED"
@@ -2360,7 +2424,6 @@ def _render_component_inspector(st: Any, project: ProjectContext, preview: bool,
             st.caption(f"소자 AI 분석 · {review_status}")
             if st.button("소자 AI 검토 다시 실행", key=f"cc_ai_review_retry_{active_review_scope}"):
                 st.session_state.pop(qwen_key, None)
-                st.session_state.pop(ocr_key, None)
                 st.session_state.pop(f"cc_ai_review_run_{active_review_scope}", None)
                 st.rerun()
         return

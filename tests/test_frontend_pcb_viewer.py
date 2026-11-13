@@ -287,8 +287,7 @@ def test_viewer_updates_regions_incrementally_without_replacing_svg_layer():
     assert "entry.shape.classList.toggle(\"cc-selected\", id === selectedId)" in source
     assert "if (!overlayChanged && !selectionChanged) return;" in source
     assert "state.imageGeometryKey !== geometryKey" in source
-    assert "state.setTriggerValue(\"selection_event\", payload)" in source
-    assert 'state.setStateValue("selection", payload)' not in source
+    assert 'state.setStateValue("selection_event", payload)' in source
     assert 'image.setAttribute("href"' in source
 
 

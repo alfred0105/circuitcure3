@@ -163,7 +163,7 @@ def run_component_marking_ocr(image: Any, bbox_xyxy: list[float] | tuple[float, 
         rgb = np.asarray(crop)
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
-        scale = max(2, min(6, 1200 // max(gray.shape)))
+        scale = min(6, max(1, 1200 // max(gray.shape)))
         enlarged = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         engine = _load_engine()
         candidates: dict[str, dict[str, Any]] = {}
@@ -208,3 +208,129 @@ def run_component_marking_ocr(image: Any, bbox_xyxy: list[float] | tuple[float, 
         "possible_part_number": possible_part,
         "verification_status": "unverified",
     }
+
+
+def run_component_marking_ocr_batch(
+    image: Any,
+    targets: list[dict[str, Any]],
+    *,
+    batch_size: int = 4,
+    on_batch: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """OCR several component crops in one RapidOCR detection call per batch.
+
+    RapidOCR's public pipeline accepts one image per call. This packs up to four
+    independently enhanced crops into a separated 2x2 sheet, runs detection and
+    recognition once, then maps each recognized text box back to its source crop.
+    The OCR recognizer internally batches detected text regions.
+    """
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        source = image.convert("RGB") if hasattr(image, "convert") else Image.fromarray(np.asarray(image)).convert("RGB")
+        source_width, source_height = source.size
+        prepared: list[tuple[str, str, np.ndarray]] = []
+        results: dict[str, dict[str, Any]] = {}
+        for target in targets:
+            component_id = str(target.get("component_id") or "")
+            kind = str(target.get("component_type") or "unknown")
+            box = target.get("bbox_xyxy")
+            if not component_id or not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+            x1, y1, x2, y2 = (float(value) for value in box)
+            left, right = max(0, int(min(x1, x2))), min(source_width, int(max(x1, x2)))
+            top, bottom = max(0, int(min(y1, y2))), min(source_height, int(max(y1, y2)))
+            if right <= left or bottom <= top:
+                continue
+            pad_x, pad_y = max(2, int((right - left) * .10)), max(2, int((bottom - top) * .10))
+            crop = source.crop((max(0, left - pad_x), max(0, top - pad_y),
+                                min(source_width, right + pad_x), min(source_height, bottom + pad_y)))
+            gray = cv2.cvtColor(np.asarray(crop), cv2.COLOR_RGB2GRAY)
+            gray = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
+            scale = min(6, max(1, 1200 // max(gray.shape)))
+            enlarged = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            prepared.append((component_id, kind, cv2.cvtColor(enlarged, cv2.COLOR_GRAY2RGB)))
+
+        engine = _load_engine()
+        total_batches = (len(prepared) + batch_size - 1) // batch_size
+        for batch_index in range(total_batches):
+            batch = prepared[batch_index * batch_size:(batch_index + 1) * batch_size]
+            columns = 2
+            rows = (len(batch) + columns - 1) // columns
+            cell_width = max(item[2].shape[1] for item in batch)
+            cell_height = max(item[2].shape[0] for item in batch)
+            gutter = 32
+            sheet = np.full((rows * cell_height + (rows + 1) * gutter,
+                             columns * cell_width + (columns + 1) * gutter, 3), 255, dtype=np.uint8)
+            cell_bounds: list[tuple[str, str, int, int, int, int]] = []
+            for index, (component_id, kind, crop_rgb) in enumerate(batch):
+                row_index, col_index = divmod(index, columns)
+                x = gutter + col_index * (cell_width + gutter) + (cell_width - crop_rgb.shape[1]) // 2
+                y = gutter + row_index * (cell_height + gutter) + (cell_height - crop_rgb.shape[0]) // 2
+                sheet[y:y + crop_rgb.shape[0], x:x + crop_rgb.shape[1]] = crop_rgb
+                cell_bounds.append((component_id, kind, x, y, x + crop_rgb.shape[1], y + crop_rgb.shape[0]))
+
+            output = engine(sheet)
+            boxes = getattr(output, "boxes", None)
+            texts = getattr(output, "txts", None)
+            scores = getattr(output, "scores", None)
+            boxes = [] if boxes is None else boxes
+            texts = [] if texts is None else texts
+            scores = [] if scores is None else scores
+            candidates: dict[str, dict[str, dict[str, Any]]] = {item[0]: {} for item in batch}
+            for text_index, raw_text in enumerate(texts):
+                text = str(raw_text).strip()
+                if not text or text_index >= len(boxes):
+                    continue
+                polygon = np.asarray(boxes[text_index], dtype=float).reshape(-1, 2)
+                center_x, center_y = float(polygon[:, 0].mean()), float(polygon[:, 1].mean())
+                owner = next((bound for bound in cell_bounds
+                              if bound[2] <= center_x < bound[4] and bound[3] <= center_y < bound[5]), None)
+                if owner is None:
+                    continue
+                component_id = owner[0]
+                score = float(scores[text_index]) if text_index < len(scores) else 0.0
+                key = re.sub(r"\s+", "", text).upper()
+                previous = candidates[component_id].get(key)
+                if previous is None or score > previous["ocr_score"]:
+                    candidates[component_id][key] = {"text": text, "ocr_score": score, "rotation_degrees": 0}
+
+            for component_id, kind, *_ in cell_bounds:
+                ordered = sorted(candidates[component_id].values(), key=lambda row: row["ocr_score"], reverse=True)
+                marking = ordered[0]["text"] if ordered else None
+                inferred = infer_passive_value(kind, marking or "") if marking else None
+                results[component_id] = {
+                    "status": "OCR_COMPLETE" if ordered else "OCR_NO_TEXT",
+                    "engine": "RapidOCR · 배치 크롭 · CLAHE · 각도 분류",
+                    "marking": marking,
+                    "candidates": ordered[:5],
+                    "inferred_value": inferred["value"] if inferred else None,
+                    "inference_method": inferred["method"] if inferred else None,
+                    "identification_status": inferred["status"] if inferred else
+                        ("OCR_TEXT_CANDIDATE" if marking else "NO_MARKING_READ"),
+                    "possible_part_number": marking if kind.casefold() in {"ic", "integrated_circuit"} else None,
+                    "verification_status": "unverified",
+                    "batch_index": batch_index + 1,
+                    "batch_size": len(batch),
+                }
+            if callable(on_batch):
+                on_batch(batch_index + 1, total_batches)
+
+        for target in targets:
+            component_id = str(target.get("component_id") or "")
+            if component_id and component_id not in results:
+                results[component_id] = {"status": "OCR_NO_TEXT", "engine": "RapidOCR · 배치 크롭",
+                                         "marking": None, "candidates": [],
+                                         "identification_status": "NO_MARKING_READ",
+                                         "verification_status": "unverified"}
+        return results
+    except OCRUnavailable:
+        raise
+    except ImportError as exc:
+        raise OCRUnavailable("각인 OCR 일괄 처리에는 OpenCV, Pillow, NumPy가 필요합니다.") from exc
+    except Exception as exc:
+        raise OCRUnavailable(f"소자 각인 OCR 일괄 처리에 실패했습니다: {exc}") from exc

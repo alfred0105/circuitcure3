@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import sys
+import logging
+import os
 from pathlib import Path
 
 # Allow `streamlit run src/circuitcare/ui.py` directly from an uninstalled checkout.
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 if str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
+
+if os.environ.get("CIRCUITCARE_VIEWER_DEBUG", "").lower() in {"1", "true", "yes"}:
+    logging.getLogger("circuitcare.frontend.component_map_adapter").setLevel(logging.INFO)
+    logging.getLogger("circuitcare.dashboard.components.pcb_workspace").setLevel(logging.INFO)
 
 
 def main() -> None:

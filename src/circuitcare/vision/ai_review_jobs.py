@@ -9,6 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
+import json
 from collections import OrderedDict
 import threading
 import time
@@ -176,13 +177,15 @@ def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[st
     started = time.perf_counter()
     state = deepcopy(snapshot["state"])
     progress = progress or _Progress()
-    progress.set_stage("OCR_BOARD", "RapidOCR·Qwen 검수 작업 시작")
+    progress.set_stage("QWEN_CLASS_REVIEW" if snapshot.get("selected_component_ids") else "OCR_BOARD",
+                       "선택 박스 분류 시작" if snapshot.get("selected_component_ids")
+                       else "OCR·Qwen 검수 작업 시작")
     api = _WorkerAPI(state)
     try:
         result = ensure_ai_component_review(
             api, image_bytes=snapshot["image_bytes"], scope=snapshot["scope"],
             rows=deepcopy(snapshot["rows"]), records_key=snapshot["records_key"],
-            progress=progress,
+            progress=progress, selected_component_ids=snapshot.get("selected_component_ids"),
         )
         review_key = f"cc_component_qwen_review_{snapshot['scope']}"
         review = state.get(review_key) if isinstance(state.get(review_key), dict) else {}
@@ -207,7 +210,8 @@ def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[st
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                 "fingerprint": snapshot["fingerprint"], "scope": snapshot["scope"],
                 "user_version": snapshot.get("user_version"),
-                "review_fingerprint": snapshot.get("review_fingerprint")}
+                "review_fingerprint": snapshot.get("review_fingerprint"),
+                "selected_component_ids": snapshot.get("selected_component_ids")}
     except Exception as exc:  # Keep worker failures isolated from Streamlit's script thread.
         error = f"{type(exc).__name__}: {str(exc)[:400]}"
         progress.set_stage("FAILED", error, error=error)
@@ -216,16 +220,22 @@ def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[st
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                 "fingerprint": snapshot["fingerprint"], "scope": snapshot["scope"],
                 "user_version": snapshot.get("user_version"),
-                "review_fingerprint": snapshot.get("review_fingerprint")}
+                "review_fingerprint": snapshot.get("review_fingerprint"),
+                "selected_component_ids": snapshot.get("selected_component_ids")}
 
 
 def submit_ai_review(*, owner: str, scope: str, fingerprint: str, image_bytes: bytes,
                      rows: list[dict[str, Any]], records_key: str,
                      state_snapshot: dict[str, Any], user_version: str | None = None,
                      review_fingerprint: str | None = None,
+                     selected_component_ids: list[str] | None = None,
                      retry_failed: bool = False) -> tuple[str | None, str]:
     """Submit or reuse one review job; never queue an unbounded model backlog."""
-    request_key = hashlib.sha256(f"{scope}|{fingerprint}".encode()).hexdigest()[:24]
+    selected_ids = sorted({str(value) for value in (selected_component_ids or [])})
+    request_key = hashlib.sha256(json.dumps(
+        [scope, fingerprint, "selected_class_only" if selected_ids else "legacy_full_review", selected_ids],
+        separators=(",", ":"),
+    ).encode()).hexdigest()[:24]
     request = (owner, request_key)
     with _LOCK:
         _prune_jobs()
@@ -253,7 +263,8 @@ def submit_ai_review(*, owner: str, scope: str, fingerprint: str, image_bytes: b
         snapshot = {"state": deepcopy(state_snapshot), "image_bytes": bytes(image_bytes),
                     "scope": scope, "rows": deepcopy(rows), "records_key": records_key,
                     "fingerprint": fingerprint, "user_version": user_version,
-                    "review_fingerprint": review_fingerprint}
+                    "review_fingerprint": review_fingerprint,
+                    "selected_component_ids": selected_ids or None}
         progress = _Progress()
         progress.set_stage("PENDING", "AI 검수 대기 중")
         future = _EXECUTOR.submit(lambda queued_snapshot: _run(queued_snapshot, progress), snapshot)

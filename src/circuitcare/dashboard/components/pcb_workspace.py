@@ -71,11 +71,12 @@ def validate_component_selection_event(
         return False, "중복 또는 오래된 선택 이벤트"
     if not isinstance(event_id, str) or not event_id.strip():
         return False, "선택 이벤트 ID가 없습니다."
-    if (action == "select" and isinstance(component_id, str)
+    if (action in {"select", "bulk-select"} and isinstance(component_id, str)
             and component_id in allowed_ids
             and isinstance(overlap_ids, list)
             and component_id in overlap_ids
-            and all(isinstance(item, str) for item in overlap_ids)):
+            and all(isinstance(item, str) and item in allowed_ids for item in overlap_ids)
+            and (action != "bulk-select" or bool(overlap_ids))):
         return True, None
     if action == "clear" and component_id is None:
         return True, None
@@ -138,6 +139,7 @@ def render_component_viewer(
         f"{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}".encode()
     ).hexdigest()[:16]
     viewer_key = f"cc_v4_pcb_viewer_{digest}"
+    bulk_selection_key = f"cc_pcb_bulk_selection_{viewer_key}"
     expected_asset_key = f"{image_fingerprint}|{project.project_id}|{project.board_id or ''}|{board_side}|{frame_id}"
     overlay_version = hashlib.sha256(repr([
         (item.component_id, item.bbox_xyxy, item.display_label, item.component_type,
@@ -154,6 +156,7 @@ def render_component_viewer(
         if previous_viewer_key:
             st.session_state[f"{OVERLAPPING_SELECTION_KEY}_{previous_viewer_key}"] = []
         st.session_state[f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"] = []
+        st.session_state[bulk_selection_key] = []
         update_selection(st.session_state, project=project, selected_component=None)
         st.session_state[active_frame_key] = frame_scope
         st.session_state["circuitcare_v4_active_viewer_key"] = viewer_key
@@ -163,7 +166,7 @@ def render_component_viewer(
         selection = update_selection(st.session_state, project=project, selected_component=None)
         selected_id = selection.selected_component
 
-    mount_status_key = f"{viewer_key}_mount_status"
+    mount_status_key = f"{viewer_key}_{image_fingerprint[:16]}_mount_status"
     last_id_key = f"{viewer_key}_last_event"
     rejected_id_key = f"{viewer_key}_rejected_event"
 
@@ -241,7 +244,18 @@ def render_component_viewer(
             st.session_state[last_id_key] = event["event_id"]
             st.session_state[last_seq_key] = seq
             on_box_draw([int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))])
+            LOGGER.info("pcb_selection stage=python_commit viewer=%s event_id=%s action=draw result=accepted bbox=%s",
+                        viewer_key, event["event_id"], [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))])
             return True
+        if event.get("selection_action") == "draw":
+            LOGGER.warning("pcb_selection stage=python_validate viewer=%s event_id=%s action=draw result=rejected owner_match=%s epoch_match=%s seq=%r last_seq=%s callback_available=%s",
+                           viewer_key, event.get("event_id"),
+                           (event.get("project_id"), event.get("board_id"), event.get("board_side"),
+                            event.get("canonical_frame_id"))
+                           == (project.project_id, project.board_id or "", board_side, frame_id),
+                           event.get("event_epoch") == event_epoch, seq,
+                           int(st.session_state.get(last_seq_key, 0)), on_box_draw is not None)
+            return False
         component_id = event.get("component_id")
         allowed_ids = {item.component_id for item in components}
         accepted, reason = validate_component_selection_event(
@@ -266,6 +280,10 @@ def render_component_viewer(
         overlap_ids = [item for item in raw_overlap_ids if item in allowed_ids]
         if component_id not in overlap_ids:
             overlap_ids.insert(0, component_id)
+        if event.get("selection_action") == "bulk-select":
+            st.session_state[bulk_selection_key] = list(dict.fromkeys(overlap_ids))
+        else:
+            st.session_state[bulk_selection_key] = []
         overlap_key = f"{OVERLAPPING_SELECTION_KEY}_{viewer_key}"
         if component_id is None:
             st.session_state[overlap_key] = []
@@ -278,7 +296,7 @@ def render_component_viewer(
         update_component_selection(st.session_state, project=project,
                                    selected_component=component_id,
                                    board_component_id=board_component_id)
-        LOGGER.info("pcb_selection stage=selection_state viewer=%s event_id=%s selected=%s overlaps=%s",
+        LOGGER.info("pcb_selection stage=python_commit viewer=%s event_id=%s action=select result=accepted selected=%s overlaps=%s",
                     viewer_key, event.get("event_id"), component_id, overlap_ids)
         _record_selection_trace(
             st.session_state,
@@ -335,8 +353,11 @@ def render_component_viewer(
         st, image_png_base64=image_b64, image_size_px=image_size_px, components=payload,
         project_id=project.project_id, board_id=project.board_id or "", board_side=board_side,
         frame_id=frame_id, photo_id=photo_id or frame_id,
+        viewer_ready_ack=st.session_state.get(mount_status_key) == "READY",
         analysis_loading=analysis_loading,
-        selected_component_id=selected_id, asset_key=image_fingerprint,
+        selected_component_id=selected_id,
+        selected_component_ids=list(st.session_state.get(bulk_selection_key, [])),
+        asset_key=image_fingerprint,
         overlay_version=overlay_version, debug_telemetry=debug_telemetry,
         selection_ack_event_id=ack_event_id, selection_rejected_event_id=rejected_event_id,
         event_sequence_seed=int(st.session_state.get(f"{viewer_key}_last_seq", 0)),

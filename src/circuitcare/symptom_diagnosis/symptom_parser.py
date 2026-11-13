@@ -54,21 +54,23 @@ def parse_user_report(client: OllamaClient, model: str, text: str) -> dict[str, 
         "type": "object", "additionalProperties": False,
         "required": ["observations", "uncertain_facts", "requires_clarification"],
         "properties": {
-            "observations": {"type": "array", "maxItems": 32, "items": {
+            "observations": {"type": "array", "maxItems": 4, "items": {
                 "type": "object", "additionalProperties": False,
                 "required": ["code", "value", "evidence_quote"],
                 "properties": {"code": {"type": "string", "enum": list(allowed)},
                                "value": {"type": "boolean"},
-                               "evidence_quote": {"type": "string", "maxLength": 250}},
+                               "evidence_quote": {"type": "string", "maxLength": 160}},
             }},
-            "uncertain_facts": {"type": "array", "maxItems": 8,
-                                 "items": {"type": "string", "maxLength": 300}},
+            "uncertain_facts": {"type": "array", "maxItems": 4,
+                                 "items": {"type": "string", "maxLength": 160}},
             "requires_clarification": {"type": "boolean"},
         },
     }
     response = client.chat_json(model, [
         {"role": "system", "content": (
             "너는 PCB 증상 문장을 관측값으로 구조화한다. 고장 원인은 추론하지 않는다. "
+            "명시적 근거가 있는 관측만 최대 4개 반환하고, 증상 추측·누락된 사실의 부정 추론은 하지 않는다. "
+            "불명확하면 observations와 uncertain_facts를 비워 둔다. "
             "입력에 명시된 사실만 추출하고, 각 항목의 evidence_quote는 원문에서 그대로 복사한다. "
             "가정·조건 표현(예: ~면, ~라면, ~할 경우)은 발생한 증상으로 기록하지 않는다. "
             "이중 부정이나 정정(예: 안 켜지는 것은 아님)은 증상 발생으로 기록하지 않는다. "
@@ -79,7 +81,7 @@ def parse_user_report(client: OllamaClient, model: str, text: str) -> dict[str, 
             "\"evidence_quote\":\"원문 인용\"}],\"uncertain_facts\":[],\"requires_clarification\":false}"
         )},
         {"role": "user", "content": "허용 코드와 설명: " + str(allowed_desc) + "\n원문: " + text[:2000]},
-    ], output_schema=schema)
+    ], output_schema=schema, output_budget=480)
     data = response.get("content", {})
     accepted: list[Observation] = []
     uncertain_rows = data.get("uncertain_facts", [])

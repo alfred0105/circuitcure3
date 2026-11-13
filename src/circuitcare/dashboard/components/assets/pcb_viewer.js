@@ -22,7 +22,8 @@ export default function(component) {
   let state = instances.get(root);
   if (!state) {
     state = { scale:1, x:0, y:0, assetKey:"", hover:null, drag:null, drawMode:false, boxDraw:null,
-      selectedComponentId:undefined, pendingSelection:null, suppressClick:false,
+      selectedComponentIds:[],
+      selectedComponentId:undefined, pendingSelection:null,
       listeners:[], observer:null, sequence:0, userAdjusted:false, mountedAssetKey:"",
       instanceId:`pcb-${Date.now()}-${Math.random().toString(36).slice(2,8)}`, renderCount:0, hrefChangeCount:0 };
     instances.set(root, state);
@@ -64,6 +65,7 @@ export default function(component) {
   } else if (!state.pendingSelection) {
     state.selectedComponentId = data.selected_component_id;
   }
+  state.selectedComponentIds = Array.isArray(data.selected_component_ids) ? data.selected_component_ids : [];
   state.sequence = Math.max(state.sequence, Number(data.event_sequence_seed) || 0);
   const listen = (target, event, callback, options) => {
     target.addEventListener(event, callback, options);
@@ -117,9 +119,10 @@ export default function(component) {
       state.regionNodes?.get(state.selectedComponentId)?.shape.classList.add("cc-selected");
     const statusLabel = root.querySelector("[data-status-label]");
     const selected = (state.data.components || []).find((item) => item.component_id === state.selectedComponentId);
-    if (statusLabel) statusLabel.textContent = selected
-      ? `선택 ${selected.display_label || selected.component_type} · ${selected.component_id}`
-      : `박스 ${(state.data.components || []).length}개 · 클릭하여 선택`;
+    if (statusLabel) statusLabel.textContent = (state.selectedComponentIds || []).length > 1
+      ? `다중 선택 ${(state.selectedComponentIds || []).length}개 · ⌘/Ctrl+클릭으로 추가·해제`
+      : selected ? `선택 ${selected.display_label || selected.component_type} · ${selected.component_id}`
+        : `박스 ${(state.data.components || []).length}개 · 클릭하여 선택`;
   };
   const sendSelection = (componentId, action = null, bbox = null, overlapIds = null) => {
     if (state.data.analysis_loading) return;
@@ -138,9 +141,12 @@ export default function(component) {
     console.debug("[pcb-selection] event_send", {event_id:payload.event_id, seq:payload.event_seq,
       action:payload.selection_action, component_id:componentId,
       overlapping_component_ids:payload.overlapping_component_ids});
-    // Selection is an event, not durable frontend state: the trigger guarantees
-    // one callback per physical click, including repeated clicks on the same box.
-    state.setTriggerValue("selection_event", payload);
+    // Keep the latest pointer event in component state. A unique event_id makes
+    // repeated clicks distinct state updates, while the state callback is
+    // reliably scoped to the owning Streamlit fragment. Trigger aggregators
+    // can be delivered after a fragment has already rerun, leaving the browser
+    // highlight ahead of the Python inspector and manual-box store.
+    state.setStateValue("selection_event", payload);
     if (action !== "draw") state.pendingSelection = {eventId, componentId};
   };
   const showTooltip = (item, event) => {
@@ -183,20 +189,29 @@ export default function(component) {
     const components = data.components || [];
     const selectedId = state.selectedComponentId !== undefined
       ? state.selectedComponentId : data.selected_component_id;
+    const bulkIds = new Set(state.selectedComponentIds || []);
     const overlayChanged = state.renderedOverlayVersion !== data.overlay_version;
-    const selectionChanged = state.renderedSelectedId !== selectedId;
+    const bulkSignature = [...bulkIds].sort().join("|");
+    const selectionChanged = state.renderedSelectedId !== selectedId
+      || state.renderedBulkSignature !== bulkSignature;
     if (!overlayChanged && !selectionChanged) return;
     if (!overlayChanged) {
       if (state.renderedSelectedId)
         state.regionNodes?.get(state.renderedSelectedId)?.shape.classList.remove("cc-selected");
+      for (const id of state.renderedBulkIds || [])
+        state.regionNodes?.get(id)?.shape.classList.remove("cc-bulk-selected");
       if (selectedId)
         state.regionNodes?.get(selectedId)?.shape.classList.add("cc-selected");
+      for (const id of bulkIds) state.regionNodes?.get(id)?.shape.classList.add("cc-bulk-selected");
+      state.renderedBulkIds = [...bulkIds];
+      state.renderedBulkSignature = bulkSignature;
       state.renderedSelectedId = selectedId;
       const statusLabel = root.querySelector("[data-status-label]");
       const selected = components.find((item) => item.component_id === selectedId);
-      if (statusLabel) statusLabel.textContent = selected
-        ? `선택 ${selected.display_label || selected.component_type} · ${selected.component_id}`
-        : `박스 ${components.length}개 · 클릭하여 선택`;
+      if (statusLabel) statusLabel.textContent = bulkIds.size > 1
+        ? `다중 선택 ${bulkIds.size}개 · ⌘/Ctrl+클릭으로 추가·해제`
+        : selected ? `선택 ${selected.display_label || selected.component_type} · ${selected.component_id}`
+          : `박스 ${components.length}개 · 클릭하여 선택`;
       return;
     }
     if (!state.regionNodes) state.regionNodes = new Map();
@@ -246,15 +261,19 @@ export default function(component) {
         entry.visualKey = visualKey;
       }
       entry.shape.classList.toggle("cc-selected", id === selectedId);
+      entry.shape.classList.toggle("cc-bulk-selected", bulkIds.has(id));
     }
     state.renderedOverlayVersion = data.overlay_version;
     state.renderedSelectedId = selectedId;
+    state.renderedBulkIds = [...bulkIds];
+    state.renderedBulkSignature = bulkSignature;
     const statusLabel = root.querySelector("[data-status-label]");
     if (statusLabel) {
       const selected = components.find((item) => item.component_id === selectedId);
-      statusLabel.textContent = selected
-        ? `선택 ${selected.display_label || selected.component_type} · ${selected.component_id}`
-        : `박스 ${components.length}개 · 클릭하여 선택`;
+      statusLabel.textContent = bulkIds.size > 1
+        ? `다중 선택 ${bulkIds.size}개 · ⌘/Ctrl+클릭으로 추가·해제`
+        : selected ? `선택 ${selected.display_label || selected.component_type} · ${selected.component_id}`
+          : `박스 ${components.length}개 · 클릭하여 선택`;
     }
   };
   const setImage = () => {
@@ -276,6 +295,7 @@ export default function(component) {
       if (!image.isConnected || image.width.baseVal.value !== expectedWidth
           || image.height.baseVal.value !== expectedHeight) return;
       state.mountedAssetKey=key;
+      if (data.viewer_ready_ack) return;
       setStateValue("viewer_status", { asset_key:key, status:"READY",
         image_size_px:[expectedWidth,expectedHeight], event_id:`ready-${Date.now()}` });
       telemetry("VIEWER_READY", {reason:"image decoded", ready_key_hash:readyOnceKey.slice(0,24)});
@@ -285,7 +305,8 @@ export default function(component) {
       telemetry("ASSET_KEY_CHANGED", {reason:previousAssetKey ? "image fingerprint changed" : "initial image"});
       state.assetKey=key;
       state.hover=null; state.drag=null; state.boxDraw=null; state.drawMode=false;
-      state.selectedComponentId=undefined; state.pendingSelection=null; state.suppressClick=false;
+      state.selectedComponentIds=[];
+      state.selectedComponentId=undefined; state.pendingSelection=null;
       tooltip.hidden=true; viewport.dataset.dragging="false"; viewport.dataset.drawing="false";
       const drawButton=root.querySelector('[data-action="draw-box"]');
       if(drawButton)drawButton.textContent="박스 그리기";
@@ -304,6 +325,9 @@ export default function(component) {
   };
   if (state.listeners.length === 0) {
     listen(viewport,"wheel",(event)=>{ event.preventDefault(); zoomAt(event.deltaY<0?1.12:1/1.12,point(event.clientX,event.clientY)); },{passive:false});
+    listen(viewport,"contextmenu",(event)=>{
+      if(event.ctrlKey && event.target.closest("[data-component-id]"))event.preventDefault();
+    });
     listen(viewport,"pointerdown",(event)=>{
       if (state.data.analysis_loading) return;
       if (event.button!==0) return;
@@ -360,8 +384,6 @@ export default function(component) {
         const drawButton=root.querySelector('[data-action="draw-box"]');
         if(drawButton)drawButton.textContent="박스 그리기";
         if(bbox[2]-bbox[0]>=4&&bbox[3]-bbox[1]>=4)sendSelection(null,"draw",bbox);
-        state.suppressClick=true;
-        setTimeout(()=>{state.suppressClick=false},0);
         try{if(viewport.hasPointerCapture(event.pointerId))viewport.releasePointerCapture(event.pointerId)}catch(_){/* already released */}
         return;
       }
@@ -371,30 +393,30 @@ export default function(component) {
       if (!drag.moved) {
         // Safari may retarget or omit the synthesized click after pointer
         // capture. The pointerup coordinates are still the physical click.
-        const hits=hitComponents(event);
+        const hits=hitComponents(event).filter((item)=>item.overlay_status!=="EXCLUDED");
         const ids=hits.map((item)=>item.component_id);
-        const selectedId=ids[0] || null;
+        let selectedId=ids[0] || null;
         console.debug("[pcb-selection] pointerup_select", {x:event.clientX,y:event.clientY,
           selected_component_id:selectedId, overlapping_component_ids:ids,
           asset_key:state.assetKey});
-        applySelectedHighlight(selectedId);
-        sendSelection(selectedId, null, null, ids);
+        if ((event.metaKey || event.ctrlKey) && selectedId) {
+          const next=new Set(state.selectedComponentIds||[]);
+          if(next.has(selectedId))next.delete(selectedId);else next.add(selectedId);
+          state.selectedComponentIds=[...next];
+          selectedId=next.has(ids[0])?ids[0]:(state.selectedComponentIds[state.selectedComponentIds.length-1]||null);
+          for(const [id,entry] of state.regionNodes||[])
+            entry.shape.classList.toggle("cc-bulk-selected",next.has(id));
+          applySelectedHighlight(selectedId);
+          sendSelection(selectedId,next.size?"bulk-select":"clear",null,[...next]);
+        } else {
+          state.selectedComponentIds=[];
+          for(const [id,entry] of state.regionNodes||[])entry.shape.classList.remove("cc-bulk-selected");
+          applySelectedHighlight(selectedId);
+          sendSelection(selectedId, null, null, ids);
+        }
       }
-      state.suppressClick=true;
-      setTimeout(()=>{state.suppressClick=false},0);
       viewport.dataset.dragging="false";
       try { if(viewport.hasPointerCapture(event.pointerId))viewport.releasePointerCapture(event.pointerId); } catch (_) { /* already released */ }
-    });
-    listen(viewport,"click",(event)=>{
-      if (state.drawMode || state.suppressClick || event.detail === 0) return;
-      const hits=hitComponents(event);
-      const ids=hits.map((item)=>item.component_id);
-      const selectedId=ids[0] || null;
-      console.debug("[pcb-selection] click", {x:event.clientX,y:event.clientY,
-        selected_component_id:selectedId, overlapping_component_ids:ids,
-        asset_key:state.assetKey});
-      applySelectedHighlight(selectedId);
-      sendSelection(selectedId, null, null, ids);
     });
     const cancelDrag=(event)=>{
       if(state.boxDraw && state.boxDraw.id===event.pointerId){
@@ -408,7 +430,11 @@ export default function(component) {
     listen(viewport,"pointercancel",cancelDrag); listen(viewport,"lostpointercapture",cancelDrag);
     listen(layer,"keydown",(event)=>{ if(event.key!=="Enter"&&event.key!==" ")return; const shape=event.target.closest("[data-component-id]"); if(!shape)return; event.preventDefault(); const id=shape.dataset.componentId; applySelectedHighlight(id); sendSelection(id, null, null, [id]); });
     for(const button of root.querySelectorAll("[data-action]")) listen(button,"click",()=>{
-      const action=button.dataset.action; if(action==="clear-selection"){applySelectedHighlight(null);sendSelection(null);}
+      const action=button.dataset.action; if(action==="clear-selection"){
+        state.selectedComponentIds=[];
+        for(const [id,entry] of state.regionNodes||[])entry.shape.classList.remove("cc-bulk-selected");
+        applySelectedHighlight(null);sendSelection(null);
+      }
       else if(action==="draw-box"){
         state.drawMode=!state.drawMode;viewport.dataset.drawing=state.drawMode?"true":"false";
         button.textContent=state.drawMode?"그리기 취소":"박스 그리기";

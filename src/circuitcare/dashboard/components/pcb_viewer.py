@@ -13,11 +13,12 @@ def render_pcb_viewer(
     st: Any, *, image_png_base64: str, image_size_px: tuple[int, int],
     components: list[dict[str, Any]], project_id: str, board_id: str,
     board_side: str, frame_id: str, selected_component_id: str | None,
+    selected_component_ids: list[str],
     asset_key: str, overlay_version: str, debug_telemetry: bool,
     event_sequence_seed: int, event_epoch: str, key: str,
     selection_ack_event_id: str | None, selection_rejected_event_id: str | None,
     on_selection_change: Any, on_selection_event_change: Any,
-    on_viewer_status_change: Any, photo_id: str | None = None, analysis_loading: bool = False,
+    on_viewer_status_change: Any, photo_id: str | None = None, analysis_loading: bool = False, viewer_ready_ack: bool = False,
 ) -> Any | None:
     """Render image and vector overlays under one SVG camera transform."""
     if not hasattr(st, "components") or not hasattr(st.components, "v2"):
@@ -41,11 +42,13 @@ def render_pcb_viewer(
             "frame_id": frame_id,
             "photo_id": photo_id or frame_id,
             "analysis_loading": analysis_loading,
+            "viewer_ready_ack": viewer_ready_ack,
             "viewer_key": key,
             "asset_key": asset_key,
             "overlay_version": overlay_version,
             "debug_telemetry": debug_telemetry,
             "selected_component_id": selected_component_id,
+            "selected_component_ids": selected_component_ids,
             "selection_ack_event_id": selection_ack_event_id,
             "selection_rejected_event_id": selection_rejected_event_id,
             "event_sequence_seed": event_sequence_seed,

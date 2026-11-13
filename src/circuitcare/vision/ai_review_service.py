@@ -34,10 +34,32 @@ def _clean_string_list(value: Any, *, limit: int = 8, max_length: int = 240) -> 
         return []
     return [str(item).strip()[:max_length] for item in value[:limit] if str(item).strip()]
 
+
+def _compact_ocr_candidates(records: list[dict[str, Any]], *, limit: int = 48) -> list[dict[str, Any]]:
+    """Bound OCR prompt size; model output must not scale with untrusted OCR text."""
+    compact = []
+    for row in records[:max(0, limit)]:
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("raw_text", row.get("text", ""))).strip()[:120]
+        bbox = row.get("bbox_xyxy")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            try:
+                bbox = [round(float(value), 1) for value in bbox]
+            except (TypeError, ValueError, OverflowError):
+                bbox = None
+        else:
+            bbox = None
+        compact.append({"text": text, "bbox_xyxy": bbox,
+                        "confidence": row.get("confidence"),
+                        "reference_candidates": _clean_string_list(row.get("reference_candidates"), limit=5,
+                                                                     max_length=40)})
+    return compact
+
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
-        "class_reviews": {"type": "array", "items": {"type": "object", "properties": {
+        "class_reviews": {"type": "array", "maxItems": 6, "items": {"type": "object", "properties": {
             "detection_id": {"type": "string"}, "decision": {"type": "string", "enum": ["suggest", "uncertain"]},
             "detector_class": {"type": "string", "enum": list(COMPONENT_LABELS)},
             "proposed_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
@@ -56,13 +78,13 @@ REVIEW_SCHEMA = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
         }, "required": ["detection_id", "decision", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
-        "duplicate_reviews": {"type": "array", "items": {"type": "object", "properties": {
+        "duplicate_reviews": {"type": "array", "maxItems": 0, "items": {"type": "object", "properties": {
             "detection_ids": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2},
             "decision": {"type": "string", "enum": ["same_component", "different_components", "uncertain"]},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
         }, "required": ["detection_ids", "decision", "confidence", "evidence"], "additionalProperties": False}},
-        "group_reviews": {"type": "array", "items": {"type": "object", "properties": {
+        "group_reviews": {"type": "array", "maxItems": 2, "items": {"type": "object", "properties": {
             "parent_id": {"type": "string"},
             "decision": {"type": "string", "enum": ["single_component", "multiple_components", "uncertain"]},
             "child_ids": {"type": "array", "items": {"type": "string"}},
@@ -76,7 +98,7 @@ REVIEW_SCHEMA = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
         }, "required": ["parent_id", "decision", "child_ids", "new_components", "confidence", "evidence"], "additionalProperties": False}},
-        "missed_component_candidates": {"type": "array", "items": {"type": "object", "properties": {
+        "missed_component_candidates": {"type": "array", "maxItems": 4, "items": {"type": "object", "properties": {
             "image_index": {"type": "integer", "minimum": 0, "maximum": 48},
             "bbox_norm_999": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 999}, "minItems": 4, "maxItems": 4},
             "proposed_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
@@ -84,7 +106,7 @@ REVIEW_SCHEMA = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
         }, "required": ["image_index", "bbox_norm_999", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
-        "notes": {"type": "array", "items": {"type": "string"}},
+        "notes": {"type": "array", "maxItems": 4, "items": {"type": "string"}},
     },
     "required": ["class_reviews", "duplicate_reviews", "group_reviews", "missed_component_candidates", "notes"],
     "additionalProperties": False,
@@ -96,9 +118,29 @@ DUPLICATE_REVIEW_SCHEMA["properties"]["group_reviews"]["maxItems"] = 0
 DUPLICATE_REVIEW_SCHEMA["properties"]["missed_component_candidates"]["maxItems"] = 0
 DUPLICATE_REVIEW_SCHEMA["properties"]["notes"]["maxItems"] = 0
 
+CLASS_ONLY_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {"class_reviews": {"type": "array", "minItems": 1, "maxItems": 6, "items": {
+        "type": "object",
+        "properties": {
+            "detection_id": {"type": "string"},
+            "decision": {"type": "string", "enum": ["suggest", "uncertain"]},
+            "proposed_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
+            "proposed_subtype": {"type": ["string", "null"]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence": {"type": "string"},
+        },
+        "required": ["detection_id", "decision", "proposed_class", "confidence", "evidence"],
+        "additionalProperties": False,
+    }}},
+    "required": ["class_reviews"],
+    "additionalProperties": False,
+}
+
 _SYSTEM = """Review the PCB images independently of YOLO. For each detection first decide whether the crop shows a physical electronic component, a relevant non-component board feature, or an uncertain/non-relevant object. Preserve the detector's class as evidence but do not copy it as your answer; an IC detector proposal may be a connector or socket. Choose a base class from the existing 18 detector classes when it applies; otherwise use other_component for a physical part, board_feature for a PCB structure, unknown when unclear, or not_component only for a clear false positive. These Qwen-only classes do not change YOLO labels. Set proposed_class equal to proposed_base_class for compatibility. Propose a subtype only when visually distinctive; otherwise use null. IC socket is an other_component subtype, not an installed IC. Explain visible body/package/pin/housing evidence, compare body OCR separately from nearby silkscreen, and do not infer a class solely from U3/J1/CN1. OCR/designator conflicts should be recorded in conflicting_evidence and require user review, but a weak nearby designator must not override clear visual evidence. Confidence is an uncalibrated model score, never a probability. Retain alternatives and uncertainty. Do not claim identity, electrical rating, pinout, or datasheet facts not visible or independently verified. Existing detections are ID-scoped; use only supplied IDs. Assess duplicate pairs only in supplied paired crops; do not delete anything. For group candidates, distinguish multiple separate bodies from a single package, connector, pins, or internal structure. Reuse listed child IDs and only suggest missing boxes as unverified. Keep evidence to one concise sentence and only populate optional arrays/fields when they add useful evidence. Return only the requested JSON object."""
 
 _DUPLICATES_ONLY_SYSTEM = """Assess only whether each supplied pair of detection boxes depicts the same physical component or two distinct components. Use the paired crops and supplied IDs. Pay attention to connector housing/pins, IC package structure, and nearby separate parts; pins or contacts within one connector/IC are not separate PCB components. Do not classify components, propose boxes, or recommend deletion. Use decision uncertain when the crop does not settle identity. Keep evidence to one concise sentence. Return empty arrays for class_reviews, group_reviews, missed_component_candidates, and notes, and return exactly one duplicate_reviews object for every supplied pair. Every duplicate object must include detection_ids with the exact pair IDs, decision, numeric confidence from 0 to 1, and evidence. Confidence is uncalibrated and never authorizes deletion. Return only schema-valid JSON."""
+_CLASS_ONLY_SYSTEM = """Estimate the component type for only the supplied selected PCB box(es). Each crop includes nearby PCB context; use supplied nearby OCR and silkscreen reference candidates only as supporting clues. A designator such as R12, C4, U3, or J1 is not enough by itself to decide the part type, and nearby text may belong to another part. Distinguish body markings from silkscreen. Do not claim an exact part number, electrical rating, pinout, function, or fault. Return one class_reviews item for each supplied detection_id and no other analysis. Choose only from the allowed classes. If visual and text evidence is unclear or conflicts, use proposed_class=unknown and decision=uncertain. Do not analyze duplicate boxes, groups, missed components, electrical function, or faults. Give one short evidence sentence that identifies whether it relies on body appearance, body marking, or nearby silkscreen. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
 
 
 def _review_images(
@@ -106,6 +148,7 @@ def _review_images(
     group_candidates: list[dict[str, Any]] | None = None,
     duplicate_pair_candidates: list[dict[str, Any]] | None = None,
     review_diagnostics: list[dict[str, Any]] | None = None, max_crop_count: int = 10,
+    component_crop_padding_ratio: float = .25,
     include_full_image: bool = True,
 ) -> tuple[list[bytes], tuple[int, int], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     with Image.open(io.BytesIO(image_bytes)) as source_image:
@@ -137,19 +180,29 @@ def _review_images(
         if not isinstance(box, (list, tuple)) or len(box) != 4:
             continue
         x1, y1, x2, y2 = map(float, box)
-        pad_x, pad_y = max(3, (x2 - x1) * .25), max(3, (y2 - y1) * .25)
-        crop = image.crop((max(0, int(x1 - pad_x)), max(0, int(y1 - pad_y)),
-                           min(width, int(x2 + pad_x)), min(height, int(y2 + pad_y))))
+        pad_x = max(3, (x2 - x1) * component_crop_padding_ratio)
+        pad_y = max(3, (y2 - y1) * component_crop_padding_ratio)
+        crop_box = (max(0, int(x1 - pad_x)), max(0, int(y1 - pad_y)),
+                    min(width, int(x2 + pad_x)), min(height, int(y2 + pad_y)))
+        crop = image.crop(crop_box)
+        if component_crop_padding_ratio > .25:
+            painter = ImageDraw.Draw(crop)
+            local_box = (int(x1 - crop_box[0]), int(y1 - crop_box[1]),
+                         int(x2 - crop_box[0]), int(y2 - crop_box[1]))
+            painter.rectangle(local_box, outline="#ff9d2e", width=4)
+            painter.text((local_box[0] + 2, max(0, local_box[1] - 16)),
+                         str(row["detection_id"]), fill="white", stroke_width=2, stroke_fill="black")
         crop.thumbnail((720, 720), Image.Resampling.LANCZOS)
         images.append(crop)
         manifest.append({"image_index": len(images) - 1, "kind": "detection_crop",
                          "detection_id": str(row["detection_id"]),
-                         "bbox_xyxy": [max(0.0, x1 - pad_x), max(0.0, y1 - pad_y),
-                                       min(float(width), x2 + pad_x), min(float(height), y2 + pad_y)]})
+                         "bbox_xyxy": list(crop_box)})
 
     # Add overlapping native-resolution views so small parts remain visible to Qwen.
     tile_size, overlap, max_tiles = 1024, 0.25, 16
-    if include_full_image and (width > tile_size or height > tile_size):
+    # The overview is already kept at up to 1600 px. Tiling a 1310x1444 source
+    # adds four highly redundant images without adding source detail.
+    if include_full_image and (width > 1600 or height > 1600):
         step = int(tile_size * (1 - overlap))
         def positions(length: int) -> list[int]:
             if length <= tile_size:
@@ -200,7 +253,7 @@ def _review_images(
                          "detection_ids": [left["detection_id"], right["detection_id"]],
                          "bbox_xyxy": crop_box})
     group_manifest = []
-    for group in (group_candidates or [])[:8]:
+    for group in (group_candidates or [])[:2]:
         parent, children = group["parent"], group["children"]
         parent_box = parent["bbox_xyxy"]
         group_boxes = [parent_box, *[child["bbox_xyxy"] for child in children]]
@@ -320,6 +373,7 @@ def review_components_with_qwen(
     ocr_records: list[dict[str, Any]],
     *, duplicate_pair_candidates: list[dict[str, Any]] | None = None,
     duplicate_pairs_only: bool = False,
+    classification_only: bool = False,
     include_board_context: bool = True,
 ) -> dict[str, Any]:
     """Request suggestions and validate every ID and normalized box before display."""
@@ -341,7 +395,7 @@ def review_components_with_qwen(
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
             image_size = source.size
-        group_candidates = ([] if duplicate_pairs_only else
+        group_candidates = ([] if duplicate_pairs_only or classification_only else
                             find_group_box_candidates(identified, image_size=image_size,
                                                       diagnostics=candidate_diagnostics))
         if duplicate_pair_candidates is not None:
@@ -353,14 +407,19 @@ def review_components_with_qwen(
                 if len(ids) == 2 and all(value in identified_by_id for value in ids):
                     normalized_pairs.append({**pair, "detections": tuple(identified_by_id[value] for value in ids)})
             duplicate_pair_candidates = normalized_pairs
-        for group in group_candidates[8:]:
+        for group in group_candidates[2:]:
             candidate_diagnostics.append({"stage": "candidate_search", "component_id": group["parent"]["detection_id"],
-                                          "status": "deferred", "reason": "group_crop_limit"})
+                                          "status": "deferred", "reason": "per_batch_group_crop_limit"})
         images, (width, height), image_manifest, pair_manifest, group_manifest = _review_images(
             image_bytes, identified, group_candidates=group_candidates,
-            duplicate_pair_candidates=duplicate_pair_candidates,
-            max_crop_count=0 if duplicate_pairs_only else 10,
-            include_full_image=not duplicate_pairs_only and include_board_context,
+            # Duplicate pairs are reviewed in the separate board-wide queue.
+            # Embedding them in every class batch repeats crops and questions.
+            duplicate_pair_candidates=([] if classification_only or
+                                       (not duplicate_pairs_only and duplicate_pair_candidates is None)
+                                       else duplicate_pair_candidates),
+            max_crop_count=0 if duplicate_pairs_only else (len(identified) if classification_only else 10),
+            component_crop_padding_ratio=.75 if classification_only else .25,
+            include_full_image=not duplicate_pairs_only and not classification_only and include_board_context,
             review_diagnostics=candidate_diagnostics)
     except Exception as exc:
         raise AIReviewStageError("candidate_search", str(exc)) from exc
@@ -373,11 +432,7 @@ def review_components_with_qwen(
         "detector_proposals": [{key: value for key, value in row.items() if key != "bbox_xyxy"}
                                | {"bbox_xyxy": [round(float(value), 1) for value in row["bbox_xyxy"]]}
                                for row in identified],
-        "nearby_ocr_text_candidates": [{"text": row.get("raw_text", row.get("text", "")),
-                                        "bbox_xyxy": row.get("bbox_xyxy"),
-                                        "confidence": row.get("confidence"),
-                                        "reference_candidates": row.get("reference_candidates", [])}
-                                       for row in ocr_records[:120]],
+        "nearby_ocr_text_candidates": _compact_ocr_candidates(ocr_records),
         "coordinate_rule": "For each missed candidate, provide image_index and bbox_norm_999=[x1,y1,x2,y2] normalized 0..999 within that exact image.",
     }
     if duplicate_pairs_only:
@@ -388,13 +443,32 @@ def review_components_with_qwen(
             "detector_proposals": [row for row in payload["detector_proposals"]
                                    if str(row.get("detection_id")) in allowed_ids],
         }
-    response_schema = REVIEW_SCHEMA
+    elif classification_only:
+        payload = {
+            "selected_detections": [{"detection_id": row["detection_id"],
+                                     "detector_class": row["class_name"],
+                                     "nearby_ocr_text_candidates": row.get("ocr_text", [])[:12],
+                                     "ocr_class_hints": row.get("ocr_class_hints", [])[:8],
+                                     "reference_designators": row.get("reference_designators", [])[:8],
+                                     "body_marking": row.get("body_marking"),
+                                     "body_marking_candidates": row.get("marking_candidates", [])[:8],
+                                     "possible_part_number_candidate": row.get("possible_part_number")}
+                                    for row in identified],
+            "selected_context_crop_sources": image_manifest,
+            "note": "Crop boundary is orange. Nearby OCR and silkscreen tokens are unverified clues and may belong to adjacent components.",
+        }
+    response_schema = CLASS_ONLY_REVIEW_SCHEMA if classification_only else REVIEW_SCHEMA
     if duplicate_pairs_only:
         response_schema = deepcopy(DUPLICATE_REVIEW_SCHEMA)
         expected_pair_count = len(pair_manifest)
         response_schema["properties"]["duplicate_reviews"]["minItems"] = expected_pair_count
         response_schema["properties"]["duplicate_reviews"]["maxItems"] = expected_pair_count
     user_prompt = (
+        "Estimate only each selected detection using its orange-boxed crop, nearby silkscreen context, and supplied unverified OCR clues. "
+        "Do not treat an adjacent reference designator as proof. Return exactly one class_reviews item "
+        "per selected detection_id. Do not return any other analysis.\n" + json.dumps(payload, ensure_ascii=False)
+        if classification_only else
+        (
         "For each pair shown in duplicate_pair_crops, return exactly one duplicate_reviews item using those two IDs. "
         "Include detection_ids, decision, numeric confidence, and evidence in each item. "
         "If the evidence cannot distinguish them, use decision=uncertain; do not omit a pair. Do not return class, group, "
@@ -402,12 +476,15 @@ def review_components_with_qwen(
         if duplicate_pairs_only else
         "Review the PCB image, YOLO proposals, and OCR evidence. Return conservative candidate findings.\n"
         + json.dumps(payload, ensure_ascii=False)
+        )
     )
     try:
         response = client.chat_json(
-            model, [{"role": "system", "content": (_DUPLICATES_ONLY_SYSTEM if duplicate_pairs_only else _SYSTEM)},
+            model, [{"role": "system", "content": (_DUPLICATES_ONLY_SYSTEM if duplicate_pairs_only else
+                                                       _CLASS_ONLY_SYSTEM if classification_only else _SYSTEM)},
                     {"role": "user", "content": user_prompt}],
             output_schema=response_schema, images=images,
+            output_budget=min(1536, 256 * len(identified)) if classification_only else None,
         )
         content = response["content"]
     except Exception as exc:
@@ -481,6 +558,15 @@ def review_components_with_qwen(
                               "functional_role_candidates": _clean_string_list(row.get("functional_role_candidates"), max_length=100),
                               "review_status": review_status,
                               "confidence": float(confidence), "evidence": evidence})
+    if classification_only:
+        requested_ids = {row["detection_id"] for row in identified}
+        returned_ids = [row["detection_id"] for row in class_reviews]
+        if set(returned_ids) != requested_ids or len(returned_ids) != len(requested_ids):
+            raise AIReviewStageError(
+                "qwen_validation",
+                f"Qwen selected-box classification expected {len(requested_ids)} unique result(s), "
+                f"received {len(returned_ids)}.",
+            )
     duplicate_reviews = []
     seen_pairs = set()
     for row in content.get("duplicate_reviews", []):
