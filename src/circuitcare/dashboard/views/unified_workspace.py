@@ -73,7 +73,7 @@ from circuitcare.frontend.workbench_state import (
     MODE_KEY, SCREEN_KEY, SELECTION_KEY, VIEW_ZOOM_KEY,
     VIEW_TRANSFORM_KEY, WORKFLOW_REVIEW, WORKFLOW_QUESTIONS, WORKFLOW_INSPECTION,
     WORKFLOW_REASSESSMENT, WORKFLOW_COMPLETE, get_workflow_state, transition_workflow,
-    enter_workbench, update_selection,
+    enter_workbench, update_component_selection, update_selection,
 )
 from circuitcare.frontend.viewer_geometry import requested_view_transform
 from circuitcare.schematic.exporter import export_schematic
@@ -81,6 +81,8 @@ from circuitcare.schematic.geometry import read_svg_view_box
 from circuitcare.schematic.viewer import render_interactive_viewer
 from circuitcare.vision.image_loader import ImageLoadError, load_board_image
 from circuitcare.vision.ai_review_jobs import get_ai_review_job
+
+PENDING_PHOTO_FOCUS_KEY = "cc_pending_board_component_photo_focus"
 
 
 def _commit_review_job(st: Any, *, scope: str) -> bool:
@@ -489,6 +491,7 @@ def _prepare_photo_component_snapshot(
     snapshot = {"project_id": project.project_id, "board_id": project.board_id or "",
                 "photo_id": photo_id, "review_scope": review_scope,
                 "image_fingerprint": image_fingerprint,
+                "image_size_px": list(processed_size),
                 "review_version": review_version, "review_components": review_models,
                 "registry_components": tuple({
                     "component_id": str(row.get("component_id") or ""),
@@ -1255,6 +1258,11 @@ def _inspection_targets(
         measurement_component = measurement_view_model_for_board_component(
             registry, board_component_id=str(board_id), preferred_photo_id=None,
         )
+        # A row without a validated photo-local box cannot be presented as a
+        # physical inspection target. Keep it in the Registry, but do not
+        # invent a clickable location or a measurement subject for it.
+        if measurement_component is None:
+            return
         type_confirmed = row.get("component_type_status") == "USER_CONFIRMED"
         source_rows = row.get("source_components", [])
         source = next((item for item in source_rows if isinstance(item, dict)
@@ -1301,6 +1309,12 @@ def _inspection_targets(
                      "available_tests": allowed_tests,
                      "visual_checks": component_visual_checks,
                      "measurement_available": measurement_component is not None,
+                     "source_component_id": (measurement_component.component_id if measurement_component
+                                             else str(source.get("component_id") or "")),
+                     "source_photo_id": (measurement_component.canonical_frame_id if measurement_component
+                                         else str(source.get("photo_id") or "")),
+                     "source_bbox_xyxy": (list(measurement_component.bbox_xyxy) if measurement_component
+                                          else list(source.get("bbox_xyxy") or [])),
                      "inspection_kind": "MEASUREMENT" if allowed_tests else "VISUAL_ONLY",
                      "component_subtype": component_subtype,
                      "completed_test_count": completed_test_count}
@@ -1330,9 +1344,9 @@ def _inspection_targets(
              "component_type_confirmed": bool(details.get("component_type_confirmed")),
              "reference_designators": list(by_id[board_id].get("reference_designators", [])),
              "display_label": (list(by_id[board_id].get("reference_designators", [])) or
-                               [next((str(source.get("component_id")) for source in by_id[board_id].get("source_components", [])
+                               [str(details.get("source_component_id") or next((source.get("component_id") for source in by_id[board_id].get("source_components", [])
                                       if isinstance(source, dict) and source.get("component_id")
-                                      and source.get("review_status") != "EXCLUDED"), board_id)])[0],
+                                      and source.get("review_status") != "EXCLUDED"), board_id))])[0],
              "reason": reason, "candidate": details,
              "inspection_kind": details.get("inspection_kind"),
              "available_tests": details.get("available_tests", []),
@@ -1633,8 +1647,20 @@ def _render_workflow_candidates(
                                   for row in candidates]
     workflow["inspection_targets"] = targets
     workflow["analysis_fingerprint"] = analysis_snapshot.get("input_fingerprint")
+    unlocated_count = sum(
+        1 for row in registry.get("components", []) if isinstance(row, dict)
+        and row.get("presence_status") != "EXCLUDED"
+        and row.get("component_type") != "board_feature"
+        and row.get("source_components")
+        and measurement_view_model_for_board_component(
+            registry, board_component_id=str(row.get("board_component_id") or ""),
+            preferred_photo_id=st.session_state.get(ACTIVE_PHOTO_KEY),
+        ) is None
+    )
     if not targets:
-        st.warning("검사 대상으로 연결할 활성 소자가 없습니다. 제외 상태가 아닌 탐지 박스가 있는지 1단계에서 확인하세요.")
+        st.warning("사진 좌표를 검증할 수 있는 활성 소자 박스가 없습니다. Registry의 내부 ID만으로는 검사 위치를 만들지 않습니다.")
+        if unlocated_count:
+            st.info(f"활성 Registry 소자 {unlocated_count}개는 사진·박스 좌표 연결이 확인되지 않아 검사 대상에서 제외했습니다. 1단계에서 실제 박스 위치를 확인하거나 수동 박스를 추가해 주세요.")
         if st.button("소자 검수로 돌아가기", key=f"cc_wf_no_targets_{project.project_id}"):
             _advance_workflow(st, project, WORKFLOW_REVIEW, "소자 검수 화면 준비 중",
                               "no_valid_target",
@@ -1644,6 +1670,8 @@ def _render_workflow_candidates(
     st.markdown("#### 우선 확인할 검사 대상 · 최대 3개")
     measurable = sum(target.get("inspection_kind") == "MEASUREMENT" for target in targets)
     st.caption(f"측정 가능 {measurable}개 · 추가 확인 대상 {len(targets) - measurable}개")
+    if unlocated_count:
+        st.caption(f"위치 미확인 Registry 소자 {unlocated_count}개는 실제 검사 위치가 없어 후보에서 제외했습니다.")
     for index, target in enumerate(targets, start=1):
         candidate = target.get("candidate", {})
         hypotheses = candidate.get("fault_hypotheses", []) if isinstance(candidate, dict) else []
@@ -1658,12 +1686,13 @@ def _render_workflow_candidates(
         if fault_title:
             label += f" · {fault_title}"
         st.markdown(f"**{label}**")
-        st.caption(f"선정 근거 · {target['reason']} · {target['board_component_id']}")
+        st.caption(f"선정 근거 · {target['reason']} · Registry ID {target['board_component_id']}")
+        box = target.get("source_bbox_xyxy") or []
+        box_text = ", ".join(str(round(float(value))) for value in box)
+        st.caption(f"실제 사진 박스 연결 · 탐지 {target.get('source_component_id')} · 사진 {target.get('source_photo_id')} · 이미지 좌표 x1,y1,x2,y2=({box_text})")
         st.caption("검사 방식 · " + ("등록된 검사 프로파일로 측정 가능"
                                      if target.get("inspection_kind") == "MEASUREMENT"
                                      else "검증된 측정 프로파일 없음 · 추가 확인 대상"))
-        if not target.get("measurement_available"):
-            st.caption("사진 좌표를 연결하지 못해 측정 입력은 보류됩니다. 소자 기록은 검사 대상으로 표시합니다.")
         st.caption("검증 상태 · " + ("측정으로 특정 가설을 확인" if hypothesis.get("visual_status") in
                   {"FAULT_SUPPORTED", "FAULT_REFUTED", "CONFLICTED", "INCONCLUSIVE"}
                   else "우선 확인 대상 · 아직 고장 판정 아님"))
@@ -1728,7 +1757,7 @@ def _render_workflow_candidates(
     )
     if measurement_component is None:
         st.warning("소자의 사진 위치를 확인할 수 없어 측정 연결을 중단했습니다.")
-    elif test_id:
+    else:
         render_measurement_panel(
             st, project, selected_component=measurement_component, preview=preview,
             component_map_version=registry.get("version"), board_registry=registry,
@@ -2091,6 +2120,12 @@ def _render_workbench_shell_body(st: Any, project: ProjectContext) -> None:
             preview=st.session_state.get(MODE_KEY) == "PREVIEW_ONLY",
         )
     photos = st.session_state.get(INTAKE_IMAGES_KEY, [])
+    pending_photo_focus = st.session_state.pop(PENDING_PHOTO_FOCUS_KEY, None)
+    valid_photo_ids = {str(item.get("image_id") or "") for item in photos if isinstance(item, dict)}
+    if pending_photo_focus in valid_photo_ids:
+        # Apply the keyed selectbox value before it is instantiated in _render_pcb.
+        # Streamlit rejects changing widget-owned state later in the same run.
+        st.session_state["circuitcare_v2_photo_choice"] = pending_photo_focus
     workflow = get_workflow_state(st.session_state, project)
     with st.container(key="cc_workbench_body"):
         left, right = st.columns([1.85, 1], gap="large")
@@ -2357,22 +2392,20 @@ def _selected_component(st: Any) -> ComponentOverlayViewModel | None:
 def _focus_board_registry_component(
     st: Any, project: ProjectContext, registry: dict[str, Any] | None, board_component_id: str,
 ) -> bool:
-    rows = registry.get("components", []) if isinstance(registry, dict) else []
-    row = next((item for item in rows if item.get("board_component_id") == board_component_id), None)
-    if not row or row.get("presence_status") == "EXCLUDED":
+    if not isinstance(registry, dict):
         return False
-    sources = sorted(row.get("source_components", []),
-                     key=lambda item: item.get("review_status") == "EXCLUDED")
-    sources = [item for item in sources if item.get("review_status") != "EXCLUDED"
-               and item.get("presence_status") != "EXCLUDED"]
-    if not sources:
+    component = measurement_view_model_for_board_component(
+        registry, board_component_id=board_component_id,
+        preferred_photo_id=st.session_state.get(ACTIVE_PHOTO_KEY),
+    )
+    if component is None:
         return False
-    source = sources[0]
-    photo_id, local_id = source.get("photo_id"), source.get("component_id")
-    st.session_state[BOARD_COMPONENT_SELECTION_KEY] = board_component_id
-    st.session_state["circuitcare_v2_photo_choice"] = photo_id
-    update_selection(st.session_state, project=project, active_photo_id=photo_id,
-                     selected_component=local_id)
+    photo_id = component.canonical_frame_id
+    st.session_state[PENDING_PHOTO_FOCUS_KEY] = photo_id
+    update_component_selection(
+        st.session_state, project=project, board_component_id=board_component_id,
+        active_photo_id=photo_id, selected_component=component.component_id,
+    )
     return True
 
 

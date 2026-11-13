@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import json
+import math
 from typing import Any
 
 from circuitcare.frontend.component_overlay_models import ComponentOverlayViewModel
@@ -141,10 +142,32 @@ def measurement_view_model_for_board_component(
                       if str(row.get("board_component_id")) == str(board_component_id)), None)
     if not component or component.get("component_type") == "board_feature":
         return None
-    sources = [row for row in component.get("source_components", [])
-               if row.get("review_status") != "EXCLUDED"
-               and row.get("coordinate_frame") == "SOURCE_PHOTO_PIXEL"
-               and isinstance(row.get("bbox_xyxy"), (list, tuple)) and len(row["bbox_xyxy"]) == 4]
+    sources = []
+    for row in component.get("source_components", []):
+        if (row.get("review_status") == "EXCLUDED"
+                or row.get("coordinate_frame") != "SOURCE_PHOTO_PIXEL"):
+            continue
+        box = row.get("bbox_xyxy")
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = (float(value) for value in box)
+        except (TypeError, ValueError):
+            continue
+        if (not all(math.isfinite(value) for value in (x1, y1, x2, y2))
+                or x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1):
+            continue
+        photo_id = str(row.get("photo_id") or "")
+        manifest = next((item for item in registry.get("photos", [])
+                         if str(item.get("photo_id")) == photo_id), None)
+        image_size = manifest.get("image_size_px") if isinstance(manifest, dict) else None
+        if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
+            width, height = image_size
+            if (not all(isinstance(value, (int, float)) and math.isfinite(float(value))
+                        for value in (width, height))
+                    or x2 > float(width) or y2 > float(height)):
+                continue
+        sources.append(row)
     if preferred_photo_id:
         sources.sort(key=lambda row: row.get("photo_id") != preferred_photo_id)
     source = next((row for row in sources if all(isinstance(value, (int, float)) for value in row["bbox_xyxy"])), None)
@@ -530,6 +553,7 @@ def build_board_component_registry(
         })
     photo_manifest = [{
         "photo_id": str(photo_id), "image_fingerprint": snapshot.get("image_fingerprint"),
+        "image_size_px": snapshot.get("image_size_px"),
         "review_version": snapshot.get("review_version"),
         "detection_status": snapshot.get("detection_status"),
         "side": snapshot.get("side", "unknown"),
