@@ -18,13 +18,13 @@ class LocalLLMError(RuntimeError):
 class OllamaClient:
     def __init__(self, base_url: str = "http://127.0.0.1:11434", timeout_seconds: int = 180,
                  num_predict: int = 1300, keep_alive: str = "10m", metadata_ttl_seconds: float = 30,
-                 auto_start: bool = False):
+                 auto_start: bool = False, backend: str | None = None):
         parsed = urlparse(base_url)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Ollama must use a local loopback HTTP URL")
         if type(num_predict) is not int or num_predict < 1:
             raise ValueError("num_predict must be a positive integer")
-        self.backend = os.environ.get("CIRCUITCARE_LLM_BACKEND", "ollama")
+        self.backend = backend or os.environ.get("CIRCUITCARE_LLM_BACKEND", "ollama")
         if self.backend == "mlx" and base_url == "http://127.0.0.1:11434":
             base_url = "http://127.0.0.1:8766"
         self.base_url = base_url.rstrip("/")
@@ -52,6 +52,11 @@ class OllamaClient:
         metadata = self.show_model(model_name)
         capabilities = metadata.get("capabilities", [])
         return isinstance(capabilities, list) and "vision" in capabilities
+
+    def model_supports_thinking(self, model_name: str) -> bool:
+        metadata = self.show_model(model_name)
+        capabilities = metadata.get("capabilities", [])
+        return isinstance(capabilities, list) and "thinking" in capabilities
 
     def model_info(self, model_name: str) -> dict:
         models = self._cached_metadata("tags", self.list_models)
@@ -82,7 +87,8 @@ class OllamaClient:
     def chat_json(self, model_name: str, messages: list[dict], *,
                   output_schema: dict | None = None,
                   images: list[bytes | str] | None = None,
-                  output_budget: int | None = None) -> dict:
+                  output_budget: int | None = None,
+                  think: bool | None = False) -> dict:
         model_info = self.model_info(model_name)
         request_messages = [dict(message) for message in messages]
         if images:
@@ -113,13 +119,14 @@ class OllamaClient:
             "model": model_name,
             "messages": request_messages,
             "stream": False,
-            "think": False,
             "keep_alive": self.keep_alive,
             "format": output_schema or "json",
             "options": {"temperature": 0.1,
                         "num_predict": output_budget if type(output_budget) is int and output_budget > 0
                         else self.num_predict},
         }
+        if think is not None:
+            body["think"] = think
         json_mode = True
         fallback_reason = None
         try:

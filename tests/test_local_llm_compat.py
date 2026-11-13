@@ -30,6 +30,15 @@ def test_chat_json_falls_back_only_for_unsupported_structured_output(monkeypatch
     assert calls[1]["think"] is False
 
 
+def test_chat_json_can_omit_thinking_parameter_for_models_without_capability(monkeypatch):
+    client = OllamaClient(backend="ollama")
+    monkeypatch.setattr(client, "model_info", lambda _name: {"name": "test:latest"})
+    calls = []
+    monkeypatch.setattr(client, "_request", lambda _method, _path, payload: (calls.append(payload) or _response()))
+    client.chat_json("test:latest", [{"role": "user", "content": "JSON"}], think=None)
+    assert "think" not in calls[0]
+
+
 @pytest.mark.parametrize("error", [
     'Ollama request failed with HTTP 501: {"error":"route unavailable"}',
     'Could not reach local Ollama at http://127.0.0.1:11434: connection refused',

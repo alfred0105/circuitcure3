@@ -149,6 +149,7 @@ def _review_images(
     duplicate_pair_candidates: list[dict[str, Any]] | None = None,
     review_diagnostics: list[dict[str, Any]] | None = None, max_crop_count: int = 10,
     component_crop_padding_ratio: float = .25,
+    component_crop_size_px: int = 720,
     include_full_image: bool = True,
 ) -> tuple[list[bytes], tuple[int, int], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     with Image.open(io.BytesIO(image_bytes)) as source_image:
@@ -192,7 +193,7 @@ def _review_images(
             painter.rectangle(local_box, outline="#ff9d2e", width=4)
             painter.text((local_box[0] + 2, max(0, local_box[1] - 16)),
                          str(row["detection_id"]), fill="white", stroke_width=2, stroke_fill="black")
-        crop.thumbnail((720, 720), Image.Resampling.LANCZOS)
+        crop.thumbnail((component_crop_size_px, component_crop_size_px), Image.Resampling.LANCZOS)
         images.append(crop)
         manifest.append({"image_index": len(images) - 1, "kind": "detection_crop",
                          "detection_id": str(row["detection_id"]),
@@ -375,6 +376,10 @@ def review_components_with_qwen(
     duplicate_pairs_only: bool = False,
     classification_only: bool = False,
     include_board_context: bool = True,
+    classification_crop_size_px: int = 720,
+    classification_padding_ratio: float = .75,
+    classification_output_budget: int | None = None,
+    classification_think: bool | None = False,
 ) -> dict[str, Any]:
     """Request suggestions and validate every ID and normalized box before display."""
     identified = []
@@ -411,6 +416,10 @@ def review_components_with_qwen(
         for group in group_candidates[2:]:
             candidate_diagnostics.append({"stage": "candidate_search", "component_id": group["parent"]["detection_id"],
                                           "status": "deferred", "reason": "per_batch_group_crop_limit"})
+        if classification_crop_size_px not in {384, 512, 720}:
+            raise ValueError("Classification crop size must be 384, 512, or 720 pixels.")
+        if not math.isfinite(float(classification_padding_ratio)) or not 0 <= classification_padding_ratio <= 1.5:
+            raise ValueError("Classification crop padding ratio must be between 0 and 1.5.")
         images, (width, height), image_manifest, pair_manifest, group_manifest = _review_images(
             image_bytes, identified, group_candidates=group_candidates,
             # Duplicate pairs are reviewed in the separate board-wide queue.
@@ -419,7 +428,8 @@ def review_components_with_qwen(
                                        (not duplicate_pairs_only and duplicate_pair_candidates is None)
                                        else duplicate_pair_candidates),
             max_crop_count=0 if duplicate_pairs_only else (len(identified) if classification_only else 10),
-            component_crop_padding_ratio=.75 if classification_only else .25,
+            component_crop_padding_ratio=classification_padding_ratio if classification_only else .25,
+            component_crop_size_px=classification_crop_size_px if classification_only else 720,
             include_full_image=not duplicate_pairs_only and not classification_only and include_board_context,
             review_diagnostics=candidate_diagnostics)
     except Exception as exc:
@@ -481,12 +491,21 @@ def review_components_with_qwen(
         )
     )
     try:
+        chat_options = {
+            "output_schema": response_schema, "images": images,
+            "output_budget": ((classification_output_budget or min(1536, 256 * len(identified)))
+                               if classification_only else None),
+        }
+        # Preserve the long-standing client contract for production Qwen review.
+        # Benchmark backends may request omission when a model does not advertise
+        # Ollama's thinking capability.
+        if classification_only and classification_think is None:
+            chat_options["think"] = None
         response = client.chat_json(
             model, [{"role": "system", "content": (_DUPLICATES_ONLY_SYSTEM if duplicate_pairs_only else
                                                        _CLASS_ONLY_SYSTEM if classification_only else _SYSTEM)},
                     {"role": "user", "content": user_prompt}],
-            output_schema=response_schema, images=images,
-            output_budget=min(1536, 256 * len(identified)) if classification_only else None,
+            **chat_options,
         )
         content = response["content"]
     except Exception as exc:

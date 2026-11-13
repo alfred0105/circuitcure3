@@ -2365,17 +2365,21 @@ def _render_workbench_shell_body(st: Any, project: ProjectContext) -> None:
     workspace_tab_key = f"cc_workbench_top_tab_{project.project_id}"
     if callable(getattr(st, "segmented_control", None)):
         workspace_tab = st.segmented_control(
-            "작업 탭", ["PCB 검수·진단", "별도 재학습"], default="PCB 검수·진단",
+            "작업 탭", ["PCB 검수·진단", "별도 재학습", "경량 모델 비교 · Archive 2"], default="PCB 검수·진단",
             key=workspace_tab_key, label_visibility="collapsed",
         )
     else:
-        workspace_tab = st.radio("작업 탭", ["PCB 검수·진단", "별도 재학습"],
+        workspace_tab = st.radio("작업 탭", ["PCB 검수·진단", "별도 재학습", "경량 모델 비교 · Archive 2"],
                                  horizontal=True, key=workspace_tab_key,
                                  label_visibility="collapsed")
+    photos = st.session_state.get(INTAKE_IMAGES_KEY, [])
     if workspace_tab == "별도 재학습":
         render_retraining_workspace(st, project)
         return
-    photos = st.session_state.get(INTAKE_IMAGES_KEY, [])
+    if workspace_tab == "경량 모델 비교 · Archive 2":
+        from circuitcare.vision.model_comparison import render_model_comparison_workspace
+        render_model_comparison_workspace(st, project, photos)
+        return
     pending_photo_focus = st.session_state.pop(PENDING_PHOTO_FOCUS_KEY, None)
     valid_photo_ids = {str(item.get("image_id") or "") for item in photos if isinstance(item, dict)}
     if pending_photo_focus in valid_photo_ids:
