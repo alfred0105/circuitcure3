@@ -494,6 +494,45 @@ def test_duplicate_only_review_cannot_mark_empty_model_response_as_reviewed():
                                     duplicate_pair_candidates=pairs, duplicate_pairs_only=True)
 
 
+def test_duplicate_only_review_retries_only_pairs_omitted_from_multi_pair_response():
+    detections = [
+        {"component_id": "a", "class_name": "resistor", "bbox_xyxy": [5, 5, 25, 20]},
+        {"component_id": "b", "class_name": "resistor", "bbox_xyxy": [7, 6, 27, 21]},
+        {"component_id": "c", "class_name": "capacitor", "bbox_xyxy": [40, 5, 60, 20]},
+        {"component_id": "d", "class_name": "capacitor", "bbox_xyxy": [42, 6, 62, 21]},
+    ]
+    pairs = _duplicate_pair_candidates(detections, limit=None)
+    assert len(pairs) == 2
+
+    class OmittingPairClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
+            self.calls += 1
+            payload = json.loads(_messages[1]["content"].split("\n", 1)[1])
+            supplied = payload["duplicate_pair_crops"]
+            if self.calls == 1:
+                supplied = supplied[:1]
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [{
+                    "detection_ids": pair["detection_ids"], "decision": "uncertain",
+                    "confidence": .4, "evidence": "The crop does not settle whether these are one part.",
+                } for pair in supplied],
+                "group_reviews": [], "missed_component_candidates": [], "notes": [],
+            }}
+
+    client = OmittingPairClient()
+    result = review_components_with_qwen(
+        client, "qwen3.5:9b", _png(), detections, [],
+        duplicate_pair_candidates=pairs, duplicate_pairs_only=True,
+    )
+    assert client.calls == 2
+    assert {tuple(row["detection_ids"]) for row in result["duplicate_reviews"]} == {
+        ("a", "b"), ("c", "d"),
+    }
+
+
 def test_duplicate_review_continuation_only_calls_remaining_pair_queue(monkeypatch):
     from circuitcare.vision import component_recognition_panel as panel
 

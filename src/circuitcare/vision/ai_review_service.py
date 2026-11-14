@@ -707,8 +707,31 @@ def review_components_with_qwen(
         returned_pairs = {tuple(sorted(item["detection_ids"])) for item in duplicate_reviews}
         missing_pairs = sorted(expected_pairs - returned_pairs)
         if missing_pairs:
-            raise AIReviewStageError("qwen_validation",
-                                     f"Qwen duplicate review omitted {len(missing_pairs)} requested pair(s).")
+            candidates_by_pair = {
+                tuple(sorted(str(row.get("detection_id") or row.get("component_id") or "")
+                             for row in candidate.get("detections", ()))): candidate
+                for candidate in (duplicate_pair_candidates or [])
+            }
+            # Some vision models obey the schema but omit rows in a multi-pair
+            # response. Retry only those pairs as focused single-pair requests.
+            if len(pair_manifest) > 1 and all(pair in candidates_by_pair for pair in missing_pairs):
+                for pair in missing_pairs:
+                    try:
+                        retry = review_components_with_qwen(
+                            client, model, image_bytes, detections, ocr_records,
+                            duplicate_pair_candidates=[candidates_by_pair[pair]],
+                            duplicate_pairs_only=True,
+                            duplicate_output_budget=min(768, max(384, duplicate_output_budget or 384)),
+                        )
+                    except AIReviewStageError:
+                        continue
+                    duplicate_reviews.extend(retry["duplicate_reviews"])
+                returned_pairs = {tuple(sorted(item["detection_ids"])) for item in duplicate_reviews}
+                missing_pairs = sorted(expected_pairs - returned_pairs)
+            if missing_pairs:
+                raise AIReviewStageError("qwen_validation",
+                                         f"Qwen duplicate review omitted {len(missing_pairs)} requested pair(s) "
+                                         "after individual retry; those pairs remain unreviewed.")
     allowed_groups = {group["parent_id"]: set(group["child_ids"])
                       for group in group_manifest}
     group_reviews = []
