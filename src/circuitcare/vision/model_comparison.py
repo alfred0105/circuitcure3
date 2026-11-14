@@ -35,6 +35,29 @@ PADDING_RATIOS = (0.0, 0.25, 0.75)
 OUTPUT_BUDGETS = (128, 192, 256)
 PROMPT_VERSION = "selected-class-only-v1"
 SCHEMA_VERSION = "class-only-review-schema-v1"
+OUTPUT_NORMALIZATION_VERSION = "archive2-class-output-v2"
+
+
+def _normalize_experiment_chat_http_response(response: dict[str, Any]) -> tuple[dict[str, Any], Any, list[str]]:
+    """Wrap array-shaped VLM JSON before OllamaClient enforces an object root."""
+    message = response.get("message")
+    raw_text = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(raw_text, str):
+        return response, None, []
+    candidate = raw_text.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return response, raw_text, []
+    if not isinstance(parsed, list):
+        return response, parsed, []
+    normalized = dict(response)
+    normalized_message = dict(message)
+    normalized_message["content"] = json.dumps({"class_reviews": parsed}, ensure_ascii=False)
+    normalized["message"] = normalized_message
+    return normalized, parsed, ["root JSON array wrapped as class_reviews"]
 
 
 def _normalize_experiment_response(response: dict[str, Any], detection_id: str) -> dict[str, Any]:
@@ -447,6 +470,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                       "output_budget": int(budget), "repeat_index": 0,
                       "prompt_version": PROMPT_VERSION, "prompt_fingerprint": prompt_fingerprint,
                       "schema_version": SCHEMA_VERSION, "schema_fingerprint": schema_fingerprint,
+                      "normalization_version": OUTPUT_NORMALIZATION_VERSION,
                       "model_digest": model_state.get("digest"), "json_valid": False,
                       "schema_valid": False, "prediction": None, "prediction_subtype": None,
                       "confidence_uncalibrated": None, "decision": None, "evidence": None,
@@ -462,12 +486,35 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
             else:
                 raw_response: dict[str, Any] = {}
                 original_chat_json = run_client.chat_json
+                original_request = run_client._request
+
+                def archive2_request(method: str, path: str, payload: dict | None = None) -> dict:
+                    response = original_request(method, path, payload)
+                    if method == "POST" and path == "/api/chat":
+                        adapted, original_content, notes = _normalize_experiment_chat_http_response(response)
+                        if original_content is not None:
+                            raw_response["content"] = original_content
+                        if notes:
+                            raw_response["http_normalization_notes"] = notes
+                            raw_response["schema_valid_before_normalization"] = False
+                        return adapted
+                    return response
+
+                run_client._request = archive2_request
+
                 def archive2_chat_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
                     response = original_chat_json(*args, **kwargs)
                     normalized = _normalize_experiment_response(response, component_id)
                     raw_response.update(normalized.get("archive2_normalization", {}))
-                    raw_response["content"] = normalized.get("archive2_raw_content")
+                    if raw_response.get("http_normalization_notes"):
+                        raw_response["schema_valid_before_normalization"] = False
+                    raw_response["notes"] = [
+                        *raw_response.get("http_normalization_notes", []),
+                        *normalized.get("archive2_normalization", {}).get("notes", []),
+                    ]
+                    raw_response.setdefault("content", normalized.get("archive2_raw_content"))
                     return normalized
+
                 run_client.chat_json = archive2_chat_json
                 try:
                     reviewed = review_components_with_qwen(
@@ -490,9 +537,9 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                               "prediction_subtype": prediction.get("proposed_subtype"),
                               "confidence_uncalibrated": (None if "confidence missing or invalid" in raw_response.get("notes", [])
                                                            else prediction.get("confidence")),
-                              "decision": response_adaptation.get("original_decision") or prediction.get("decision"),
+                              "decision": raw_response.get("original_decision") or prediction.get("decision"),
                               "evidence": prediction.get("evidence"),
-                              "uncertain": response_adaptation.get(
+                              "uncertain": raw_response.get(
                                   "model_uncertain", prediction.get("uncertain",
                                                                      prediction.get("decision") == "uncertain")),
                               "wall_ms": round(wall_ms, 3),
@@ -509,15 +556,18 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                   "ocr": ocr_rows, "crop": crop_px, "padding": padding,
                                   "budget": budget, "prompt": prompt_fingerprint,
                                   "schema": schema_fingerprint,
+                                  "normalization": OUTPUT_NORMALIZATION_VERSION,
                               }, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()}
                 except Exception as exc:
                     result = {**common, "status": "FAILED", "wall_ms": round(
                         (time.perf_counter_ns() - start_ns) / 1_000_000, 3), "json_valid": False,
                         "error": f"{type(exc).__name__}: {str(exc)[:400]}",
-                        "normalization_notes": raw_response.get("notes", []),
+                        "normalization_notes": [*raw_response.get("http_normalization_notes", []),
+                                                 *raw_response.get("notes", [])],
                         "raw_model_response": raw_response.get("content")}
                 finally:
                     run_client.chat_json = original_chat_json
+                    run_client._request = original_request
             produced.append(result)
             all_rows.append(result)
             _save_runs(all_rows)

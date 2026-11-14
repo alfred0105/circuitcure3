@@ -1,7 +1,10 @@
+import json
+
 from circuitcare.component_taxonomy import COMPONENT_CLASSES, UNKNOWN_CLASS
 from circuitcare.vision.ai_review_service import _review_images
 from circuitcare.vision.model_comparison import (
-    MODEL_CATALOG, _normalize_experiment_response, _probe_models, _summarize,
+    MODEL_CATALOG, _normalize_experiment_chat_http_response,
+    _normalize_experiment_response, _probe_models, _summarize,
 )
 from PIL import Image
 import io
@@ -139,6 +142,31 @@ def test_archive2_all_models_are_presented_through_one_classification_field_sche
     assert all(set(row) == expected_fields for row in results)
     assert [row["proposed_class"] for row in results] == ["ic", "ic", "ic"]
     assert [row["uncertain"] for row in results] == [False, False, True]
+
+
+def test_archive2_wraps_qwen_root_array_before_shared_json_parser():
+    raw_rows = [{"detection_id": "U1", "component_type": "IC", "confidence": 0.91,
+                 "decision": "suggest", "evidence_sentence": "Square package with pins."}]
+    ollama_response = {"message": {"content": "```json\n" + json.dumps(raw_rows) + "\n```"}, "done": True}
+
+    adapted, original, notes = _normalize_experiment_chat_http_response(ollama_response)
+    assert original == raw_rows
+    assert notes == ["root JSON array wrapped as class_reviews"]
+
+    parsed_for_shared_path = json.loads(adapted["message"]["content"])
+    normalized = _normalize_experiment_response({"content": parsed_for_shared_path}, "U1")
+    row = normalized["content"]["class_reviews"][0]
+    assert row["proposed_class"] == "ic"
+    assert row["decision"] == "suggest"
+    assert row["evidence"] == "Square package with pins."
+
+
+def test_archive2_does_not_rewrite_object_root_response():
+    response = {"message": {"content": '{"class_reviews": []}'}}
+    adapted, original, notes = _normalize_experiment_chat_http_response(response)
+    assert adapted is response
+    assert original == {"class_reviews": []}
+    assert notes == []
 
 
 def test_summary_uses_only_confirmed_18_class_labels_and_reports_slices():
