@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 
 from circuitcare.component_taxonomy import (
     COMPONENT_CLASSES, QWEN_CLASSIFICATION_CLASSES, UNKNOWN_CLASS,
@@ -574,12 +574,16 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
             key=f"cc_archive2_box_crop_{project.project_id}_{photo_id}",
         )
         selected_detection = real_detection_by_photo_number[selected_photo_number]
-        x1, y1, x2, y2 = [int(round(value)) for value in selected_detection["bbox_xyxy"]]
-        crop = _image.convert("RGB").crop((max(0, x1), max(0, y1),
-                                            min(_image.width, x2), min(_image.height, y2)))
-        crop.thumbnail((720, 720), Image.Resampling.LANCZOS)
-        st.image(crop, caption=f"번호 {selected_photo_number} · {selected_detection['detection_id']} · "
-                               f"YOLO {selected_detection['class_name']}", width="stretch")
+        raw_x1, raw_y1, raw_x2, raw_y2 = [int(round(value)) for value in selected_detection["bbox_xyxy"]]
+        left, top_px = max(0, min(_image.width, raw_x1)), max(0, min(_image.height, raw_y1))
+        right, bottom_px = max(0, min(_image.width, raw_x2)), max(0, min(_image.height, raw_y2))
+        if right <= left or bottom_px <= top_px:
+            st.warning(f"번호 {selected_photo_number} 박스가 이미지 영역 밖에 있어 확대할 수 없습니다. YOLO 원본 ID: {selected_detection['detection_id']}")
+        else:
+            crop = _image.convert("RGB").crop((left, top_px, right, bottom_px))
+            crop.thumbnail((720, 720), Image.Resampling.LANCZOS)
+            st.image(crop, caption=f"번호 {selected_photo_number} · {selected_detection['detection_id']} · "
+                                   f"YOLO {selected_detection['class_name']}", width="stretch")
         st.caption("AI의 ‘오탐 후보’는 확정 판정이 아닙니다. 확대 박스와 전체 기판을 함께 보고 사용자가 확인하세요.")
     duplicate_pairs = _duplicate_pair_candidates(comparison_detections, limit=24)
     duplicate_pair_review_state_key = f"cc_archive2_duplicate_pairs_{project.project_id}_{photo_id}"
