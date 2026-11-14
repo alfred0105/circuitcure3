@@ -207,6 +207,19 @@ def test_nested_class_reviews_envelope_is_unwrapped_without_using_yolo_class_as_
     assert row["response_status"] == "RECEIVED"
 
 
+def test_boxes_envelope_and_short_id_alias_are_mapped_as_model_responses():
+    response = {"content": {"boxes": [
+        {"id": "1", "object_status": "COMPONENT", "proposed_class": "ic"},
+        {"id": "2", "object_status": "NOT_COMPONENT", "proposed_class": "unknown"},
+    ]}}
+    normalized = _normalize_experiment_response_batch(response, ["1", "2"])
+    rows = normalized["content"]["class_reviews"]
+    assert [row["response_status"] for row in rows] == ["RECEIVED", "RECEIVED"]
+    assert [row["object_status"] for row in rows] == ["COMPONENT", "NOT_COMPONENT"]
+    assert [row["proposed_class"] for row in rows] == ["ic", UNKNOWN_CLASS]
+    assert "boxes envelope normalized" in normalized["archive2_normalization"]["notes"]
+
+
 def test_summary_scores_nested_full_board_predictions_without_repeating_run_time_per_box():
     row = {"status": "COMPLETE", "backend": "Ollama", "model_key": "qwen35_9b",
            "crop_px": "full_board", "padding_ratio": 0, "output_budget": 256,

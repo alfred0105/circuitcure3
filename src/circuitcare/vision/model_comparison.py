@@ -38,6 +38,7 @@ CROP_SIZES = (384, 512, 720)
 PADDING_RATIOS = (0.0, 0.25, 0.75)
 OUTPUT_BUDGETS = (192, 256, 384)
 FULL_BOARD_BATCH_SIZE = 10
+MODEL_BATCH_SIZES = {"lfm3_vl_2b": 5, "minicpm_v47_1b": 5}
 PROMPT_VERSION = "full-board-fast-classification-v2"
 SCHEMA_VERSION = "full-board-fast-classification-schema-v2"
 OUTPUT_NORMALIZATION_VERSION = "archive2-class-output-v3"
@@ -191,7 +192,7 @@ def _normalize_experiment_response_batch(
         raw_rows = raw_content
         notes.append("root array normalized")
     elif isinstance(raw_content, dict):
-        for key in ("class_reviews", "detections", "results", "selected_detections"):
+        for key in ("class_reviews", "detections", "results", "selected_detections", "boxes"):
             value = raw_content.get(key)
             if isinstance(value, list):
                 raw_rows = value
@@ -206,7 +207,7 @@ def _normalize_experiment_response_batch(
     for raw in raw_rows:
         if not isinstance(raw, dict):
             continue
-        detection_id = str(raw.get("detection_id") or raw.get("component_id") or "")
+        detection_id = str(raw.get("detection_id") or raw.get("component_id") or raw.get("id") or "")
         if detection_id not in id_set:
             continue
         # Some VLMs wrap each row's useful fields in class_reviews.
@@ -426,6 +427,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         FULL_BOARD_CLASSIFICATION_SCHEMA, _FULL_BOARD_CLASSIFICATION_SYSTEM,
         _duplicate_pair_candidates, review_components_with_qwen,
     )
+    from circuitcare.vision.box_reconciliation import same_component_box_pair
 
     st.markdown("### Archive 2 · 소자별 이미지 AI 비교")
     st.caption("전체 PCB 사진과 모든 활성 YOLO 박스를 네 모델에 동일하게 입력해 종류를 비교합니다. 결과는 실험 기록에만 저장됩니다.")
@@ -565,15 +567,65 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                    f"사용자 확정 정답 {len(ground_truth_by_id)}개는 모델 입력에서 제외 · "
                    f"OCR 문맥 {len(ocr_rows)}개 · {image_size[0]}×{image_size[1]}px")
     duplicate_pairs = _duplicate_pair_candidates(comparison_detections, limit=24)
-    with st.expander(f"겹침·중복 의심 박스 · {len(duplicate_pairs)}쌍", expanded=False):
+    duplicate_pair_review_state_key = f"cc_archive2_duplicate_pairs_{project.project_id}_{photo_id}"
+    if not isinstance(st.session_state.get(duplicate_pair_review_state_key), dict):
+        st.session_state[duplicate_pair_review_state_key] = {}
+    pair_label_to_candidate = {
+        f"{pair['detections'][0]['detection_id']} ↔ {pair['detections'][1]['detection_id']}": pair
+        for pair in duplicate_pairs
+    }
+    with st.expander(f"겹침·중복 의심 박스 · {len(duplicate_pairs)}쌍", expanded=bool(duplicate_pairs)):
         if duplicate_pairs:
-            st.caption("좌표 겹침만으로 뽑은 빠른 후보입니다. 같은 부품으로 확정하거나 박스를 자동 삭제하지 않습니다.")
+            st.caption("아래 빠른 분류는 박스 좌표만 비교한 결과입니다. 같은 부품인지 확정하려면 원하는 쌍만 선택해 AI로 따로 확인하세요. 어느 결과도 박스를 자동 삭제하지 않습니다.")
             st.dataframe([{
-            "박스 A": pair["detections"][0]["detection_id"],
-            "박스 B": pair["detections"][1]["detection_id"],
+                "박스 A": pair["detections"][0]["detection_id"],
+                "박스 B": pair["detections"][1]["detection_id"],
+                "기하 분류": "중복 가능성 높음" if same_component_box_pair(
+                    pair["detections"][0]["bbox_xyxy"], pair["detections"][1]["bbox_xyxy"]
+                ) else "겹침만 확인 · 별도 소자일 수 있음",
+                "AI 쌍 검토": st.session_state[duplicate_pair_review_state_key].get(
+                    "|".join(sorted(item["detection_id"] for item in pair["detections"])), "미실행"
+                ),
                 "IoU": round(pair["metrics"]["iou"], 3),
                 "작은 박스 포함률": round(pair["metrics"]["smaller_coverage"], 3),
             } for pair in duplicate_pairs], use_container_width=True, hide_index=True)
+            selected_pair_labels = st.multiselect(
+                "AI로 확인할 겹침 쌍 (한 번에 최대 3쌍)", list(pair_label_to_candidate), max_selections=3,
+                key=f"cc_archive2_duplicate_pair_select_{project.project_id}_{photo_id}",
+            )
+            duplicate_model = st.selectbox(
+                "중복 확인 모델", list(MODEL_CATALOG), index=0,
+                format_func=lambda value: MODEL_CATALOG[value]["label"],
+                key=f"cc_archive2_duplicate_model_{project.project_id}_{photo_id}",
+            )
+            if st.button("선택 쌍 AI 중복 확인", key=f"cc_archive2_duplicate_run_{project.project_id}_{photo_id}",
+                         disabled=not selected_pair_labels):
+                duplicate_status = st.status("선택한 박스 쌍을 확인 중", expanded=True)
+                try:
+                    duplicate_client = OllamaClient(timeout_seconds=300, num_predict=256,
+                                                    keep_alive="10m", auto_start=True)
+                    duplicate_result = review_components_with_qwen(
+                        duplicate_client, MODEL_CATALOG[duplicate_model]["ollama_id"], image_bytes,
+                        comparison_detections, [],
+                        duplicate_pair_candidates=[pair_label_to_candidate[label] for label in selected_pair_labels],
+                        duplicate_pairs_only=True,
+                    )
+                    pair_results = {tuple(item["detection_ids"]): item["decision"]
+                                    for item in duplicate_result["duplicate_reviews"]}
+                    for label in selected_pair_labels:
+                        pair = pair_label_to_candidate[label]
+                        pair_ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
+                        decision = pair_results.get(pair_ids)
+                        st.session_state[duplicate_pair_review_state_key]["|".join(pair_ids)] = {
+                            "same_component": "AI: 같은 소자 후보",
+                            "different_components": "AI: 서로 다른 소자",
+                            "uncertain": "AI: 판정 보류",
+                        }.get(decision, "AI: 응답 누락")
+                    duplicate_status.update(label="선택 쌍 검토 완료", state="complete", expanded=False)
+                    st.rerun()
+                except Exception as exc:
+                    duplicate_status.update(label="중복 쌍 검토 실패", state="error", expanded=True)
+                    st.error(f"{type(exc).__name__}: {str(exc)[:400]}")
         else:
             st.caption("현재 겹침 기준에 맞는 후보가 없습니다.")
 
@@ -640,10 +692,15 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 batch_errors = []
                 batch_metrics = []
                 try:
-                    batch_count = (len(model_detections) + FULL_BOARD_BATCH_SIZE - 1) // FULL_BOARD_BATCH_SIZE
-                    for batch_index, batch_start in enumerate(range(0, len(model_detections), FULL_BOARD_BATCH_SIZE), start=1):
-                        batch_detections = model_detections[batch_start:batch_start + FULL_BOARD_BATCH_SIZE]
-                        batch_ids = [row["detection_id"] for row in batch_detections]
+                    model_batch_size = MODEL_BATCH_SIZES.get(model_key, FULL_BOARD_BATCH_SIZE)
+                    batch_count = (len(model_detections) + model_batch_size - 1) // model_batch_size
+                    for batch_index, batch_start in enumerate(range(0, len(model_detections), model_batch_size), start=1):
+                        global_batch = model_detections[batch_start:batch_start + model_batch_size]
+                        global_model_ids = [row["detection_id"] for row in global_batch]
+                        batch_ids = [str(local_index) for local_index in range(1, len(global_batch) + 1)]
+                        local_to_global_id = dict(zip(batch_ids, global_model_ids))
+                        batch_detections = [{**row, "detection_id": local_id, "component_id": local_id}
+                                             for row, local_id in zip(global_batch, batch_ids)]
                         raw_response: dict[str, Any] = {}
 
                         def archive2_request(method: str, path: str, payload: dict | None = None) -> dict:
@@ -678,14 +735,18 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                 include_board_context=True, classification_output_budget=int(budget),
                                 classification_think=False,
                             )
-                            batch_review_rows.extend(reviewed_batch["class_reviews"])
+                            for review in reviewed_batch["class_reviews"]:
+                                global_id = local_to_global_id.get(str(review.get("detection_id")))
+                                if global_id is not None:
+                                    batch_review_rows.append({**review, "detection_id": global_id})
                             batch_metrics.append(reviewed_batch.get("ollama_metrics", {}))
                         except Exception as exc:
                             batch_errors.append(f"배치 {batch_index}/{batch_count}: {type(exc).__name__}: {str(exc)[:240]}")
                         finally:
                             run_client.chat_json = original_chat_json
                             run_client._request = original_request
-                        raw_batches.append({"detection_ids": batch_ids, "response": raw_response.get("content"),
+                        raw_batches.append({"detection_ids": global_model_ids, "request_ids": batch_ids,
+                                            "response": raw_response.get("content"),
                                             "notes": raw_response.get("notes", []),
                                             "error": batch_errors[-1] if batch_errors and batch_errors[-1].startswith(
                                                 f"배치 {batch_index}/") else None})
@@ -800,6 +861,14 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 } for item in row.get("predictions", [])]
                 if row.get("status") == "PARTIAL":
                     st.warning("일부 박스에 응답이 없습니다. 무응답은 unknown 분류로 간주하지 않았습니다.")
+                unanswered = sum(item.get("response_status") == "NO_RESPONSE"
+                                 for item in row.get("predictions", []))
+                if unanswered:
+                    st.caption(f"응답 수신 {len(prediction_table) - unanswered}/{len(prediction_table)}개 · 무응답 {unanswered}개")
+                if row.get("batch_errors"):
+                    with st.expander("실패한 배치 원인", expanded=False):
+                        for message in row["batch_errors"]:
+                            st.error(message)
                 st.markdown(f"### 전체 박스 분류 · {len(prediction_table)}개")
                 if prediction_table:
                     st.dataframe(prediction_table, use_container_width=True, hide_index=True)
