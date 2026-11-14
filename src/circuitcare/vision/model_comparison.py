@@ -732,7 +732,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                               "wall_ms": round(wall_ms, 3),
                               "load_ms": _ns_ms(metric_sums["load_duration_ns"]),
                               "prompt_eval_ms": _ns_ms(metric_sums["prompt_eval_duration_ns"]),
-                              "eval_ms": eval_ms, "prompt_eval_count": metrics.get("prompt_eval_count"),
+                              "eval_ms": eval_ms, "prompt_eval_count": metric_sums["prompt_eval_count"],
                               "eval_count": eval_count,
                               "tokens_per_second": (eval_count / (eval_ms / 1000)
                                   if isinstance(eval_count, (int, float)) and eval_ms else None),
