@@ -246,7 +246,9 @@ def _subset_accuracy(rows: list[dict[str, Any]], classes: set[str]) -> float | N
 def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[str, Any]]) -> None:
     """Compare selected-component crops in an isolated Archive 2 workspace."""
     from circuitcare.dashboard.views.unified_workspace import _cached_photo_pixels
-    from circuitcare.vision.component_recognition_panel import review_aux_keys, review_keys, review_scope
+    from circuitcare.vision.component_recognition_panel import (
+        ensure_component_detection, review_aux_keys, review_keys, review_scope,
+    )
     from circuitcare.vision.ai_review_service import (
         CLASS_ONLY_REVIEW_SCHEMA, _CLASS_ONLY_SYSTEM, _review_images, review_components_with_qwen,
     )
@@ -269,10 +271,27 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         st.error(f"사진을 준비하지 못했습니다 · {exc}")
         return
     scope = review_scope(image_bytes, project.project_id, photo_id)
-    _result_key, rows_key, _error_key = review_keys(scope)
+    result_key, rows_key, error_key = review_keys(scope)
+    if result_key not in st.session_state and error_key not in st.session_state:
+        with st.status("선택한 사진에서 YOLO 소자 탐지 중", expanded=True) as yolo_status:
+            detected, detection_error = ensure_component_detection(
+                st, image_bytes=photo["data"], project_id=project.project_id, photo_id=photo_id,
+                review_image_bytes=image_bytes, review_image_size=image_size, progress=yolo_status,
+            )
+            if detection_error or detected is None:
+                yolo_status.update(label="YOLO 탐지 실패", state="error", expanded=True)
+            else:
+                yolo_status.update(label=f"YOLO 탐지 완료 · {len(detected.get('detections', []))}개 후보",
+                                   state="complete", expanded=False)
     detections = st.session_state.get(rows_key, [])
+    if error_key in st.session_state and result_key not in st.session_state:
+        st.error(f"자동 소자 탐지에 실패했습니다 · {st.session_state[error_key]}")
+        if st.button("YOLO 다시 실행", key=f"cc_archive2_yolo_retry_{project.project_id}_{photo_id}"):
+            st.session_state.pop(error_key, None)
+            st.rerun()
+        return
     if not isinstance(detections, list) or not detections:
-        st.warning("저장된 YOLO 박스가 없습니다. 먼저 PCB 검수 화면에서 해당 사진을 탐지하세요.")
+        st.info("YOLO 탐지는 완료됐지만 선택할 수 있는 소자 박스가 없습니다.")
         return
     active = [row for row in detections if isinstance(row, dict) and row.get("상태") != "제외"
               and row.get("component_id")]
