@@ -394,6 +394,7 @@ def review_components_with_qwen(
     classification_padding_ratio: float = .75,
     classification_output_budget: int | None = None,
     classification_think: bool | None = False,
+    duplicate_output_budget: int | None = None,
 ) -> dict[str, Any]:
     """Request suggestions and validate every ID and normalized box before display."""
     if full_board_classification and not classification_only:
@@ -540,7 +541,9 @@ def review_components_with_qwen(
             "output_budget": ((min(1024, max(128, classification_output_budget or 512))
                                if full_board_classification else
                                classification_output_budget or min(1536, 256 * len(identified)))
-                              if classification_only else None),
+                              if classification_only else
+                              min(2048, max(384, duplicate_output_budget or 768))
+                              if duplicate_pairs_only else None),
         }
         # Preserve the long-standing client contract for production Qwen review.
         # Benchmark backends may request omission when a model does not advertise

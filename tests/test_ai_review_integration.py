@@ -454,6 +454,7 @@ def test_qwen_duplicate_pair_override_uses_crops_for_cross_batch_ids():
 def test_duplicate_only_review_uses_pair_crops_without_repeating_class_or_tile_review():
     class PairOnlyClient:
         def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
+            assert output_budget == 768
             payload = json.loads(_messages[1]["content"].split("\n", 1)[1])
             assert "do not omit a pair" in _messages[1]["content"]
             assert output_schema["properties"]["class_reviews"]["maxItems"] == 0
@@ -474,7 +475,7 @@ def test_duplicate_only_review_uses_pair_crops_without_repeating_class_or_tile_r
     pairs = _duplicate_pair_candidates(detections, limit=None)
     result = review_components_with_qwen(PairOnlyClient(), "qwen3.5:9b", _png(), detections,
                                          [{"text": "R1"}], duplicate_pair_candidates=pairs,
-                                         duplicate_pairs_only=True)
+                                         duplicate_pairs_only=True, duplicate_output_budget=768)
     assert result["class_reviews"] == []
     assert result["duplicate_reviews"][0]["decision"] == "different_components"
 

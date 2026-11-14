@@ -638,26 +638,40 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
             if review_all_pairs or review_selected_pairs:
                 duplicate_status = st.status("선택한 박스 쌍을 확인 중", expanded=True)
                 try:
-                    duplicate_client = OllamaClient(timeout_seconds=300, num_predict=256,
+                    duplicate_client = OllamaClient(timeout_seconds=300, num_predict=768,
                                                     keep_alive="10m", auto_start=True)
                     selected_candidates = ([pair_label_to_candidate[label] for label in selected_pair_labels]
                                            if review_selected_pairs else duplicate_pairs[:12])
-                    duplicate_result = review_components_with_qwen(
-                        duplicate_client, MODEL_CATALOG[duplicate_model]["ollama_id"], image_bytes,
-                        comparison_detections, [],
-                        duplicate_pair_candidates=selected_candidates,
-                        duplicate_pairs_only=True,
-                    )
-                    pair_results = {tuple(sorted(item["detection_ids"])): item["decision"]
-                                    for item in duplicate_result["duplicate_reviews"]}
-                    for pair in selected_candidates:
-                        pair_ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
-                        decision = pair_results.get(pair_ids)
-                        st.session_state[duplicate_pair_review_state_key]["|".join(pair_ids)] = {
-                            "same_component": "AI: 같은 소자 후보",
-                            "different_components": "AI: 서로 다른 소자",
-                            "uncertain": "AI: 판정 보류",
-                        }.get(decision, "AI: 응답 누락")
+                    if review_all_pairs:
+                        reviewed_pair_ids = st.session_state[duplicate_pair_review_state_key]
+                        selected_candidates = [pair for pair in selected_candidates
+                                               if "|".join(sorted(item["detection_id"]
+                                                                  for item in pair["detections"]))
+                                               not in reviewed_pair_ids]
+                    batches = [selected_candidates[index:index + 4]
+                               for index in range(0, len(selected_candidates), 4)]
+                    for batch_index, candidate_batch in enumerate(batches, start=1):
+                        duplicate_status.update(
+                            label=f"중복 후보 확인 중 · {batch_index}/{len(batches)} 배치",
+                            state="running", expanded=True,
+                        )
+                        duplicate_result = review_components_with_qwen(
+                            duplicate_client, MODEL_CATALOG[duplicate_model]["ollama_id"], image_bytes,
+                            comparison_detections, [],
+                            duplicate_pair_candidates=candidate_batch,
+                            duplicate_pairs_only=True,
+                            duplicate_output_budget=768,
+                        )
+                        pair_results = {tuple(sorted(item["detection_ids"])): item["decision"]
+                                        for item in duplicate_result["duplicate_reviews"]}
+                        for pair in candidate_batch:
+                            pair_ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
+                            decision = pair_results.get(pair_ids)
+                            st.session_state[duplicate_pair_review_state_key]["|".join(pair_ids)] = {
+                                "same_component": "AI: 같은 소자 후보",
+                                "different_components": "AI: 서로 다른 소자",
+                                "uncertain": "AI: 판정 보류",
+                            }.get(decision, "AI: 응답 누락")
                     deferred = max(0, len(duplicate_pairs) - 12) if review_all_pairs else 0
                     duplicate_status.update(
                         label=f"중복 쌍 검토 완료 · {len(selected_candidates)}쌍" +
