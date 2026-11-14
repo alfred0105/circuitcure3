@@ -84,6 +84,11 @@ REVIEW_SCHEMA = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
         }, "required": ["detection_ids", "decision", "confidence", "evidence"], "additionalProperties": False}},
+        "component_presence_reviews": {"type": "array", "maxItems": 0, "items": {"type": "object", "properties": {
+            "detection_id": {"type": "string"},
+            "object_status": {"type": "string", "enum": ["COMPONENT", "NOT_COMPONENT", "UNCERTAIN"]},
+            "evidence": {"type": "string", "maxLength": 160},
+        }, "required": ["detection_id", "object_status", "evidence"], "additionalProperties": False}},
         "group_reviews": {"type": "array", "maxItems": 2, "items": {"type": "object", "properties": {
             "parent_id": {"type": "string"},
             "decision": {"type": "string", "enum": ["single_component", "multiple_components", "uncertain"]},
@@ -108,7 +113,8 @@ REVIEW_SCHEMA = {
         }, "required": ["image_index", "bbox_norm_999", "proposed_class", "confidence", "evidence"], "additionalProperties": False}},
         "notes": {"type": "array", "maxItems": 4, "items": {"type": "string"}},
     },
-    "required": ["class_reviews", "duplicate_reviews", "group_reviews", "missed_component_candidates", "notes"],
+    "required": ["class_reviews", "duplicate_reviews", "component_presence_reviews",
+                 "group_reviews", "missed_component_candidates", "notes"],
     "additionalProperties": False,
 }
 
@@ -139,7 +145,8 @@ CLASS_ONLY_REVIEW_SCHEMA = {
 
 _SYSTEM = """Review the PCB images independently of YOLO. For each detection first decide whether the crop shows a physical electronic component, a relevant non-component board feature, or an uncertain/non-relevant object. Preserve the detector's class as evidence but do not copy it as your answer; an IC detector proposal may be a connector or socket. Choose a base class from the existing 18 detector classes when it applies; otherwise use other_component for a physical part, board_feature for a PCB structure, unknown when unclear, or not_component only for a clear false positive. These Qwen-only classes do not change YOLO labels. Set proposed_class equal to proposed_base_class for compatibility. Propose a subtype only when visually distinctive; otherwise use null. IC socket is an other_component subtype, not an installed IC. Explain visible body/package/pin/housing evidence, compare body OCR separately from nearby silkscreen, and do not infer a class solely from U3/J1/CN1. OCR/designator conflicts should be recorded in conflicting_evidence and require user review, but a weak nearby designator must not override clear visual evidence. Confidence is an uncalibrated model score, never a probability. Retain alternatives and uncertainty. Do not claim identity, electrical rating, pinout, or datasheet facts not visible or independently verified. Existing detections are ID-scoped; use only supplied IDs. Assess duplicate pairs only in supplied paired crops; do not delete anything. For group candidates, distinguish multiple separate bodies from a single package, connector, pins, or internal structure. Reuse listed child IDs and only suggest missing boxes as unverified. Keep evidence to one concise sentence and only populate optional arrays/fields when they add useful evidence. Return only the requested JSON object."""
 
-_DUPLICATES_ONLY_SYSTEM = """Assess only whether each supplied pair of detection boxes depicts the same physical component or two distinct components. Use the paired crops and supplied IDs. Pay attention to connector housing/pins, IC package structure, and nearby separate parts; pins or contacts within one connector/IC are not separate PCB components. Do not classify components, propose boxes, or recommend deletion. Use decision uncertain when the crop does not settle identity. Keep evidence to one concise sentence. Return empty arrays for class_reviews, group_reviews, missed_component_candidates, and notes, and return exactly one duplicate_reviews object for every supplied pair. Every duplicate object must include detection_ids with the exact pair IDs, decision, numeric confidence from 0 to 1, and evidence. Confidence is uncalibrated and never authorizes deletion. Return only schema-valid JSON."""
+_DUPLICATES_ONLY_SYSTEM = """Assess only whether each supplied pair of detection boxes depicts the same physical component or two distinct components. Use the paired crops and supplied IDs. Pay attention to connector housing/pins, IC package structure, and nearby separate parts; pins or contacts within one connector/IC are not separate PCB components. Do not classify components, propose boxes, or recommend deletion. Use decision uncertain when the crop does not settle identity. Keep evidence to one concise sentence. Return empty arrays for class_reviews, component_presence_reviews, group_reviews, missed_component_candidates, and notes, and return exactly one duplicate_reviews object for every supplied pair. Every duplicate object must include detection_ids with the exact pair IDs, decision, numeric confidence from 0 to 1, and evidence. Confidence is uncalibrated and never authorizes deletion. Return only schema-valid JSON."""
+_DUPLICATES_AND_PRESENCE_SYSTEM = """For every supplied pair, assess whether the two boxes show the same physical component or separate components, and give one COMPONENT/NOT_COMPONENT/UNCERTAIN presence status for each unique supplied detection ID. Use only the paired crops and IDs. COMPONENT means a visible physical electronic part; NOT_COMPONENT means a clear non-part feature or false positive; UNCERTAIN means existence cannot be determined. Pins within a connector or IC package are not separate components. Return one duplicate_reviews item per pair and one component_presence_reviews item per unique box ID. Do not recommend deletion. If unsure, use uncertain status. Evidence must be one short sentence. Confidence is uncalibrated. Return only schema-valid JSON."""
 _CLASS_ONLY_SYSTEM = """Estimate the component type for only the supplied selected PCB box(es). Each crop includes nearby PCB context; use supplied nearby OCR and silkscreen reference candidates only as supporting clues. A designator such as R12, C4, U3, or J1 is not enough by itself to decide the part type, and nearby text may belong to another part. Distinguish body markings from silkscreen. user_confirmed_reference_info contains locally saved information confirmed by a user for matching markings; use it only as a comparison clue and do not assume it matches unless the visible/OCR marking supports the match. Do not claim an exact part number, electrical rating, pinout, function, or fault. Return one class_reviews item for each supplied detection_id and no other analysis. Choose only from the 18 detector component classes listed in the schema. When the component cannot be identified confidently, use proposed_class=unknown and decision=uncertain. Do not use extension labels such as other_component, board_feature, or not_component in this selected-class task. Do not analyze duplicate boxes, groups, missed components, electrical function, or faults. Give one short evidence sentence that identifies whether it relies on body appearance, body marking, nearby silkscreen, or a user-confirmed matching reference. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
 _FULL_BOARD_CLASSIFICATION_SYSTEM = """Classify each labeled YOLO box quickly. For each ID return only: detection_id, object_status (COMPONENT, NOT_COMPONENT, or UNCERTAIN), proposed_class (one of the 18 classes or unknown). COMPONENT means a real physical part; use unknown when it is real but its type is unclear. NOT_COMPONENT means the box is a clear false positive. UNCERTAIN means presence itself is unclear. Do not explain, add evidence, confidence, subtype, or other text. Never treat missing output as unknown. Return compact JSON only."""
 
@@ -395,6 +402,7 @@ def review_components_with_qwen(
     classification_output_budget: int | None = None,
     classification_think: bool | None = False,
     duplicate_output_budget: int | None = None,
+    include_component_presence: bool = False,
 ) -> dict[str, Any]:
     """Request suggestions and validate every ID and normalized box before display."""
     if full_board_classification and not classification_only:
@@ -513,6 +521,10 @@ def review_components_with_qwen(
         expected_pair_count = len(pair_manifest)
         response_schema["properties"]["duplicate_reviews"]["minItems"] = expected_pair_count
         response_schema["properties"]["duplicate_reviews"]["maxItems"] = expected_pair_count
+        if include_component_presence:
+            expected_detection_ids = sorted({detection_id for pair in pair_manifest
+                                             for detection_id in pair["detection_ids"]})
+            response_schema["properties"]["component_presence_reviews"]["maxItems"] = len(expected_detection_ids)
     user_prompt = (
         "Classify the numbered boxes in the full-board image. Return exactly this JSON shape, with one row per box: "
         "{\"class_reviews\":[{\"detection_id\":\"1\",\"object_status\":\"COMPONENT\",\"proposed_class\":\"ic\"}]}. "
@@ -528,7 +540,12 @@ def review_components_with_qwen(
                 "For each pair shown in duplicate_pair_crops, return exactly one duplicate_reviews item using those two IDs. "
                 "Include detection_ids, decision, numeric confidence, and evidence in each item. "
                 "If the evidence cannot distinguish them, use decision=uncertain; do not omit a pair. Do not return class, group, "
-                "or missed-component analysis.\n" + json.dumps(payload, ensure_ascii=False)
+                "or missed-component analysis."
+                + (" Also return component_presence_reviews with one status for each unique supplied box ID: "
+                   "COMPONENT means visible physical part, NOT_COMPONENT means clearly a board feature/false positive, "
+                   "UNCERTAIN means presence is unclear. Never treat a missing row as a status. "
+                   if include_component_presence else "")
+                + "\n" + json.dumps(payload, ensure_ascii=False)
                 if duplicate_pairs_only else
                 "Review the PCB image, YOLO proposals, and OCR evidence. Return conservative candidate findings.\n"
                 + json.dumps(payload, ensure_ascii=False)
@@ -551,7 +568,9 @@ def review_components_with_qwen(
         if classification_only and classification_think is None:
             chat_options["think"] = None
         response = client.chat_json(
-            model, [{"role": "system", "content": (_DUPLICATES_ONLY_SYSTEM if duplicate_pairs_only else
+            model, [{"role": "system", "content": (_DUPLICATES_AND_PRESENCE_SYSTEM
+                                                       if duplicate_pairs_only and include_component_presence else
+                                                       _DUPLICATES_ONLY_SYSTEM if duplicate_pairs_only else
                                                        _FULL_BOARD_CLASSIFICATION_SYSTEM if full_board_classification else
                                                        _CLASS_ONLY_SYSTEM if classification_only else _SYSTEM)},
                     {"role": "user", "content": user_prompt}],
@@ -702,6 +721,23 @@ def review_components_with_qwen(
         seen_pairs.add(pair)
         duplicate_reviews.append({**row, "detection_ids": list(pair), "confidence": float(confidence),
                                   "evidence": str(row.get("evidence", ""))[:500]})
+    component_presence_reviews = []
+    if duplicate_pairs_only and include_component_presence:
+        expected_detection_ids = {detection_id for pair in pair_manifest
+                                  for detection_id in pair["detection_ids"]}
+        seen_presence_ids = set()
+        for row in content.get("component_presence_reviews", []):
+            detection_id = str(row.get("detection_id") or "")
+            object_status = row.get("object_status")
+            if (detection_id not in expected_detection_ids or detection_id in seen_presence_ids
+                    or object_status not in {"COMPONENT", "NOT_COMPONENT", "UNCERTAIN"}):
+                continue
+            seen_presence_ids.add(detection_id)
+            component_presence_reviews.append({
+                "detection_id": detection_id,
+                "object_status": object_status,
+                "evidence": str(row.get("evidence", ""))[:160],
+            })
     if duplicate_pairs_only:
         expected_pairs = {tuple(sorted(item["detection_ids"])) for item in pair_manifest}
         returned_pairs = {tuple(sorted(item["detection_ids"])) for item in duplicate_reviews}
@@ -722,16 +758,22 @@ def review_components_with_qwen(
                             duplicate_pair_candidates=[candidates_by_pair[pair]],
                             duplicate_pairs_only=True,
                             duplicate_output_budget=min(768, max(384, duplicate_output_budget or 384)),
+                            include_component_presence=include_component_presence,
                         )
                     except AIReviewStageError:
                         continue
                     duplicate_reviews.extend(retry["duplicate_reviews"])
+                    component_presence_reviews.extend(retry.get("component_presence_reviews", []))
                 returned_pairs = {tuple(sorted(item["detection_ids"])) for item in duplicate_reviews}
                 missing_pairs = sorted(expected_pairs - returned_pairs)
-            if missing_pairs:
+            if missing_pairs and not include_component_presence:
                 raise AIReviewStageError("qwen_validation",
                                          f"Qwen duplicate review omitted {len(missing_pairs)} requested pair(s) "
                                          "after individual retry; those pairs remain unreviewed.")
+        else:
+            missing_pairs = []
+    else:
+        missing_pairs = []
     allowed_groups = {group["parent_id"]: set(group["child_ids"])
                       for group in group_manifest}
     group_reviews = []
@@ -840,6 +882,8 @@ def review_components_with_qwen(
     if not isinstance(notes, list):
         notes = []
     return {"class_reviews": class_reviews, "duplicate_reviews": duplicate_reviews,
+            "component_presence_reviews": component_presence_reviews,
+            "unreviewed_pairs": [list(pair) for pair in missing_pairs],
             "group_reviews": group_reviews,
             "missed_component_candidates": missed,
             "notes": [str(note)[:300] for note in notes[:10]],

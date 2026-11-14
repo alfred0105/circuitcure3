@@ -586,9 +586,22 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                    f"YOLO {selected_detection['class_name']}", width="stretch")
         st.caption("AI의 ‘오탐 후보’는 확정 판정이 아닙니다. 확대 박스와 전체 기판을 함께 보고 사용자가 확인하세요.")
     duplicate_pairs = _duplicate_pair_candidates(comparison_detections, limit=24)
-    duplicate_pair_review_state_key = f"cc_archive2_duplicate_pairs_{project.project_id}_{photo_id}"
-    if not isinstance(st.session_state.get(duplicate_pair_review_state_key), dict):
-        st.session_state[duplicate_pair_review_state_key] = {}
+    duplicate_pair_review_state_key = f"cc_archive2_duplicate_model_results_{project.project_id}_{photo_id}"
+    duplicate_pair_fingerprint = hashlib.sha256(json.dumps({
+        "image": image_sha,
+        "detections": [{"id": row["detection_id"], "box": row["bbox_xyxy"]}
+                       for row in comparison_detections],
+        "pairs": [[item["detection_id"] for item in pair["detections"]]
+                  for pair in duplicate_pairs],
+        "models": selected_models,
+        "mode": "duplicate-and-physical-presence-v1",
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    duplicate_pair_state = st.session_state.get(duplicate_pair_review_state_key)
+    if (not isinstance(duplicate_pair_state, dict)
+            or duplicate_pair_state.get("fingerprint") != duplicate_pair_fingerprint):
+        duplicate_pair_state = {"fingerprint": duplicate_pair_fingerprint, "pairs": {}}
+        st.session_state[duplicate_pair_review_state_key] = duplicate_pair_state
+    pair_model_results = duplicate_pair_state["pairs"]
     pair_label_to_candidate = {}
     for pair in duplicate_pairs:
         left_id, right_id = (str(item["detection_id"]) for item in pair["detections"])
@@ -599,7 +612,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         ] = pair
     with st.expander(f"겹침·중복 의심 박스 · {len(duplicate_pairs)}쌍", expanded=bool(duplicate_pairs)):
         if duplicate_pairs:
-            st.caption("좌표상 겹침은 후보일 뿐입니다. AI가 실제 같은 부품인지 쌍별로 확인합니다. 검토 결과는 제안이며 박스를 자동 삭제하지 않습니다.")
+            st.caption("같은 모델 선택을 사용해 모든 선택 모델이 같은 박스 쌍을 순차 비교합니다. 모델의 실물/오탐 판단은 제안이며 정답 확정이나 박스 자동 삭제가 아닙니다.")
             st.dataframe([{
                 "박스 번호 A": model_detection_id_by_real_id.get(
                     str(pair["detections"][0]["detection_id"]), "—"),
@@ -610,8 +623,10 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 "기하 분류": "중복 가능성 높음" if same_component_box_pair(
                     pair["detections"][0]["bbox_xyxy"], pair["detections"][1]["bbox_xyxy"]
                 ) else "겹침만 확인 · 별도 소자일 수 있음",
-                "AI 쌍 검토": st.session_state[duplicate_pair_review_state_key].get(
-                    "|".join(sorted(item["detection_id"] for item in pair["detections"])), "미실행"
+                "모델 검토 완료": sum(
+                    pair_model_results.get("|".join(sorted(item["detection_id"] for item in pair["detections"])), {})
+                    .get(model_key, {}).get("status") in {"COMPLETE", "PARTIAL"}
+                    for model_key in selected_models
                 ),
                 "IoU": round(pair["metrics"]["iou"], 3),
                 "작은 박스 포함률": round(pair["metrics"]["smaller_coverage"], 3),
@@ -620,108 +635,234 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 "AI로 확인할 겹침 쌍 (한 번에 최대 3쌍)", list(pair_label_to_candidate), max_selections=3,
                 key=f"cc_archive2_duplicate_pair_select_{project.project_id}_{photo_id}",
             )
-            duplicate_model = st.selectbox(
-                "중복 확인 모델", list(MODEL_CATALOG), index=0,
-                format_func=lambda value: MODEL_CATALOG[value]["label"],
-                key=f"cc_archive2_duplicate_model_{project.project_id}_{photo_id}",
-            )
             review_all_pairs = st.button(
-                f"상위 후보 전체 AI 중복 확인 · {min(len(duplicate_pairs), 12)}쌍",
+                f"선택 모델 전체로 상위 후보 비교 · {min(len(duplicate_pairs), 12)}쌍",
                 key=f"cc_archive2_duplicate_run_all_{project.project_id}_{photo_id}",
-                disabled=not duplicate_pairs,
+                disabled=not duplicate_pairs or not selected_models,
             )
             review_selected_pairs = st.button(
-                "선택 쌍 AI 중복 확인",
+                "선택 쌍을 선택 모델 전체로 비교",
                 key=f"cc_archive2_duplicate_run_{project.project_id}_{photo_id}",
-                disabled=not selected_pair_labels,
+                disabled=not selected_pair_labels or not selected_models,
             )
             if review_all_pairs or review_selected_pairs:
-                duplicate_status = st.status("선택한 박스 쌍을 확인 중", expanded=True)
+                duplicate_status = st.status("선택한 모델로 박스 쌍을 비교 중", expanded=True)
                 try:
-                    duplicate_client = OllamaClient(timeout_seconds=300, num_predict=768,
-                                                    keep_alive="10m", auto_start=True)
                     selected_candidates = ([pair_label_to_candidate[label] for label in selected_pair_labels]
                                            if review_selected_pairs else duplicate_pairs[:12])
-                    if review_all_pairs:
-                        reviewed_pair_ids = st.session_state[duplicate_pair_review_state_key]
-                        selected_candidates = [pair for pair in selected_candidates
-                                               if reviewed_pair_ids.get(
-                                                   "|".join(sorted(item["detection_id"]
-                                                                   for item in pair["detections"])))
-                                               in (None, "AI 응답 누락 · 직접 확인")]
                     batches = [selected_candidates[index:index + 4]
                                for index in range(0, len(selected_candidates), 4)]
-                    unresolved_pairs = []
-                    for batch_index, candidate_batch in enumerate(batches, start=1):
+                    pair_count = sum(len(batch) for batch in batches)
+                    unavailable_count = 0
+                    failed_count = 0
+                    for model_index, model_key in enumerate(selected_models, start=1):
+                        model_id = MODEL_CATALOG[model_key]["ollama_id"]
+                        model_state = availability.get(model_key, {})
                         duplicate_status.update(
-                            label=f"중복 후보 확인 중 · {batch_index}/{len(batches)} 배치",
+                            label=f"{MODEL_CATALOG[model_key]['label']} · 모델 {model_index}/{len(selected_models)}",
                             state="running", expanded=True,
                         )
-                        try:
-                            duplicate_result = review_components_with_qwen(
-                                duplicate_client, MODEL_CATALOG[duplicate_model]["ollama_id"], image_bytes,
-                                comparison_detections, [],
-                                duplicate_pair_candidates=candidate_batch,
-                                duplicate_pairs_only=True,
-                                duplicate_output_budget=768,
+                        if model_state.get("status") != "READY":
+                            unavailable_count += pair_count
+                            for pair in selected_candidates:
+                                ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
+                                pair_key = "|".join(ids)
+                                pair_model_results.setdefault(pair_key, {})[model_key] = {
+                                    "status": "UNAVAILABLE",
+                                    "reason": model_state.get("reason", "설치 또는 실행 불가"),
+                                    "component_status": {},
+                                }
+                            continue
+                        duplicate_client = OllamaClient(timeout_seconds=300, num_predict=2048,
+                                                        keep_alive="10m", auto_start=True)
+                        for batch_index, candidate_batch in enumerate(batches, start=1):
+                            duplicate_status.update(
+                                label=f"{MODEL_CATALOG[model_key]['label']} · {batch_index}/{len(batches)} 묶음",
+                                state="running", expanded=True,
                             )
-                        except AIReviewStageError as batch_error:
-                            if batch_error.stage != "qwen_validation" or "omitted" not in str(batch_error):
-                                raise
-                            # A valid JSON array may still omit a requested item.
-                            # Retry each pair separately; unresolved rows remain
-                            # explicit and are never interpreted as duplicate.
-                            duplicate_reviews = []
-                            for pair_index, pair in enumerate(candidate_batch, start=1):
-                                duplicate_status.update(
-                                    label=f"누락된 쌍 개별 확인 중 · {batch_index}/{len(batches)} 배치 · "
-                                          f"{pair_index}/{len(candidate_batch)} 쌍",
-                                    state="running", expanded=True,
+                            started = time.perf_counter_ns()
+                            batch_failure_reason = None
+                            try:
+                                duplicate_result = review_components_with_qwen(
+                                    duplicate_client, model_id, image_bytes, comparison_detections, [],
+                                    duplicate_pair_candidates=candidate_batch, duplicate_pairs_only=True,
+                                    duplicate_output_budget=2048, include_component_presence=True,
                                 )
-                                try:
-                                    pair_result = review_components_with_qwen(
-                                        duplicate_client, MODEL_CATALOG[duplicate_model]["ollama_id"], image_bytes,
-                                        comparison_detections, [],
-                                        duplicate_pair_candidates=[pair],
-                                        duplicate_pairs_only=True,
-                                        duplicate_output_budget=512,
-                                    )
-                                    duplicate_reviews.extend(pair_result["duplicate_reviews"])
-                                except AIReviewStageError as pair_error:
-                                    if pair_error.stage != "qwen_validation" or "omitted" not in str(pair_error):
-                                        raise
-                                    pair_ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
-                                    st.session_state[duplicate_pair_review_state_key]["|".join(pair_ids)] = (
-                                        "AI 응답 누락 · 직접 확인"
-                                    )
-                                    unresolved_pairs.append(pair_ids)
-                            duplicate_result = {"duplicate_reviews": duplicate_reviews}
-                        pair_results = {tuple(sorted(item["detection_ids"])): item["decision"]
-                                        for item in duplicate_result["duplicate_reviews"]}
-                        for pair in candidate_batch:
-                            pair_ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
-                            decision = pair_results.get(pair_ids)
-                            if pair_ids not in unresolved_pairs:
-                                st.session_state[duplicate_pair_review_state_key]["|".join(pair_ids)] = {
-                                    "same_component": "AI: 같은 소자 후보",
-                                    "different_components": "AI: 서로 다른 소자",
-                                    "uncertain": "AI: 판정 보류",
-                                }.get(decision, "AI: 응답 누락 · 직접 확인")
-                    if unresolved_pairs:
-                        st.warning(f"{len(unresolved_pairs)}쌍은 Qwen 응답이 없어 미판정으로 남겼습니다. "
-                                   "목록에서 ‘AI 응답 누락 · 직접 확인’으로 표시됩니다.")
+                                candidate_results = duplicate_result
+                            except AIReviewStageError as batch_error:
+                                if batch_error.stage != "qwen_validation" or "omitted" not in str(batch_error):
+                                    candidate_results = None
+                                else:
+                                    candidate_results = {"duplicate_reviews": [], "component_presence_reviews": []}
+                                    for pair_index, pair in enumerate(candidate_batch, start=1):
+                                        duplicate_status.update(
+                                            label=f"{MODEL_CATALOG[model_key]['label']} · 누락 쌍 재확인 "
+                                                  f"{pair_index}/{len(candidate_batch)}",
+                                            state="running", expanded=True,
+                                        )
+                                        try:
+                                            pair_result = review_components_with_qwen(
+                                                duplicate_client, model_id, image_bytes, comparison_detections, [],
+                                                duplicate_pair_candidates=[pair], duplicate_pairs_only=True,
+                                                duplicate_output_budget=768, include_component_presence=True,
+                                            )
+                                            candidate_results["duplicate_reviews"].extend(
+                                                pair_result["duplicate_reviews"])
+                                            candidate_results["component_presence_reviews"].extend(
+                                                pair_result["component_presence_reviews"])
+                                        except Exception:
+                                            ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
+                                            pair_model_results.setdefault("|".join(ids), {})[model_key] = {
+                                                "status": "NO_RESPONSE", "decision": None,
+                                                "component_status": {}, "reason": "응답 누락 또는 형식 오류",
+                                            }
+                                            failed_count += 1
+                            except Exception as model_error:
+                                candidate_results = None
+                                batch_failure_reason = f"{type(model_error).__name__}: {str(model_error)[:180]}"
+                                failed_count += len(candidate_batch)
+
+                            elapsed_ms = round((time.perf_counter_ns() - started) / 1_000_000, 1)
+                            duplicate_by_pair = {
+                                tuple(sorted(row["detection_ids"])): row
+                                for row in candidate_results["duplicate_reviews"]
+                            } if candidate_results else {}
+                            presence_by_id = {
+                                row["detection_id"]: row
+                                for row in candidate_results["component_presence_reviews"]
+                            } if candidate_results else {}
+                            for pair in candidate_batch:
+                                ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
+                                pair_key = "|".join(ids)
+                                existing = pair_model_results.get(pair_key, {}).get(model_key, {})
+                                if existing.get("status") == "NO_RESPONSE":
+                                    continue
+                                duplicate = duplicate_by_pair.get(ids)
+                                component_status = {}
+                                for detection_id in ids:
+                                    presence = presence_by_id.get(detection_id)
+                                    component_status[detection_id] = {
+                                        "status": presence.get("object_status", "NO_RESPONSE")
+                                        if presence else "NO_RESPONSE",
+                                        "evidence": presence.get("evidence", "") if presence else "",
+                                    }
+                                pair_model_results.setdefault(pair_key, {})[model_key] = {
+                                    "status": ("COMPLETE" if duplicate and all(
+                                        item["status"] != "NO_RESPONSE" for item in component_status.values())
+                                        else "PARTIAL" if duplicate or any(
+                                            item["status"] != "NO_RESPONSE" for item in component_status.values())
+                                        else "NO_RESPONSE"),
+                                    "decision": duplicate.get("decision") if duplicate else None,
+                                    "evidence": duplicate.get("evidence", "") if duplicate else "",
+                                    "component_status": component_status,
+                                    "wall_ms": elapsed_ms,
+                                    "reason": None if duplicate else (
+                                        batch_failure_reason or "모델 응답에서 쌍 판정이 누락됨"),
+                                }
+                        st.session_state[duplicate_pair_review_state_key] = duplicate_pair_state
                     deferred = max(0, len(duplicate_pairs) - 12) if review_all_pairs else 0
                     duplicate_status.update(
-                        label=f"중복 쌍 검토 완료 · {len(selected_candidates)}쌍" +
+                        label=f"선택 모델 비교 완료 · {len(selected_candidates)}쌍" +
                               (f" · 나머지 {deferred}쌍은 대기" if deferred else ""),
                         state="complete", expanded=bool(deferred),
                     )
+                    if unavailable_count or failed_count:
+                        st.warning(f"모델 미설치/실행 불가 결과 {unavailable_count}개 · "
+                                   f"응답 누락 또는 오류 {failed_count}개. 모델별 표에서 상태를 확인하세요.")
                     if deferred:
                         st.info(f"후보가 12쌍을 넘어 상위 12쌍만 이번에 검토했습니다. 남은 {deferred}쌍은 선택 검토로 확인하세요.")
                     st.rerun()
                 except Exception as exc:
-                    duplicate_status.update(label="중복 쌍 검토 실패", state="error", expanded=True)
+                    duplicate_status.update(label="겹침 쌍 비교 실패", state="error", expanded=True)
                     st.error(f"{type(exc).__name__}: {str(exc)[:400]}")
+            status_labels = {
+                "COMPONENT": "실물 부품 후보",
+                "NOT_COMPONENT": "오탐/기판 요소 후보",
+                "UNCERTAIN": "실물 여부 미확정",
+                "NO_RESPONSE": "응답 누락",
+            }
+            model_status_labels = {
+                "COMPLETE": "완료",
+                "PARTIAL": "일부 응답",
+                "NO_RESPONSE": "응답 누락",
+                "UNAVAILABLE": "모델 사용 불가",
+            }
+            decision_labels = {
+                "same_component": "같은 부품 후보",
+                "different_components": "서로 다른 부품 후보",
+                "uncertain": "중복 여부 미확정",
+            }
+            pair_result_rows = []
+            for pair in duplicate_pairs:
+                ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
+                pair_key = "|".join(ids)
+                model_results = pair_model_results.get(pair_key, {})
+                for model_key in selected_models:
+                    model_result = model_results.get(model_key, {})
+                    components = model_result.get("component_status", {})
+                    left = components.get(ids[0], {})
+                    right = components.get(ids[1], {})
+                    pair_result_rows.append({
+                        "박스 쌍": f"{model_detection_id_by_real_id.get(ids[0], '?')} ↔ "
+                                   f"{model_detection_id_by_real_id.get(ids[1], '?')}",
+                        "모델": MODEL_CATALOG[model_key]["label"],
+                        "모델 상태": model_status_labels.get(model_result.get("status"), "미실행"),
+                        "같은 부품 판단": decision_labels.get(model_result.get("decision"),
+                                                             "판정 미응답" if model_result else "미실행"),
+                        f"{model_detection_id_by_real_id.get(ids[0], '?')}번 실물 여부":
+                            status_labels.get(left.get("status"), "미실행"),
+                        f"{model_detection_id_by_real_id.get(ids[1], '?')}번 실물 여부":
+                            status_labels.get(right.get("status"), "미실행"),
+                        "간단 근거": model_result.get("evidence") or model_result.get("reason") or "",
+                        "요청 묶음 응답시간(ms)": model_result.get("wall_ms"),
+                    })
+            if pair_result_rows:
+                st.markdown("**선택 모델별 겹침·실물 여부 비교**")
+                st.dataframe(pair_result_rows, use_container_width=True, hide_index=True)
+                viewed_pair_label = st.selectbox(
+                    "모델별 결과 카드로 볼 박스 쌍", list(pair_label_to_candidate),
+                    key=f"cc_archive2_duplicate_pair_cards_{project.project_id}_{photo_id}",
+                )
+                viewed_pair = pair_label_to_candidate[viewed_pair_label]
+                viewed_ids = tuple(sorted(item["detection_id"] for item in viewed_pair["detections"]))
+                viewed_key = "|".join(viewed_ids)
+                viewed_model_results = pair_model_results.get(viewed_key, {})
+                for detection_id in viewed_ids:
+                    counts = {status: sum(
+                        viewed_model_results.get(model_key, {}).get("component_status", {})
+                        .get(detection_id, {}).get("status") == status
+                        for model_key in selected_models
+                    ) for status in ("COMPONENT", "NOT_COMPONENT", "UNCERTAIN", "NO_RESPONSE")}
+                    st.caption(
+                        f"박스 {model_detection_id_by_real_id.get(detection_id, '?')} 실물 여부 모델 응답 집계 "
+                        f"· 실물 후보 {counts['COMPONENT']} · 오탐/기판 요소 후보 {counts['NOT_COMPONENT']} "
+                        f"· 불확실 {counts['UNCERTAIN']} · 미응답 {counts['NO_RESPONSE']} "
+                        "· 모델 합의 수이며 정답 판정은 아님"
+                    )
+                cards = st.columns(2)
+                for model_index, model_key in enumerate(selected_models):
+                    model_result = pair_model_results.get(viewed_key, {}).get(model_key, {})
+                    with cards[model_index % 2]:
+                        with st.container(border=True):
+                            st.markdown(f"**{MODEL_CATALOG[model_key]['label']}**")
+                            st.caption(model_status_labels.get(model_result.get("status"), "비교 전"))
+                            st.markdown("동일 소자 여부 · " +
+                                        decision_labels.get(model_result.get("decision"), "판정 응답 없음"))
+                            for detection_id in viewed_ids:
+                                source = source_by_id.get(detection_id, {})
+                                object_status = model_result.get("component_status", {}).get(detection_id, {})
+                                number = model_detection_id_by_real_id.get(detection_id, "?")
+                                st.write(
+                                    f"박스 {number} · YOLO {source.get('detector_class') or source.get('class_name') or 'unknown'}"
+                                    f" → {status_labels.get(object_status.get('status'), '미응답')}"
+                                )
+                            if model_result.get("evidence"):
+                                st.caption(model_result["evidence"])
+                            if model_result.get("reason"):
+                                st.caption(str(model_result["reason"]))
+                            if model_result.get("wall_ms") is not None:
+                                st.caption(f"요청 묶음 응답 {model_result['wall_ms']} ms")
+            st.caption("실물/오탐 결과도 모델의 시각적 제안입니다. 사용자 확인 데이터가 정답 기준이며, 모델 의견만으로 박스를 제외하지 않습니다.")
         else:
             st.caption("현재 겹침 기준에 맞는 후보가 없습니다.")
 

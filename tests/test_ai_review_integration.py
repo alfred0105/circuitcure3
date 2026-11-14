@@ -533,6 +533,69 @@ def test_duplicate_only_review_retries_only_pairs_omitted_from_multi_pair_respon
     }
 
 
+def test_duplicate_review_can_return_per_box_physical_component_status():
+    detections = [
+        {"component_id": "false", "class_name": "unknown", "bbox_xyxy": [5, 5, 25, 20]},
+        {"component_id": "part", "class_name": "resistor", "bbox_xyxy": [7, 6, 27, 21]},
+    ]
+    pairs = _duplicate_pair_candidates(detections, limit=None)
+
+    class PresenceClient:
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
+            assert output_schema["properties"]["component_presence_reviews"]["maxItems"] == 2
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [],
+                "duplicate_reviews": [{"detection_ids": ["false", "part"],
+                    "decision": "different_components", "confidence": .7, "evidence": "Separate regions."}],
+                "component_presence_reviews": [
+                    {"detection_id": "false", "object_status": "NOT_COMPONENT", "evidence": "Box covers a board marking."},
+                    {"detection_id": "part", "object_status": "COMPONENT", "evidence": "Visible resistor body and terminals."},
+                ],
+                "group_reviews": [], "missed_component_candidates": [], "notes": [],
+            }}
+
+    result = review_components_with_qwen(
+        PresenceClient(), "qwen3.5:9b", _png(), detections, [],
+        duplicate_pair_candidates=pairs, duplicate_pairs_only=True,
+        include_component_presence=True,
+    )
+    assert {row["detection_id"]: row["object_status"]
+            for row in result["component_presence_reviews"]} == {
+                "false": "NOT_COMPONENT", "part": "COMPONENT",
+            }
+
+
+def test_missing_duplicate_decision_preserves_component_presence_as_partial_result():
+    detections = [
+        {"component_id": "false", "class_name": "unknown", "bbox_xyxy": [5, 5, 25, 20]},
+        {"component_id": "part", "class_name": "resistor", "bbox_xyxy": [7, 6, 27, 21]},
+    ]
+    pairs = _duplicate_pair_candidates(detections, limit=None)
+
+    class PresenceOnlyClient:
+        def chat_json(self, *_args, **_kwargs):
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [],
+                "component_presence_reviews": [
+                    {"detection_id": "false", "object_status": "NOT_COMPONENT", "evidence": "Board marking."},
+                    {"detection_id": "part", "object_status": "COMPONENT", "evidence": "Physical package."},
+                ],
+                "group_reviews": [], "missed_component_candidates": [], "notes": [],
+            }}
+
+    result = review_components_with_qwen(
+        PresenceOnlyClient(), "qwen3.5:9b", _png(), detections, [],
+        duplicate_pair_candidates=pairs, duplicate_pairs_only=True,
+        include_component_presence=True,
+    )
+    assert result["duplicate_reviews"] == []
+    assert result["unreviewed_pairs"] == [["false", "part"]]
+    assert {row["detection_id"]: row["object_status"]
+            for row in result["component_presence_reviews"]} == {
+                "false": "NOT_COMPONENT", "part": "COMPONENT",
+            }
+
+
 def test_duplicate_review_continuation_only_calls_remaining_pair_queue(monkeypatch):
     from circuitcare.vision import component_recognition_panel as panel
 
