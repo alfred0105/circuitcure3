@@ -68,6 +68,15 @@ class OllamaClient:
         with self._metadata_lock:
             self._metadata_cache.clear()
 
+    def unload_model(self, model_name: str) -> bool:
+        """Unload an Ollama model after a bounded workflow; native MLX servers manage their own lifetime."""
+        if self.backend != "ollama":
+            return False
+        self._request("POST", "/api/generate", {
+            "model": model_name, "prompt": "", "stream": False, "keep_alive": 0,
+        })
+        return True
+
     def _cached_metadata(self, key: str, loader):
         now = time.monotonic()
         with self._metadata_lock:

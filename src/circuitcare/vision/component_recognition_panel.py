@@ -236,7 +236,8 @@ def _duplicate_pair_queue_summary(queue: dict) -> dict[str, Any]:
     return counts
 
 
-def _claim_duplicate_pair_page(candidates: list[dict], queue: dict, *, limit: int = 12) -> list[dict]:
+def _claim_duplicate_pair_page(candidates: list[dict], queue: dict, *, limit: int = 12,
+                               retry_failed: bool = True) -> list[dict]:
     """Claim a bounded page; leave all unclaimed candidates resumable as DEFERRED."""
     records = queue.setdefault("pairs", {})
     selected = []
@@ -248,7 +249,8 @@ def _claim_duplicate_pair_page(candidates: list[dict], queue: dict, *, limit: in
     for candidate in ordered_candidates:
         pair_id = _duplicate_pair_id(candidate)
         record = records.get(pair_id, {})
-        if record.get("status") not in {"PENDING", "DEFERRED", "FAILED"}:
+        retryable = {"PENDING", "DEFERRED", "FAILED"} if retry_failed else {"PENDING", "DEFERRED"}
+        if record.get("status") not in retryable:
             continue
         if len(selected) >= max(0, limit):
             if record.get("status") in {"PENDING", "DEFERRED"}:
@@ -326,7 +328,7 @@ def _ollama_review_client() -> Any:
     # 4096-token completion even for a six-box batch on Qwen3.5 9B.
     # Keep an upper bound on JSON generation. Large output budgets let a malformed
     # or overly verbose batch occupy the single MLX worker for several minutes.
-    return OllamaClient(auto_start=True, timeout_seconds=300, num_predict=4096)
+    return OllamaClient(auto_start=True, timeout_seconds=300, num_predict=4096, keep_alive="30m")
 
 
 def invalidate_qwen_review(state: Any, scope: str) -> None:
@@ -666,6 +668,22 @@ def _store_predictions(state: Any, records_key: str, result: dict) -> None:
     state[records_key] = rows
 
 
+def _queue_initial_ai_review(st_api: Any, *, image_bytes: bytes, scope: str,
+                             rows: list[dict], records_key: str, project_id: str) -> None:
+    """Start one idempotent Qwen 9B job after a photo's YOLO boxes are ready."""
+    selected_ids = [str(row.get("component_id")) for row in rows
+                    if row.get("상태") != "제외" and row.get("component_id")]
+    if not selected_ids:
+        return
+    import secrets
+    token = st_api.session_state.setdefault("cc_ai_review_session_owner", secrets.token_urlsafe(20))
+    queue_ai_component_review(
+        st_api, image_bytes=image_bytes, scope=scope, rows=rows, records_key=records_key,
+        owner=f"{token}|{project_id}", selected_component_ids=selected_ids,
+        retry_failed=False,
+    )
+
+
 def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: str,
                                photo_id: str, review_image_bytes: bytes | None = None,
                                review_image_size: tuple[int, int] | None = None,
@@ -680,6 +698,9 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
     if cleaned_rows != old_rows:
         st_api.session_state[records_key] = cleaned_rows
     if result_key in st_api.session_state:
+        _queue_initial_ai_review(st_api, image_bytes=review_bytes, scope=scope,
+                                 rows=st_api.session_state.get(records_key, []),
+                                 records_key=records_key, project_id=project_id)
         _record_vision_metric(st_api.session_state, "yolo_detection", 0.0, "cache_hit")
         _write_analysis_status(progress, "YOLO 소자 탐지 · 재사용")
         return st_api.session_state[result_key], None
@@ -712,6 +733,9 @@ def ensure_component_detection(st_api: Any, *, image_bytes: bytes, project_id: s
                                     x2 * scale_x, y2 * scale_y]
         st_api.session_state[result_key] = result
         _store_predictions(st_api.session_state, records_key, result)
+        _queue_initial_ai_review(st_api, image_bytes=review_bytes, scope=scope,
+                                 rows=st_api.session_state.get(records_key, []),
+                                 records_key=records_key, project_id=project_id)
         _record_vision_metric(st_api.session_state, "yolo_detection",
                               (time.perf_counter() - started) * 1000, "complete")
         _write_analysis_status(progress, f"YOLO 소자 탐지 · 완료 · {len(result.get('detections', []))}개")
@@ -748,29 +772,46 @@ def _run_selected_classification(st_api: Any, *, image_bytes: bytes, scope: str,
     fingerprint = _selected_classification_fingerprint(image_bytes, detections, selected_ids)
     batch_cache_key = f"cc_component_qwen_batches_{scope}"
     batch_cache = st_api.session_state.setdefault(batch_cache_key, {})
-    cached = batch_cache.get(fingerprint)
-    if isinstance(cached, dict) and cached.get("status") == "complete":
-        partial = cached["result"]
-        _write_analysis_status(progress, "선택 소자 분류 · 캐시 결과 재사용")
-    else:
-        if progress is not None and callable(getattr(progress, "set_stage", None)):
-            progress.set_stage("QWEN_CLASS_REVIEW", f"Qwen 선택 소자 분류 · {len(targets)}개 박스",
-                               completed_batches=0, total_batches=1, current_batch=1)
-        client = _ollama_review_client()
-        vision_check = getattr(client, "model_supports_vision", None)
-        if callable(vision_check) and not vision_check(DEFAULT_REVIEW_MODEL):
-            raise RuntimeError(f"{DEFAULT_REVIEW_MODEL} 모델이 Ollama에서 vision 기능을 선언하지 않았습니다.")
-        started = time.perf_counter()
-        partial = review_components_with_qwen(
-            client, DEFAULT_REVIEW_MODEL, image_bytes, detections, [],
-            classification_only=True, include_board_context=False,
-        )
-        batch_cache[fingerprint] = {"status": "complete", "result": partial}
-        _write_analysis_status(progress, f"선택 소자 분류 · 완료 · {len(partial.get('class_reviews', []))}개 제안")
-        if progress is not None and callable(getattr(progress, "set_stage", None)):
-            progress.set_stage("RESULT_VALIDATION", "선택 소자 분류 결과 확인 중",
-                               completed_batches=1, total_batches=1, current_batch=1)
-        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+    batches = _review_detection_batches(detections, batch_size=6)
+    client = None
+    started = time.perf_counter()
+    class_reviews, ollama_metrics, image_count, cache_hits = [], {}, 0, 0
+    for batch_index, detection_batch in enumerate(batches, start=1):
+        batch_ids = {str(row.get("detection_id") or row.get("component_id")) for row in detection_batch}
+        batch_fingerprint = _selected_classification_fingerprint(image_bytes, detection_batch, batch_ids)
+        cached = batch_cache.get(batch_fingerprint)
+        if isinstance(cached, dict) and cached.get("status") == "complete":
+            partial = cached["result"]
+            cache_hits += 1
+        else:
+            if client is None:
+                client = _ollama_review_client()
+                vision_check = getattr(client, "model_supports_vision", None)
+                if callable(vision_check) and not vision_check(DEFAULT_REVIEW_MODEL):
+                    raise RuntimeError(f"{DEFAULT_REVIEW_MODEL} 모델이 Ollama에서 vision 기능을 선언하지 않았습니다.")
+            if progress is not None and callable(getattr(progress, "set_stage", None)):
+                progress.set_stage("QWEN_CLASS_REVIEW", f"Qwen3.5 9B 소자 분류 · {batch_index}/{len(batches)} 배치",
+                                   completed_batches=batch_index - 1, total_batches=len(batches),
+                                   current_batch=batch_index)
+            st_api.session_state[f"cc_ai_review_model_used_{scope}"] = True
+            partial = review_components_with_qwen(
+                client, DEFAULT_REVIEW_MODEL, image_bytes, detection_batch, [],
+                classification_only=True, include_board_context=False,
+            )
+            batch_cache[batch_fingerprint] = {"status": "complete", "result": partial}
+        class_reviews.extend(partial.get("class_reviews", []))
+        image_count += int(partial.get("review_image_count", len(detection_batch)))
+        for key, value in (partial.get("ollama_metrics") or {}).items():
+            if isinstance(value, (int, float)):
+                ollama_metrics[key] = ollama_metrics.get(key, 0) + value
+    partial = {"class_reviews": class_reviews, "model": DEFAULT_REVIEW_MODEL,
+               "review_image_count": image_count, "ollama_metrics": ollama_metrics}
+    duration_ms = round((time.perf_counter() - started) * 1000, 2)
+    _write_analysis_status(progress, f"Qwen3.5 9B 소자 분류 · 완료 · {len(class_reviews)}/{len(targets)}개")
+    if progress is not None and callable(getattr(progress, "set_stage", None)):
+        progress.set_stage("RESULT_VALIDATION", "소자 분류 결과 확인 중",
+                           completed_batches=len(batches), total_batches=len(batches),
+                           current_batch=len(batches))
 
     previous = st_api.session_state.get(qwen_key)
     review = deepcopy(previous) if (isinstance(previous, dict)
@@ -786,7 +827,8 @@ def _run_selected_classification(st_api: Any, *, image_bytes: bytes, scope: str,
             by_id[str(proposal["detection_id"])] = proposal
     review.update({
         "class_reviews": list(by_id.values()),
-        "duplicate_reviews": [], "group_reviews": [], "missed_component_candidates": [],
+        "duplicate_reviews": (review.get("duplicate_reviews", []) if isinstance(review, dict) else []),
+        "group_reviews": [], "missed_component_candidates": [],
         "model": partial.get("model", DEFAULT_REVIEW_MODEL),
         "review_mode": "selected_class_only",
         "selected_component_ids": sorted(selected_ids),
@@ -804,13 +846,13 @@ def _run_selected_classification(st_api: Any, *, image_bytes: bytes, scope: str,
     review["ollama_metrics"] = partial.get("ollama_metrics", {})
     review["source_fingerprint"] = _inference_fingerprint(rows, None)
     review["performance"] = {
-        "batch_size": len(targets), "class_review_batches": 1,
-        "class_review_requests": 0 if isinstance(cached, dict) else 1,
-        "class_batch_cache_hits": 1 if isinstance(cached, dict) else 0,
+        "batch_size": len(targets), "class_review_batches": len(batches),
+        "class_review_requests": len(batches) - cache_hits,
+        "class_batch_cache_hits": cache_hits,
         "qwen_image_count": partial.get("review_image_count", len(targets)),
         "qwen_native_tile_count": 0,
         "output_tokens_per_second": None,
-        "duration_ms": duration_ms if not isinstance(cached, dict) else 0,
+        "duration_ms": duration_ms,
     }
     st_api.session_state[qwen_key] = review
 
@@ -968,24 +1010,30 @@ def queue_ai_component_review(st_api: Any, *, image_bytes: bytes, scope: str,
 
 def continue_duplicate_pair_review(st_api: Any, *, image_bytes: bytes, scope: str,
                                    rows: list[dict], ocr_result: dict | None = None,
-                                   progress: Any = None) -> dict[str, Any]:
+                                   progress: Any = None, retry_failed: bool = True) -> dict[str, Any]:
     """Review the next bounded duplicate-pair page without rerunning OCR or class review."""
     from circuitcare.vision.ai_review_service import DEFAULT_REVIEW_MODEL, review_components_with_qwen
 
     image_fingerprint = hashlib.sha256(image_bytes).hexdigest()
     indexed = [dict(row, detection_id=str(row.get("component_id") or row.get("detection_id")))
                for row in rows if row.get("상태") != "제외"]
-    candidates = _duplicate_pair_candidates(indexed, limit=None)
+    candidates_by_id = {}
+    for candidate in _duplicate_pair_candidates(indexed, limit=None):
+        pair_id = _duplicate_pair_id(candidate)
+        if pair_id:
+            candidates_by_id.setdefault(pair_id, candidate)
+    candidates = list(candidates_by_id.values())
     queue_key = f"cc_component_qwen_pair_queue_{scope}"
     queue = _sync_duplicate_pair_queue(candidates, st_api.session_state.get(queue_key),
                                        image_fingerprint=image_fingerprint,
                                        model=DEFAULT_REVIEW_MODEL)
     records = queue["pairs"]
-    pending = _claim_duplicate_pair_page(candidates, queue, limit=12)
+    pending = _claim_duplicate_pair_page(candidates, queue, limit=12, retry_failed=retry_failed)
     if not pending:
         st_api.session_state[queue_key] = queue
         return _duplicate_pair_queue_summary(queue)
 
+    st_api.session_state[f"cc_ai_review_model_used_{scope}"] = True
     status = progress or st_api.status("Qwen 중복 후보 검토 중", expanded=True)
     status.write(f"중복 후보 추가 배치 처리 중 · {len(pending)}쌍")
     client_error = None
@@ -1296,7 +1344,7 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                 qwen_review = None
         if isinstance(qwen_review, dict):
             selected_ids = set(map(str, qwen_review.get("selected_component_ids", [])))
-            st_api.caption("선택 소자 종류 검수 · OCR 및 중복 검수는 실행하지 않았습니다.")
+            st_api.caption("최초 YOLO 탐지 후 Qwen3.5 9B가 소자 종류와 중복 후보를 순차 검토합니다.")
             if qwen_review.get("verification_status") == "AI_REVIEW_FAILED":
                 diagnostics = qwen_review.get("review_diagnostics", {}).get("selected_classification", {})
                 st_api.error(f"Qwen 분류 실패 · {diagnostics.get('error') or '요청을 완료하지 못했습니다.'}")
@@ -1351,6 +1399,29 @@ def render_component_recognition_panel(st_api: Any, *, image_bytes: bytes, proje
                         st_api.session_state[records_key] = rows
                         invalidate_review_state()
                         st_api.rerun(scope="fragment")
+            duplicate_reviews = qwen_review.get("duplicate_reviews", [])
+            if duplicate_reviews:
+                st_api.markdown("**중복 박스 검토 제안 · 사용자 확인 필요**")
+                row_by_id = {str(row.get("component_id")): row for row in rows}
+                seen_pair_ids = set()
+                for proposal in duplicate_reviews:
+                    ids = sorted(map(str, proposal.get("detection_ids", [])))
+                    pair_id = "|".join(ids)
+                    if len(ids) != 2 or pair_id in seen_pair_ids:
+                        continue
+                    seen_pair_ids.add(pair_id)
+                    left, right = (row_by_id.get(item) for item in ids)
+                    if left is None or right is None:
+                        continue
+                    decision = proposal.get("decision")
+                    verdict = {"same_component": "같은 소자일 가능성", "different_components": "서로 다른 소자",
+                               "uncertain": "판단 불확실"}.get(decision, "검토 필요")
+                    st_api.caption(
+                        f"{left.get('component_id')} ({left.get('소자 종류', 'unknown')}) ↔ "
+                        f"{right.get('component_id')} ({right.get('소자 종류', 'unknown')}) · {verdict}"
+                    )
+                    st_api.caption(str(proposal.get("evidence") or "시각 근거 없음"))
+                st_api.caption("AI 제안만으로 박스를 자동 제외하지 않았습니다. 동일 박스 쌍은 한 번만 표시합니다.")
 
     export_rows = [{"project_id": project_id, "photo_id": photo_id,
                     "active": row.get("상태") != "제외", "class_name": row["소자 종류"],

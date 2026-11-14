@@ -126,6 +126,20 @@ class _WorkerAPI:
         return _Progress()
 
 
+def _unload_review_model(state: dict[str, Any], scope: str, progress: _Progress) -> bool | None:
+    if not state.pop(f"cc_ai_review_model_used_{scope}", False):
+        return None
+    try:
+        from circuitcare.vision.component_recognition_panel import _ollama_review_client
+        from circuitcare.vision.ai_review_service import DEFAULT_REVIEW_MODEL
+        _ollama_review_client().unload_model(DEFAULT_REVIEW_MODEL)
+        return True
+    except Exception as unload_error:
+        progress.set_stage("MODEL_UNLOAD_WARNING", "검수는 끝났지만 Qwen3.5 9B 메모리 해제를 확인하지 못했습니다.",
+                           error=str(unload_error)[:300])
+        return False
+
+
 _LOCK = threading.RLock()
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="circuitcare-ai-review")
 _JOBS: OrderedDict[tuple[str, str], _Job] = OrderedDict()
@@ -172,7 +186,9 @@ def _prune_jobs(now: float | None = None) -> None:
 
 
 def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[str, Any]:
-    from circuitcare.vision.component_recognition_panel import ensure_ai_component_review
+    from circuitcare.vision.component_recognition_panel import (
+        continue_duplicate_pair_review, ensure_ai_component_review,
+    )
 
     started = time.perf_counter()
     state = deepcopy(snapshot["state"])
@@ -189,6 +205,29 @@ def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[st
         )
         review_key = f"cc_component_qwen_review_{snapshot['scope']}"
         review = state.get(review_key) if isinstance(state.get(review_key), dict) else {}
+        if (snapshot.get("selected_component_ids") and result == "complete"
+                and review.get("verification_status") not in {"AI_REVIEW_FAILED", "AI_REVIEW_PARTIAL"}):
+            from circuitcare.vision.ai_review_service import _duplicate_pair_candidates
+            active_rows = [dict(row, detection_id=str(row.get("component_id") or row.get("detection_id")))
+                           for row in state.get(snapshot["records_key"], snapshot["rows"])
+                           if row.get("상태") != "제외"]
+            pair_count = len(_duplicate_pair_candidates(active_rows, limit=None))
+            pages = max(1, (pair_count + 11) // 12)
+            for page in range(pages):
+                progress.set_stage("QWEN_DUPLICATE_REVIEW",
+                                   f"Qwen3.5 9B 중복 박스 검토 · {page + 1}/{pages} 배치",
+                                   completed_batches=page, total_batches=pages, current_batch=page + 1)
+                summary = continue_duplicate_pair_review(
+                    api, image_bytes=snapshot["image_bytes"], scope=snapshot["scope"],
+                    rows=state.get(snapshot["records_key"], snapshot["rows"]),
+                    progress=progress, retry_failed=False,
+                )
+                if summary.get("pending", 0) + summary.get("deferred", 0) <= 0:
+                    break
+                if summary.get("reviewed", 0) == 0 and summary.get("failed", 0) > 0:
+                    break
+            review = state.get(review_key) if isinstance(state.get(review_key), dict) else review
+        model_unloaded = _unload_review_model(state, snapshot["scope"], progress)
         result_status = ("AI_REVIEW_PARTIAL" if review.get("verification_status") == "AI_REVIEW_PARTIAL"
                          else "FAILED" if result.upper() in {"FAILED", "UNAVAILABLE"}
                          else "COMPLETE")
@@ -202,8 +241,12 @@ def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[st
                           for stage in ("qwen", "candidate_search")
                           if isinstance(diagnostics.get(stage), dict)
                           and diagnostics[stage].get("error")), None)
-        progress.set_stage(final_stage, (f"AI 검수 실패 · {error}" if error else "AI 검수 작업 실패")
-                           if final_stage == "FAILED" else "AI 검수 작업 완료")
+        final_message = ((f"AI 검수 실패 · {error}" if error else "AI 검수 작업 실패")
+                         if final_stage == "FAILED" else
+                         "AI 검수 완료 · Qwen3.5 9B 메모리 해제" if model_unloaded is True else
+                         "AI 검수 완료 · 모델 메모리 해제 확인 실패" if model_unloaded is False else
+                         "AI 검수 작업 완료")
+        progress.set_stage(final_stage, final_message)
         return {"status": result_status, "state": state, "messages": progress.snapshot()["messages"],
                 "error": error,
                 "progress": progress.snapshot(),
@@ -213,6 +256,7 @@ def _run(snapshot: dict[str, Any], progress: _Progress | None = None) -> dict[st
                 "review_fingerprint": snapshot.get("review_fingerprint"),
                 "selected_component_ids": snapshot.get("selected_component_ids")}
     except Exception as exc:  # Keep worker failures isolated from Streamlit's script thread.
+        _unload_review_model(state, snapshot["scope"], progress)
         error = f"{type(exc).__name__}: {str(exc)[:400]}"
         progress.set_stage("FAILED", error, error=error)
         return {"status": "FAILED", "error": error,

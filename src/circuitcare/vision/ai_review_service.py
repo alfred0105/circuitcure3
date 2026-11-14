@@ -140,6 +140,20 @@ CLASS_ONLY_REVIEW_SCHEMA = {
 _SYSTEM = """Review the PCB images independently of YOLO. For each detection first decide whether the crop shows a physical electronic component, a relevant non-component board feature, or an uncertain/non-relevant object. Preserve the detector's class as evidence but do not copy it as your answer; an IC detector proposal may be a connector or socket. Choose a base class from the existing 18 detector classes when it applies; otherwise use other_component for a physical part, board_feature for a PCB structure, unknown when unclear, or not_component only for a clear false positive. These Qwen-only classes do not change YOLO labels. Set proposed_class equal to proposed_base_class for compatibility. Propose a subtype only when visually distinctive; otherwise use null. IC socket is an other_component subtype, not an installed IC. Explain visible body/package/pin/housing evidence, compare body OCR separately from nearby silkscreen, and do not infer a class solely from U3/J1/CN1. OCR/designator conflicts should be recorded in conflicting_evidence and require user review, but a weak nearby designator must not override clear visual evidence. Confidence is an uncalibrated model score, never a probability. Retain alternatives and uncertainty. Do not claim identity, electrical rating, pinout, or datasheet facts not visible or independently verified. Existing detections are ID-scoped; use only supplied IDs. Assess duplicate pairs only in supplied paired crops; do not delete anything. For group candidates, distinguish multiple separate bodies from a single package, connector, pins, or internal structure. Reuse listed child IDs and only suggest missing boxes as unverified. Keep evidence to one concise sentence and only populate optional arrays/fields when they add useful evidence. Return only the requested JSON object."""
 
 _DUPLICATES_ONLY_SYSTEM = """Assess only whether each supplied pair of detection boxes depicts the same physical component or two distinct components. Use the paired crops and supplied IDs. Pay attention to connector housing/pins, IC package structure, and nearby separate parts; pins or contacts within one connector/IC are not separate PCB components. Do not classify components, propose boxes, or recommend deletion. Use decision uncertain when the crop does not settle identity. Keep evidence to one concise sentence. Return empty arrays for class_reviews, group_reviews, missed_component_candidates, and notes, and return exactly one duplicate_reviews object for every supplied pair. Every duplicate object must include detection_ids with the exact pair IDs, decision, numeric confidence from 0 to 1, and evidence. Confidence is uncalibrated and never authorizes deletion. Return only schema-valid JSON."""
+
+_DUPLICATE_DECISION_ALIASES = {
+    "same": "same_component", "same_part": "same_component",
+    "same_physical_component": "same_component", "duplicate": "same_component",
+    "duplicates": "same_component", "one_component": "same_component",
+    "different": "different_components", "different_component": "different_components",
+    "distinct": "different_components", "distinct_component": "different_components",
+    "distinct_components": "different_components", "separate": "different_components",
+    "separate_component": "different_components", "separate_components": "different_components",
+    "separate_parts": "different_components", "different_parts": "different_components",
+    "two_components": "different_components", "not_duplicate": "different_components",
+    "not_the_same": "different_components", "unsure": "uncertain",
+    "not_sure": "uncertain", "inconclusive": "uncertain", "cannot_determine": "uncertain",
+}
 _CLASS_ONLY_SYSTEM = """Estimate the component type for only the supplied selected PCB box(es). Each crop includes nearby PCB context; use supplied nearby OCR and silkscreen reference candidates only as supporting clues. A designator such as R12, C4, U3, or J1 is not enough by itself to decide the part type, and nearby text may belong to another part. Distinguish body markings from silkscreen. user_confirmed_reference_info contains locally saved information confirmed by a user for matching markings; use it only as a comparison clue and do not assume it matches unless the visible/OCR marking supports the match. Do not claim an exact part number, electrical rating, pinout, function, or fault. Return one class_reviews item for each supplied detection_id and no other analysis. Choose only from the allowed classes. If visual and text evidence is unclear or conflicts, use proposed_class=unknown and decision=uncertain. Do not analyze duplicate boxes, groups, missed components, electrical function, or faults. Give one short evidence sentence that identifies whether it relies on body appearance, body marking, nearby silkscreen, or a user-confirmed matching reference. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
 
 
@@ -571,12 +585,25 @@ def review_components_with_qwen(
             )
     duplicate_reviews = []
     seen_pairs = set()
-    for row in content.get("duplicate_reviews", []):
+    duplicate_rows = content.get("duplicate_reviews")
+    if duplicate_rows is None:
+        duplicate_rows = next((content[key] for key in
+                               ("duplicate_pair_reviews", "duplicate_pair_crops", "pair_reviews")
+                               if key in content), [])
+    if isinstance(duplicate_rows, dict):
+        duplicate_rows = [duplicate_rows]
+    if not isinstance(duplicate_rows, list):
+        duplicate_rows = []
+    for row in duplicate_rows:
+        if not isinstance(row, dict):
+            continue
         ids = row.get("detection_ids", [])
         confidence = row.get("confidence")
+        raw_decision = str(row.get("decision") or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        decision = _DUPLICATE_DECISION_ALIASES.get(raw_decision, raw_decision)
         if (len(ids) != 2 or ids[0] == ids[1] or not set(ids) <= known_ids
                 or tuple(sorted(ids)) not in allowed_pairs
-                or row.get("decision") not in {"same_component", "different_components", "uncertain"}
+                or decision not in {"same_component", "different_components", "uncertain"}
                 or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
                 or not 0 <= float(confidence) <= 1):
             continue
@@ -584,7 +611,8 @@ def review_components_with_qwen(
         if pair in seen_pairs:
             continue
         seen_pairs.add(pair)
-        duplicate_reviews.append({**row, "detection_ids": list(pair), "confidence": float(confidence),
+        duplicate_reviews.append({**row, "detection_ids": list(pair), "decision": decision,
+                                  "confidence": float(confidence),
                                   "evidence": str(row.get("evidence", ""))[:500]})
     if duplicate_pairs_only:
         expected_pairs = {tuple(sorted(item["detection_ids"])) for item in pair_manifest}

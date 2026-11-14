@@ -103,6 +103,25 @@ def test_chat_json_keeps_model_warm_and_exposes_ollama_performance_metrics(monke
     assert result["eval_count"] == 5
 
 
+def test_unload_model_requests_immediate_ollama_unload(monkeypatch):
+    client = OllamaClient()
+    calls = []
+    monkeypatch.setattr(client, "_request", lambda method, path, payload: (
+        calls.append((method, path, payload)) or {"done": True}
+    ))
+    assert client.unload_model("qwen3.5:9b") is True
+    assert calls == [("POST", "/api/generate", {
+        "model": "qwen3.5:9b", "prompt": "", "stream": False, "keep_alive": 0,
+    })]
+
+
+def test_native_mlx_model_lifetime_is_not_manually_unloaded(monkeypatch):
+    client = OllamaClient()
+    client.backend = "mlx"
+    monkeypatch.setattr(client, "_request", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+    assert client.unload_model("qwen3.5:9b") is False
+
+
 def test_model_metadata_is_cached_for_the_configured_ttl(monkeypatch):
     client = OllamaClient(metadata_ttl_seconds=30)
     model_calls = []

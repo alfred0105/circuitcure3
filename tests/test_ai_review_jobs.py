@@ -245,3 +245,47 @@ def test_worker_failure_returns_original_batch_error(monkeypatch):
         'records_key': 'rows', 'image_bytes': b'photo', 'fingerprint': 'v1'})
     assert result['status'] == 'FAILED'
     assert result['error'] == 'Ollama request timed out'
+
+
+def test_initial_review_runs_class_then_duplicate_checks_and_unloads_qwen(monkeypatch):
+    from circuitcare.vision import component_recognition_panel as panel
+
+    calls = []
+    def classify(api, *, image_bytes, scope, rows, records_key, progress, selected_component_ids=None):
+        calls.append("class")
+        api.session_state["cc_ai_review_model_used_scope"] = True
+        api.session_state["cc_component_qwen_review_scope"] = {
+            "model": "qwen3.5:9b", "verification_status": "AI_SUGGESTIONS_ONLY",
+            "class_reviews": [{"detection_id": item, "proposed_class": "unknown"}
+                               for item in selected_component_ids],
+        }
+        return "complete"
+
+    def duplicates(api, **kwargs):
+        calls.append("duplicates")
+        review = api.session_state["cc_component_qwen_review_scope"]
+        review["duplicate_reviews"] = [{"detection_ids": ["a", "b"], "decision": "uncertain"}]
+        return {"total": 1, "reviewed": 1, "pending": 0, "deferred": 0, "failed": 0}
+
+    class Client:
+        def unload_model(self, model):
+            calls.append(f"unload:{model}")
+            return True
+
+    monkeypatch.setattr(panel, "ensure_ai_component_review", classify)
+    monkeypatch.setattr(panel, "continue_duplicate_pair_review", duplicates)
+    monkeypatch.setattr(panel, "_ollama_review_client", lambda: Client())
+    result = ai_review_jobs._run({
+        "state": {"rows": [
+            {"component_id": "a", "소자 종류": "resistor", "상태": "검수 필요",
+             "x1": 1, "y1": 1, "x2": 20, "y2": 20},
+            {"component_id": "b", "소자 종류": "resistor", "상태": "검수 필요",
+             "x1": 3, "y1": 3, "x2": 22, "y2": 22},
+        ]}, "image_bytes": b"image", "scope": "scope",
+        "rows": [{"component_id": "a", "x1": 1, "y1": 1, "x2": 20, "y2": 20},
+                 {"component_id": "b", "x1": 3, "y1": 3, "x2": 22, "y2": 22}],
+        "records_key": "rows", "fingerprint": "fp", "selected_component_ids": ["a", "b"],
+    })
+    assert calls == ["class", "duplicates", "unload:qwen3.5:9b"]
+    assert result["status"] == "COMPLETE"
+    assert result["state"]["cc_component_qwen_review_scope"]["duplicate_reviews"][0]["detection_ids"] == ["a", "b"]

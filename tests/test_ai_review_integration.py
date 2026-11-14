@@ -107,6 +107,61 @@ def test_qwen_review_validates_detection_ids_and_unverified_boxes():
     assert candidate["bbox_xyxy"][0] > 0
 
 
+@pytest.mark.parametrize(("field", "single_object", "raw_decision", "expected"), [
+    ("duplicate_reviews", True, "distinct_components", "different_components"),
+    ("duplicate_pair_crops", False, "same", "same_component"),
+])
+def test_qwen_duplicate_review_normalizes_supported_response_shapes(field, single_object, raw_decision, expected):
+    detections = [
+        {"component_id": "a", "class_name": "resistor", "bbox_xyxy": [5, 5, 25, 20]},
+        {"component_id": "b", "class_name": "resistor", "bbox_xyxy": [7, 6, 27, 21]},
+    ]
+    pair = _duplicate_pair_candidates(detections, limit=None)[0]
+    payload = {"detection_ids": ["a", "b"], "decision": raw_decision,
+               "confidence": .8, "evidence": "The outlines are clearly visible."}
+
+    class EnvelopeClient:
+        def chat_json(self, *_args, **_kwargs):
+            return {"model": "qwen3.5:9b", "content": {
+                field: payload if single_object else [payload],
+            }}
+
+    result = review_components_with_qwen(
+        EnvelopeClient(), "qwen3.5:9b", _png(), detections, [],
+        duplicate_pair_candidates=[pair], duplicate_pairs_only=True,
+    )
+    assert result["duplicate_reviews"][0]["decision"] == expected
+    assert result["duplicate_reviews"][0]["detection_ids"] == ["a", "b"]
+
+
+def test_initial_yolo_detection_queues_all_active_boxes_for_qwen_9b(monkeypatch):
+    from contextlib import nullcontext
+    import circuitcare.vision.component_recognition_panel as panel
+
+    queued = []
+
+    class Detector:
+        def load_component_locator(self):
+            return None
+
+        def run_prediction(self, _image, _options):
+            return {"image_width": 100, "image_height": 80, "detections": [
+                {"class_name": "resistor", "confidence": .8, "bbox_xyxy": [3, 4, 20, 18]},
+                {"class_name": "capacitor", "confidence": .6, "bbox_xyxy": [22, 4, 39, 18]},
+            ]}
+
+    monkeypatch.setattr(panel, "_app_server", lambda: Detector())
+    monkeypatch.setattr(panel, "_queue_initial_ai_review", lambda *args, **kwargs: queued.append(kwargs))
+    api = SimpleNamespace(session_state={}, spinner=lambda *_args, **_kwargs: nullcontext())
+    result, error = panel.ensure_component_detection(
+        api, image_bytes=b"same-pcb", project_id="project", photo_id="photo",
+    )
+    assert error is None
+    assert len(result["detections"]) == 2
+    assert queued and len(queued[0]["rows"]) == 2
+    assert all(row["상태"] != "제외" for row in queued[0]["rows"])
+
+
 def test_silkscreen_reference_is_attached_as_class_hint_not_applied_as_fact():
     rows = associate_ocr_with_components(
         [{"component_id": "part-1", "class_name": "resistor", "bbox_xyxy": [0, 0, 20, 20]}],
