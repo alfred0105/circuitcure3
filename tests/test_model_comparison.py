@@ -1,6 +1,6 @@
 import json
 
-from circuitcare.component_taxonomy import COMPONENT_CLASSES, UNKNOWN_CLASS
+from circuitcare.component_taxonomy import COMPONENT_CLASSES, QWEN_CLASSIFICATION_CLASSES, UNKNOWN_CLASS
 from circuitcare.vision.ai_review_service import _review_images
 from circuitcare.vision.model_comparison import (
     MODEL_CATALOG, _normalize_experiment_chat_http_response,
@@ -142,6 +142,29 @@ def test_archive2_all_models_are_presented_through_one_classification_field_sche
     assert all(set(row) == expected_fields for row in results)
     assert [row["proposed_class"] for row in results] == ["ic", "ic", "ic"]
     assert [row["uncertain"] for row in results] == [False, False, True]
+
+
+def test_archive2_proposals_are_normalized_to_the_fixed_18_class_taxonomy():
+    assert len(COMPONENT_CLASSES) == 18
+    assert set(QWEN_CLASSIFICATION_CLASSES) == {*COMPONENT_CLASSES, UNKNOWN_CLASS}
+    allowed = set(QWEN_CLASSIFICATION_CLASSES)
+    for class_name in COMPONENT_CLASSES:
+        normalized = _normalize_experiment_response({"content": {"class_reviews": [{
+            "detection_id": "U1", "proposed_class": class_name, "decision": "suggest",
+            "confidence": .8, "evidence": "Visual class proposal.",
+        }]}}, "U1")
+        assert normalized["content"]["class_reviews"][0]["proposed_class"] in allowed
+        assert normalized["content"]["class_reviews"][0]["proposed_class"] == class_name
+
+    for unsupported in ("other_component", "board_feature", "not_component", "fictional_part"):
+        normalized = _normalize_experiment_response({"content": {"class_reviews": [{
+            "detection_id": "U1", "proposed_class": unsupported, "decision": "suggest",
+            "confidence": .8, "evidence": "Unsupported label.",
+        }]}}, "U1")
+        row = normalized["content"]["class_reviews"][0]
+        assert row["proposed_class"] == UNKNOWN_CLASS
+        assert row["decision"] == "uncertain"
+        assert row["uncertain"] is True
 
 
 def test_archive2_wraps_qwen_root_array_before_shared_json_parser():

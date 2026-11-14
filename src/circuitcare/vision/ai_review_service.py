@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw
 
 from circuitcare.local_llm import OllamaClient
 from circuitcare.component_taxonomy import (
-    COMPONENT_CLASSES, COMPONENT_LABELS, QWEN_REVIEW_CLASSES, UNKNOWN_CLASS,
+    COMPONENT_CLASSES, COMPONENT_LABELS, QWEN_CLASSIFICATION_CLASSES, QWEN_REVIEW_CLASSES, UNKNOWN_CLASS,
     normalize_component_class, normalize_qwen_class, normalize_qwen_subtype,
 )
 from circuitcare.vision.box_reconciliation import (
@@ -125,7 +125,7 @@ CLASS_ONLY_REVIEW_SCHEMA = {
         "properties": {
             "detection_id": {"type": "string"},
             "decision": {"type": "string", "enum": ["suggest", "uncertain"]},
-            "proposed_class": {"type": "string", "enum": list(REVIEW_CLASSES)},
+            "proposed_class": {"type": "string", "enum": list(QWEN_CLASSIFICATION_CLASSES)},
             "proposed_subtype": {"type": ["string", "null"]},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "evidence": {"type": "string"},
@@ -140,7 +140,7 @@ CLASS_ONLY_REVIEW_SCHEMA = {
 _SYSTEM = """Review the PCB images independently of YOLO. For each detection first decide whether the crop shows a physical electronic component, a relevant non-component board feature, or an uncertain/non-relevant object. Preserve the detector's class as evidence but do not copy it as your answer; an IC detector proposal may be a connector or socket. Choose a base class from the existing 18 detector classes when it applies; otherwise use other_component for a physical part, board_feature for a PCB structure, unknown when unclear, or not_component only for a clear false positive. These Qwen-only classes do not change YOLO labels. Set proposed_class equal to proposed_base_class for compatibility. Propose a subtype only when visually distinctive; otherwise use null. IC socket is an other_component subtype, not an installed IC. Explain visible body/package/pin/housing evidence, compare body OCR separately from nearby silkscreen, and do not infer a class solely from U3/J1/CN1. OCR/designator conflicts should be recorded in conflicting_evidence and require user review, but a weak nearby designator must not override clear visual evidence. Confidence is an uncalibrated model score, never a probability. Retain alternatives and uncertainty. Do not claim identity, electrical rating, pinout, or datasheet facts not visible or independently verified. Existing detections are ID-scoped; use only supplied IDs. Assess duplicate pairs only in supplied paired crops; do not delete anything. For group candidates, distinguish multiple separate bodies from a single package, connector, pins, or internal structure. Reuse listed child IDs and only suggest missing boxes as unverified. Keep evidence to one concise sentence and only populate optional arrays/fields when they add useful evidence. Return only the requested JSON object."""
 
 _DUPLICATES_ONLY_SYSTEM = """Assess only whether each supplied pair of detection boxes depicts the same physical component or two distinct components. Use the paired crops and supplied IDs. Pay attention to connector housing/pins, IC package structure, and nearby separate parts; pins or contacts within one connector/IC are not separate PCB components. Do not classify components, propose boxes, or recommend deletion. Use decision uncertain when the crop does not settle identity. Keep evidence to one concise sentence. Return empty arrays for class_reviews, group_reviews, missed_component_candidates, and notes, and return exactly one duplicate_reviews object for every supplied pair. Every duplicate object must include detection_ids with the exact pair IDs, decision, numeric confidence from 0 to 1, and evidence. Confidence is uncalibrated and never authorizes deletion. Return only schema-valid JSON."""
-_CLASS_ONLY_SYSTEM = """Estimate the component type for only the supplied selected PCB box(es). Each crop includes nearby PCB context; use supplied nearby OCR and silkscreen reference candidates only as supporting clues. A designator such as R12, C4, U3, or J1 is not enough by itself to decide the part type, and nearby text may belong to another part. Distinguish body markings from silkscreen. user_confirmed_reference_info contains locally saved information confirmed by a user for matching markings; use it only as a comparison clue and do not assume it matches unless the visible/OCR marking supports the match. Do not claim an exact part number, electrical rating, pinout, function, or fault. Return one class_reviews item for each supplied detection_id and no other analysis. Choose only from the allowed classes. If visual and text evidence is unclear or conflicts, use proposed_class=unknown and decision=uncertain. Do not analyze duplicate boxes, groups, missed components, electrical function, or faults. Give one short evidence sentence that identifies whether it relies on body appearance, body marking, nearby silkscreen, or a user-confirmed matching reference. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
+_CLASS_ONLY_SYSTEM = """Estimate the component type for only the supplied selected PCB box(es). Each crop includes nearby PCB context; use supplied nearby OCR and silkscreen reference candidates only as supporting clues. A designator such as R12, C4, U3, or J1 is not enough by itself to decide the part type, and nearby text may belong to another part. Distinguish body markings from silkscreen. user_confirmed_reference_info contains locally saved information confirmed by a user for matching markings; use it only as a comparison clue and do not assume it matches unless the visible/OCR marking supports the match. Do not claim an exact part number, electrical rating, pinout, function, or fault. Return one class_reviews item for each supplied detection_id and no other analysis. Choose only from the 18 detector component classes listed in the schema. When the component cannot be identified confidently, use proposed_class=unknown and decision=uncertain. Do not use extension labels such as other_component, board_feature, or not_component in this selected-class task. Do not analyze duplicate boxes, groups, missed components, electrical function, or faults. Give one short evidence sentence that identifies whether it relies on body appearance, body marking, nearby silkscreen, or a user-confirmed matching reference. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
 
 
 def _review_images(
@@ -516,12 +516,16 @@ def review_components_with_qwen(
     for row in content.get("class_reviews", []):
         confidence = row.get("confidence")
         proposed = normalize_qwen_class(row.get("proposed_base_class", row.get("proposed_class")))
+        decision = row.get("decision")
         if (row.get("detection_id") not in known_ids
-                or row.get("decision") not in {"suggest", "uncertain"}
+                or decision not in {"suggest", "uncertain"}
                 or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
                 or not 0 <= float(confidence) <= 1):
             continue
-        if row.get("decision") == "uncertain":
+        if classification_only and proposed not in QWEN_CLASSIFICATION_CLASSES:
+            proposed = UNKNOWN_CLASS
+            decision = "uncertain"
+        if decision == "uncertain":
             proposed = UNKNOWN_CLASS
         target = next(item for item in identified if item["detection_id"] == row["detection_id"])
         hints = {normalize_component_class(item, allow_not_component=False)
@@ -567,7 +571,7 @@ def review_components_with_qwen(
                          "UNKNOWN" if proposed == UNKNOWN_CLASS else
                          "NOT_COMPONENT_SUGGESTED" if proposed == "not_component" else "AI_SUGGESTED")
         class_reviews.append({**row, "detector_class": target["class_name"],
-                              "decision": row["decision"],
+                              "decision": decision,
                               "proposed_class": proposed, "proposed_base_class": proposed,
                               "proposed_subtype": subtype, "alternative_classes": alternatives,
                               "is_physical_component": bool(physical), "is_board_feature": board_feature,

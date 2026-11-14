@@ -16,6 +16,9 @@ COMPONENT_LABELS = (*COMPONENT_CLASSES, UNKNOWN_CLASS, NOT_COMPONENT_CLASS)
 QWEN_EXTENSION_CLASSES = ("other_component", "board_feature")
 QWEN_REVIEW_CLASSES = (*COMPONENT_CLASSES, *QWEN_EXTENSION_CLASSES,
                        UNKNOWN_CLASS, NOT_COMPONENT_CLASS)
+# Selected-box classification compares component type only. Keep it within the
+# detector's fixed 18 classes while allowing an explicit abstention.
+QWEN_CLASSIFICATION_CLASSES = (*COMPONENT_CLASSES, UNKNOWN_CLASS)
 
 QWEN_SUBTYPES: dict[str, tuple[str, ...]] = {
     "ic": ("mcu", "memory", "regulator", "driver", "operational_amplifier",

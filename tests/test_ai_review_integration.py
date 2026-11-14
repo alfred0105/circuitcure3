@@ -15,7 +15,8 @@ from circuitcare.vision.ai_review_service import (
 )
 from circuitcare.vision.box_reconciliation import associate_ocr_with_components
 from circuitcare.vision.box_reconciliation import (
-    board_visible_review_rows, boxes_overlap_candidate, deduplicate_component_boxes,
+    board_visible_review_rows, box_iou, boxes_overlap_candidate, deduplicate_component_boxes,
+    duplicate_box_metrics,
     exclude_review_row, find_group_box_candidates, preserve_review_rows,
     remove_unreviewed_legacy_secondary_rows, same_component_box_pair,
 )
@@ -27,7 +28,8 @@ from circuitcare.vision.component_recognition_panel import (
     _make_group_child_row, continue_duplicate_pair_review,
 )
 from circuitcare.component_taxonomy import (
-    COMPONENT_CLASSES, COMPONENT_LABELS, QWEN_REVIEW_CLASSES, QWEN_SUBTYPE_DEFINITIONS, QWEN_SUBTYPES,
+    COMPONENT_CLASSES, COMPONENT_LABELS, QWEN_CLASSIFICATION_CLASSES, QWEN_REVIEW_CLASSES,
+    QWEN_SUBTYPE_DEFINITIONS, QWEN_SUBTYPES,
     normalize_component_class, normalize_qwen_class, normalize_qwen_subtype,
 )
 
@@ -196,6 +198,103 @@ def test_qwen_uncertain_class_stays_unknown_and_weak_ocr_hint_is_preserved_as_co
     assert result["class_reviews"][0]["review_status"] == "AI_CONFLICTED"
     assert result["class_reviews"][0]["needs_user_review"] is True
     assert result["class_reviews"][0]["detector_class"] == "resistor"
+
+
+def test_selected_box_classification_schema_is_limited_to_the_18_detector_classes_plus_unknown():
+    assert len(COMPONENT_CLASSES) == 18
+    assert set(QWEN_CLASSIFICATION_CLASSES) == {*COMPONENT_CLASSES, "unknown"}
+
+    class SelectedClassClient:
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
+            enum = output_schema["properties"]["class_reviews"]["items"]["properties"]["proposed_class"]["enum"]
+            assert set(enum) == set(QWEN_CLASSIFICATION_CLASSES)
+            return {"model": "qwen3.5:9b", "content": {"class_reviews": [{
+                "detection_id": "selected", "decision": "suggest", "proposed_class": "other_component",
+                "confidence": .8, "evidence": "Physical package, outside the fixed detector taxonomy.",
+            }]}}
+
+    result = review_components_with_qwen(
+        SelectedClassClient(), "qwen3.5:9b", _png(),
+        [{"detection_id": "selected", "component_id": "selected", "class_name": "unknown",
+          "bbox_xyxy": [10, 10, 70, 60]}], [], classification_only=True,
+        include_board_context=False,
+    )
+    assert result["class_reviews"][0]["proposed_class"] == "unknown"
+    assert result["class_reviews"][0]["decision"] == "uncertain"
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "overlap_candidate", "same_component"),
+    [
+        ([10, 10, 110, 110], [10, 10, 110, 110], True, True),
+        ([10, 10, 110, 110], [12, 12, 108, 108], True, True),
+        # A small real component contained in a broad localization box is an
+        # overlap signal but must not be automatically merged with that box.
+        ([0, 0, 100, 100], [44, 44, 56, 56], True, False),
+        ([0, 0, 60, 60], [40, 0, 100, 60], False, False),
+        ([0, 0, 20, 20], [500, 500, 520, 520], False, False),
+    ],
+)
+def test_duplicate_geometry_matrix_distinguishes_same_body_from_real_overlap(
+    left, right, overlap_candidate, same_component,
+):
+    assert boxes_overlap_candidate(left, right) is overlap_candidate
+    assert same_component_box_pair(left, right) is same_component
+    assert box_iou(left, right) == pytest.approx(box_iou(right, left))
+    assert duplicate_box_metrics(left, right)["area_ratio"] == pytest.approx(
+        duplicate_box_metrics(right, left)["area_ratio"]
+    )
+
+
+def test_box_ensemble_keeps_distinct_nested_or_partly_overlapping_parts_and_ignores_invalid_boxes():
+    candidates = [
+        {"source": "broad", "score": .95, "box": [0, 0, 100, 100]},
+        {"source": "small-real-part", "score": .72, "box": [44, 44, 56, 56]},
+        {"source": "neighbor", "score": .7, "box": [80, 20, 130, 70]},
+        {"source": "bad", "score": .99, "box": [1, 2, 3]},
+    ]
+    kept, suppressed = deduplicate_component_boxes(candidates)
+    assert {row["source"] for row in kept} == {"broad", "small-real-part", "neighbor"}
+    assert suppressed == []
+
+
+def test_overlapping_duplicate_pair_review_requires_user_action_before_hiding_box():
+    detections = [
+        {"detection_id": "wide", "component_id": "wide", "class_name": "ic",
+         "bbox_xyxy": [10, 10, 110, 110]},
+        {"detection_id": "tight", "component_id": "tight", "class_name": "ic",
+         "bbox_xyxy": [18, 18, 102, 102]},
+    ]
+    pairs = _duplicate_pair_candidates(detections, limit=None)
+    assert len(pairs) == 1
+
+    class DuplicateClient:
+        def chat_json(self, _model, _messages, *, output_schema, images, output_budget=None):
+            assert len(images) == 1
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [{
+                    "detection_ids": ["wide", "tight"], "decision": "same_component",
+                    "confidence": .9, "evidence": "Both boxes frame the same package body.",
+                }], "group_reviews": [], "missed_component_candidates": [], "notes": [],
+            }}
+
+    result = review_components_with_qwen(
+        DuplicateClient(), "qwen3.5:9b", _png(), detections, [],
+        duplicate_pair_candidates=pairs, duplicate_pairs_only=True,
+    )
+    proposal = result["duplicate_reviews"][0]
+    assert duplicate_exclusion_enabled(proposal, detections[0]["bbox_xyxy"], detections[1]["bbox_xyxy"])
+
+    review_rows = [
+        {"component_id": "wide", "소자 종류": "ic", "상태": "검수 필요",
+         "x1": 10, "y1": 10, "x2": 110, "y2": 110},
+        {"component_id": "tight", "소자 종류": "ic", "상태": "검수 필요",
+         "x1": 18, "y1": 18, "x2": 102, "y2": 102},
+    ]
+    assert len(board_visible_review_rows(review_rows)) == 2  # model agreement never deletes either box
+    exclude_review_row(review_rows[1], reason="user_confirmed_duplicate", review=proposal)
+    assert len(review_rows) == 2  # history remains reversible
+    assert [row["component_id"] for row in board_visible_review_rows(review_rows)] == ["wide"]
 
 
 def test_qwen_extension_taxonomy_does_not_change_yolo_18_classes_and_validates_subtypes():

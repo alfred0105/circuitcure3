@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from circuitcare.component_taxonomy import (
-    COMPONENT_CLASSES, UNKNOWN_CLASS, normalize_qwen_class, normalize_qwen_subtype,
+    COMPONENT_CLASSES, QWEN_CLASSIFICATION_CLASSES, UNKNOWN_CLASS,
+    normalize_qwen_class, normalize_qwen_subtype,
 )
 from circuitcare.local_llm import OllamaClient
 
@@ -145,7 +146,15 @@ def _normalize_experiment_response(response: dict[str, Any], detection_id: str) 
         evidence = "모델이 판별 근거를 반환하지 않아 분류를 확인할 수 없습니다."
         notes.append("evidence missing")
         schema_valid = False
-    allowed_classes = {*COMPONENT_CLASSES, UNKNOWN_CLASS, "other_component", "board_feature", "not_component"}
+    allowed_classes = set(QWEN_CLASSIFICATION_CLASSES)
+    raw_class_token = str(proposed_raw or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    unsupported_raw_class = (proposed == UNKNOWN_CLASS
+                             and raw_class_token not in {"", "unknown", "unknown_component"})
+    if proposed not in allowed_classes or unsupported_raw_class:
+        proposed = UNKNOWN_CLASS
+        model_uncertain = True
+        decision = "uncertain"
+        notes.append("class outside the 18-class selection taxonomy; recorded as unknown")
     proposed = proposed if proposed in allowed_classes else UNKNOWN_CLASS
     subtype_raw = next((row[key] for key in ("proposed_subtype", "subtype", "component_subtype")
                         if row.get(key) is not None), None)
