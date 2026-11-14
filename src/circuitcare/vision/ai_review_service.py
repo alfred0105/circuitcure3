@@ -147,6 +147,19 @@ _SYSTEM = """Review the PCB images independently of YOLO. For each detection fir
 
 _DUPLICATES_ONLY_SYSTEM = """Assess only whether each supplied pair of detection boxes depicts the same physical component or two distinct components. Use the paired crops and supplied IDs. Pay attention to connector housing/pins, IC package structure, and nearby separate parts; pins or contacts within one connector/IC are not separate PCB components. Do not classify components, propose boxes, or recommend deletion. Use decision uncertain when the crop does not settle identity. Keep evidence to one concise sentence. Return empty arrays for class_reviews, component_presence_reviews, group_reviews, missed_component_candidates, and notes, and return exactly one duplicate_reviews object for every supplied pair. Every duplicate object must include detection_ids with the exact pair IDs, decision, numeric confidence from 0 to 1, and evidence. Confidence is uncalibrated and never authorizes deletion. Return only schema-valid JSON."""
 _DUPLICATES_AND_PRESENCE_SYSTEM = """For every supplied pair, assess whether the two boxes show the same physical component or separate components, and give one COMPONENT/NOT_COMPONENT/UNCERTAIN presence status for each unique supplied detection ID. Use only the paired crops and IDs. COMPONENT means a visible physical electronic part; NOT_COMPONENT means a clear non-part feature or false positive; UNCERTAIN means existence cannot be determined. Pins within a connector or IC package are not separate components. Return one duplicate_reviews item per pair and one component_presence_reviews item per unique box ID. Do not recommend deletion. If unsure, use uncertain status. Evidence must be one short sentence. Confidence is uncalibrated. Return only schema-valid JSON."""
+_DUPLICATE_DECISION_ALIASES = {
+    "same": "same_component", "same_part": "same_component",
+    "same_physical_component": "same_component", "duplicate": "same_component",
+    "duplicates": "same_component", "one_component": "same_component",
+    "different": "different_components", "different_component": "different_components",
+    "distinct": "different_components", "distinct_component": "different_components",
+    "distinct_components": "different_components", "separate": "different_components",
+    "separate_component": "different_components", "separate_components": "different_components",
+    "separate_parts": "different_components", "different_parts": "different_components",
+    "two_components": "different_components", "not_duplicate": "different_components",
+    "not_the_same": "different_components", "unsure": "uncertain",
+    "not_sure": "uncertain", "inconclusive": "uncertain", "cannot_determine": "uncertain",
+}
 _CLASS_ONLY_SYSTEM = """Estimate the component type for only the supplied selected PCB box(es). Each crop includes nearby PCB context; use supplied nearby OCR and silkscreen reference candidates only as supporting clues. A designator such as R12, C4, U3, or J1 is not enough by itself to decide the part type, and nearby text may belong to another part. Distinguish body markings from silkscreen. user_confirmed_reference_info contains locally saved information confirmed by a user for matching markings; use it only as a comparison clue and do not assume it matches unless the visible/OCR marking supports the match. Do not claim an exact part number, electrical rating, pinout, function, or fault. Return one class_reviews item for each supplied detection_id and no other analysis. Choose only from the 18 detector component classes listed in the schema. When the component cannot be identified confidently, use proposed_class=unknown and decision=uncertain. Do not use extension labels such as other_component, board_feature, or not_component in this selected-class task. Do not analyze duplicate boxes, groups, missed components, electrical function, or faults. Give one short evidence sentence that identifies whether it relies on body appearance, body marking, nearby silkscreen, or a user-confirmed matching reference. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
 _FULL_BOARD_CLASSIFICATION_SYSTEM = """Classify each labeled YOLO box quickly. For each ID return only: detection_id, object_status (COMPONENT, NOT_COMPONENT, or UNCERTAIN), proposed_class (one of the 18 classes or unknown). COMPONENT means a real physical part; use unknown when it is real but its type is unclear. NOT_COMPONENT means the box is a clear false positive. UNCERTAIN means presence itself is unclear. Do not explain, add evidence, confidence, subtype, or other text. Never treat missing output as unknown. Return compact JSON only."""
 
@@ -706,12 +719,25 @@ def review_components_with_qwen(
             )
     duplicate_reviews = []
     seen_pairs = set()
-    for row in content.get("duplicate_reviews", []):
+    duplicate_rows = content.get("duplicate_reviews")
+    if duplicate_rows is None:
+        duplicate_rows = next((content[key] for key in
+                               ("duplicate_pair_reviews", "duplicate_pair_crops", "pair_reviews")
+                               if key in content), [])
+    if isinstance(duplicate_rows, dict):
+        duplicate_rows = [duplicate_rows]
+    if not isinstance(duplicate_rows, list):
+        duplicate_rows = []
+    for row in duplicate_rows:
+        if not isinstance(row, dict):
+            continue
         ids = row.get("detection_ids", [])
         confidence = row.get("confidence")
+        raw_decision = str(row.get("decision") or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        decision = _DUPLICATE_DECISION_ALIASES.get(raw_decision, raw_decision)
         if (len(ids) != 2 or ids[0] == ids[1] or not set(ids) <= known_ids
                 or tuple(sorted(ids)) not in allowed_pairs
-                or row.get("decision") not in {"same_component", "different_components", "uncertain"}
+                or decision not in {"same_component", "different_components", "uncertain"}
                 or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence))
                 or not 0 <= float(confidence) <= 1):
             continue
@@ -719,7 +745,8 @@ def review_components_with_qwen(
         if pair in seen_pairs:
             continue
         seen_pairs.add(pair)
-        duplicate_reviews.append({**row, "detection_ids": list(pair), "confidence": float(confidence),
+        duplicate_reviews.append({**row, "detection_ids": list(pair), "decision": decision,
+                                  "confidence": float(confidence),
                                   "evidence": str(row.get("evidence", ""))[:500]})
     component_presence_reviews = []
     if duplicate_pairs_only and include_component_presence:

@@ -565,6 +565,58 @@ def test_duplicate_review_can_return_per_box_physical_component_status():
             }
 
 
+def test_duplicate_review_normalizes_model_alias_distinct_components():
+    detections = [
+        {"component_id": "a", "class_name": "resistor", "bbox_xyxy": [5, 5, 25, 20]},
+        {"component_id": "b", "class_name": "resistor", "bbox_xyxy": [7, 6, 27, 21]},
+    ]
+    pairs = _duplicate_pair_candidates(detections, limit=None)
+
+    class AliasClient:
+        def chat_json(self, *_args, **_kwargs):
+            return {"model": "qwen3.5:9b", "content": {
+                "class_reviews": [], "duplicate_reviews": [{
+                    "detection_ids": ["a", "b"], "decision": "distinct_components",
+                    "confidence": .98, "evidence": "Two separate physical components.",
+                }], "group_reviews": [], "missed_component_candidates": [], "notes": [],
+            }}
+
+    result = review_components_with_qwen(
+        AliasClient(), "qwen3.5:9b", _png(), detections, [],
+        duplicate_pair_candidates=pairs, duplicate_pairs_only=True,
+    )
+    assert result["duplicate_reviews"][0]["decision"] == "different_components"
+    assert result["unreviewed_pairs"] == []
+
+
+@pytest.mark.parametrize(("field", "as_object", "raw_decision", "expected"), [
+    ("duplicate_reviews", True, "same", "same_component"),
+    ("duplicate_pair_crops", False, "same_component", "same_component"),
+    ("duplicate_pair_reviews", False, "distinct_components", "different_components"),
+])
+def test_duplicate_review_normalizes_model_specific_envelope_shapes(field, as_object, raw_decision, expected):
+    detections = [
+        {"component_id": "a", "class_name": "resistor", "bbox_xyxy": [5, 5, 25, 20]},
+        {"component_id": "b", "class_name": "resistor", "bbox_xyxy": [7, 6, 27, 21]},
+    ]
+    pairs = _duplicate_pair_candidates(detections, limit=None)
+    review = {"detection_ids": ["a", "b"], "decision": raw_decision,
+              "confidence": .8, "evidence": "The visible outlines are distinct."}
+
+    class ModelEnvelopeClient:
+        def chat_json(self, *_args, **_kwargs):
+            return {"model": "vision-model", "content": {
+                field: review if as_object else [review],
+            }}
+
+    result = review_components_with_qwen(
+        ModelEnvelopeClient(), "vision-model", _png(), detections, [],
+        duplicate_pair_candidates=pairs, duplicate_pairs_only=True,
+    )
+    assert result["duplicate_reviews"][0]["decision"] == expected
+    assert result["unreviewed_pairs"] == []
+
+
 def test_missing_duplicate_decision_preserves_component_presence_as_partial_result():
     detections = [
         {"component_id": "false", "class_name": "unknown", "bbox_xyxy": [5, 5, 25, 20]},

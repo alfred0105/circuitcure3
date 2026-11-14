@@ -585,6 +585,25 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
             st.image(crop, caption=f"번호 {selected_photo_number} · {selected_detection['detection_id']} · "
                                    f"YOLO {selected_detection['class_name']}", width="stretch")
         st.caption("AI의 ‘오탐 후보’는 확정 판정이 아닙니다. 확대 박스와 전체 기판을 함께 보고 사용자가 확인하세요.")
+    run_key = f"cc_archive2_last_board_run_v3_{project.project_id}_{photo_id}"
+    all_rows = _load_runs()
+    full_board_status_by_model: dict[str, dict[str, dict[str, Any]]] = {}
+    current_boxes = {row["detection_id"]: row["bbox_xyxy"] for row in comparison_detections}
+    for saved_run in reversed(all_rows):
+        if (saved_run.get("project_id") != project.project_id or saved_run.get("photo_id") != photo_id
+                or saved_run.get("component_id") != "__FULL_BOARD__"
+                or saved_run.get("image_sha256") != image_sha
+                or saved_run.get("status") not in {"COMPLETE", "PARTIAL"}):
+            continue
+        model_key = saved_run.get("model_key")
+        if model_key not in MODEL_CATALOG or model_key in full_board_status_by_model:
+            continue
+        saved_boxes = saved_run.get("bbox_xyxy_by_id", {})
+        full_board_status_by_model[model_key] = {
+            str(row.get("detection_id")): row for row in saved_run.get("predictions", [])
+            if isinstance(row, dict) and str(row.get("detection_id")) in current_boxes
+            and saved_boxes.get(str(row.get("detection_id"))) == current_boxes[str(row.get("detection_id"))]
+        }
     duplicate_pairs = _duplicate_pair_candidates(comparison_detections, limit=24)
     duplicate_pair_review_state_key = f"cc_archive2_duplicate_model_results_{project.project_id}_{photo_id}"
     duplicate_pair_fingerprint = hashlib.sha256(json.dumps({
@@ -686,7 +705,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                 duplicate_result = review_components_with_qwen(
                                     duplicate_client, model_id, image_bytes, comparison_detections, [],
                                     duplicate_pair_candidates=candidate_batch, duplicate_pairs_only=True,
-                                    duplicate_output_budget=2048, include_component_presence=True,
+                                    duplicate_output_budget=768,
                                 )
                                 candidate_results = duplicate_result
                             except AIReviewStageError as batch_error:
@@ -704,17 +723,16 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                             pair_result = review_components_with_qwen(
                                                 duplicate_client, model_id, image_bytes, comparison_detections, [],
                                                 duplicate_pair_candidates=[pair], duplicate_pairs_only=True,
-                                                duplicate_output_budget=768, include_component_presence=True,
+                                                duplicate_output_budget=768,
                                             )
                                             candidate_results["duplicate_reviews"].extend(
                                                 pair_result["duplicate_reviews"])
-                                            candidate_results["component_presence_reviews"].extend(
-                                                pair_result["component_presence_reviews"])
-                                        except Exception:
+                                        except Exception as pair_error:
                                             ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
                                             pair_model_results.setdefault("|".join(ids), {})[model_key] = {
                                                 "status": "NO_RESPONSE", "decision": None,
-                                                "component_status": {}, "reason": "응답 누락 또는 형식 오류",
+                                                "component_status": {},
+                                                "reason": f"{type(pair_error).__name__}: {str(pair_error)[:180]}",
                                             }
                                             failed_count += 1
                             except Exception as model_error:
@@ -727,10 +745,6 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                 tuple(sorted(row["detection_ids"])): row
                                 for row in candidate_results["duplicate_reviews"]
                             } if candidate_results else {}
-                            presence_by_id = {
-                                row["detection_id"]: row
-                                for row in candidate_results["component_presence_reviews"]
-                            } if candidate_results else {}
                             for pair in candidate_batch:
                                 ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
                                 pair_key = "|".join(ids)
@@ -738,23 +752,10 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                 if existing.get("status") == "NO_RESPONSE":
                                     continue
                                 duplicate = duplicate_by_pair.get(ids)
-                                component_status = {}
-                                for detection_id in ids:
-                                    presence = presence_by_id.get(detection_id)
-                                    component_status[detection_id] = {
-                                        "status": presence.get("object_status", "NO_RESPONSE")
-                                        if presence else "NO_RESPONSE",
-                                        "evidence": presence.get("evidence", "") if presence else "",
-                                    }
                                 pair_model_results.setdefault(pair_key, {})[model_key] = {
-                                    "status": ("COMPLETE" if duplicate and all(
-                                        item["status"] != "NO_RESPONSE" for item in component_status.values())
-                                        else "PARTIAL" if duplicate or any(
-                                            item["status"] != "NO_RESPONSE" for item in component_status.values())
-                                        else "NO_RESPONSE"),
+                                    "status": "COMPLETE" if duplicate else "NO_RESPONSE",
                                     "decision": duplicate.get("decision") if duplicate else None,
                                     "evidence": duplicate.get("evidence", "") if duplicate else "",
-                                    "component_status": component_status,
                                     "wall_ms": elapsed_ms,
                                     "reason": None if duplicate else (
                                         batch_failure_reason or "모델 응답에서 쌍 판정이 누락됨"),
@@ -767,8 +768,8 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                         state="complete", expanded=bool(deferred),
                     )
                     if unavailable_count or failed_count:
-                        st.warning(f"모델 미설치/실행 불가 결과 {unavailable_count}개 · "
-                                   f"응답 누락 또는 오류 {failed_count}개. 모델별 표에서 상태를 확인하세요.")
+                        st.warning(f"모델 사용 불가 {unavailable_count}개 · "
+                                   f"응답 누락/오류 {failed_count}개. 모델별 결과 상태와 사유를 확인하세요.")
                     if deferred:
                         st.info(f"후보가 12쌍을 넘어 상위 12쌍만 이번에 검토했습니다. 남은 {deferred}쌍은 선택 검토로 확인하세요.")
                     st.rerun()
@@ -779,11 +780,12 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 "COMPONENT": "실물 부품 후보",
                 "NOT_COMPONENT": "오탐/기판 요소 후보",
                 "UNCERTAIN": "실물 여부 미확정",
-                "NO_RESPONSE": "응답 누락",
+                "NO_RESPONSE": "전체 PCB 판정 응답 누락",
+                "NOT_RUN": "전체 PCB 비교 필요",
             }
             model_status_labels = {
                 "COMPLETE": "완료",
-                "PARTIAL": "일부 응답",
+                "PARTIAL": "일부 응답 누락",
                 "NO_RESPONSE": "응답 누락",
                 "UNAVAILABLE": "모델 사용 불가",
             }
@@ -799,7 +801,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 model_results = pair_model_results.get(pair_key, {})
                 for model_key in selected_models:
                     model_result = model_results.get(model_key, {})
-                    components = model_result.get("component_status", {})
+                    components = full_board_status_by_model.get(model_key, {})
                     left = components.get(ids[0], {})
                     right = components.get(ids[1], {})
                     pair_result_rows.append({
@@ -808,17 +810,20 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                         "모델": MODEL_CATALOG[model_key]["label"],
                         "모델 상태": model_status_labels.get(model_result.get("status"), "미실행"),
                         "같은 부품 판단": decision_labels.get(model_result.get("decision"),
-                                                             "판정 미응답" if model_result else "미실행"),
+                                                             "응답 누락" if model_result else "미실행"),
                         f"{model_detection_id_by_real_id.get(ids[0], '?')}번 실물 여부":
-                            status_labels.get(left.get("status"), "미실행"),
+                            status_labels.get(left.get("object_status"), "전체 PCB 비교 필요"),
                         f"{model_detection_id_by_real_id.get(ids[1], '?')}번 실물 여부":
-                            status_labels.get(right.get("status"), "미실행"),
+                            status_labels.get(right.get("object_status"), "전체 PCB 비교 필요"),
                         "간단 근거": model_result.get("evidence") or model_result.get("reason") or "",
                         "요청 묶음 응답시간(ms)": model_result.get("wall_ms"),
                     })
             if pair_result_rows:
                 st.markdown("**선택 모델별 겹침·실물 여부 비교**")
                 st.dataframe(pair_result_rows, use_container_width=True, hide_index=True)
+                if not full_board_status_by_model:
+                    st.info("실물/오탐 여부는 같은 사진의 ‘전체 PCB 모델 비교’ 결과를 재사용합니다. "
+                            "전체 PCB 모델 비교를 한 번 실행하면 여기에도 모델별 실물 판별이 표시됩니다.")
                 viewed_pair_label = st.selectbox(
                     "모델별 결과 카드로 볼 박스 쌍", list(pair_label_to_candidate),
                     key=f"cc_archive2_duplicate_pair_cards_{project.project_id}_{photo_id}",
@@ -829,14 +834,24 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 viewed_model_results = pair_model_results.get(viewed_key, {})
                 for detection_id in viewed_ids:
                     counts = {status: sum(
-                        viewed_model_results.get(model_key, {}).get("component_status", {})
-                        .get(detection_id, {}).get("status") == status
+                        full_board_status_by_model.get(model_key, {}).get(detection_id, {})
+                        .get("object_status") == status
                         for model_key in selected_models
-                    ) for status in ("COMPONENT", "NOT_COMPONENT", "UNCERTAIN", "NO_RESPONSE")}
+                    ) for status in ("COMPONENT", "NOT_COMPONENT", "UNCERTAIN")}
+                    not_run_count = sum(
+                        detection_id not in full_board_status_by_model.get(model_key, {})
+                        for model_key in selected_models
+                    )
+                    missing_response_count = sum(
+                        full_board_status_by_model.get(model_key, {}).get(detection_id, {})
+                        .get("object_status") == "NO_RESPONSE"
+                        for model_key in selected_models
+                    )
                     st.caption(
-                        f"박스 {model_detection_id_by_real_id.get(detection_id, '?')} 실물 여부 모델 응답 집계 "
+                        f"박스 {model_detection_id_by_real_id.get(detection_id, '?')} 실물 여부 모델 결과 집계 "
                         f"· 실물 후보 {counts['COMPONENT']} · 오탐/기판 요소 후보 {counts['NOT_COMPONENT']} "
-                        f"· 불확실 {counts['UNCERTAIN']} · 미응답 {counts['NO_RESPONSE']} "
+                        f"· 불확실 {counts['UNCERTAIN']} · 응답 누락 {missing_response_count} "
+                        f"· 전체 비교 전 {not_run_count} "
                         "· 모델 합의 수이며 정답 판정은 아님"
                     )
                 cards = st.columns(2)
@@ -847,14 +862,17 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                             st.markdown(f"**{MODEL_CATALOG[model_key]['label']}**")
                             st.caption(model_status_labels.get(model_result.get("status"), "비교 전"))
                             st.markdown("동일 소자 여부 · " +
-                                        decision_labels.get(model_result.get("decision"), "판정 응답 없음"))
+                                        decision_labels.get(model_result.get("decision"), "응답 누락" if
+                                                            model_result.get("status") == "NO_RESPONSE" else "미실행"))
                             for detection_id in viewed_ids:
                                 source = source_by_id.get(detection_id, {})
-                                object_status = model_result.get("component_status", {}).get(detection_id, {})
+                                object_status = full_board_status_by_model.get(model_key, {}).get(
+                                    detection_id, {"object_status": "NOT_RUN"}
+                                )
                                 number = model_detection_id_by_real_id.get(detection_id, "?")
                                 st.write(
                                     f"박스 {number} · YOLO {source.get('detector_class') or source.get('class_name') or 'unknown'}"
-                                    f" → {status_labels.get(object_status.get('status'), '미응답')}"
+                                    f" → {status_labels.get(object_status.get('object_status'), '전체 PCB 비교 필요')}"
                                 )
                             if model_result.get("evidence"):
                                 st.caption(model_result["evidence"])
@@ -983,8 +1001,6 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                  width="stretch")
             st.caption("Qwen이 제안하지 않은 위치도 미탐지라고 단정할 수 없습니다. 결과는 후보 탐색이며 실제 정답 검증에는 사람이 사진을 확인해야 합니다.")
 
-    run_key = f"cc_archive2_last_board_run_v3_{project.project_id}_{photo_id}"
-    all_rows = _load_runs()
     if st.button("전체 PCB 모델 비교 실행", type="primary",
                   key=f"cc_archive2_run_board_v3_{project.project_id}_{photo_id}",
                   disabled=not selected_models):
