@@ -16,7 +16,7 @@ from itertools import product
 from pathlib import Path
 from typing import Any
 
-from circuitcare.component_taxonomy import COMPONENT_CLASSES, UNKNOWN_CLASS
+from circuitcare.component_taxonomy import COMPONENT_CLASSES, UNKNOWN_CLASS, normalize_qwen_class
 from circuitcare.local_llm import OllamaClient
 
 MODEL_CATALOG = {
@@ -34,6 +34,80 @@ PADDING_RATIOS = (0.0, 0.25, 0.75)
 OUTPUT_BUDGETS = (128, 192, 256)
 PROMPT_VERSION = "selected-class-only-v1"
 SCHEMA_VERSION = "class-only-review-schema-v1"
+
+
+def _normalize_experiment_response(response: dict[str, Any], detection_id: str) -> dict[str, Any]:
+    """Normalize VLM-specific response envelopes for Archive 2 only.
+
+    The original object is retained for audit. Missing or unusable classifications
+    become an explicit unknown result, never a guessed class.
+    """
+    content = response.get("content")
+    response["archive2_raw_content"] = json.loads(json.dumps(content, ensure_ascii=False))
+    notes: list[str] = []
+    raw_rows: list[Any] = []
+    if isinstance(content, dict):
+        candidate = content.get("class_reviews")
+        if isinstance(candidate, list):
+            raw_rows = candidate
+        elif isinstance(content.get("selected_detections"), list):
+            raw_rows = content["selected_detections"]
+            notes.append("selected_detections envelope normalized")
+        elif content.get("detection_id"):
+            raw_rows = [content]
+            notes.append("single-result envelope normalized")
+    row = next((item for item in raw_rows if isinstance(item, dict)
+                and str(item.get("detection_id", detection_id)) == detection_id), None)
+    schema_valid = row is not None and "class_reviews" in (content if isinstance(content, dict) else {})
+    if row is None:
+        row = {}
+        notes.append("classification result missing; recorded as unknown")
+
+    proposed_raw = row.get("proposed_class", row.get("proposed_base_class"))
+    proposed = normalize_qwen_class(proposed_raw) if proposed_raw is not None else UNKNOWN_CLASS
+    if proposed_raw is None:
+        notes.append("proposed_class missing; recorded as unknown")
+        schema_valid = False
+    confidence = row.get("confidence")
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        confidence = float(confidence)
+        if 1 < confidence <= 100:
+            confidence /= 100
+            notes.append("confidence percentage converted to 0..1")
+            schema_valid = False
+        if not 0 <= confidence <= 1:
+            confidence = None
+            notes.append("confidence outside supported range omitted")
+            schema_valid = False
+    else:
+        confidence = None
+        notes.append("confidence missing or invalid")
+        schema_valid = False
+    decision = row.get("decision")
+    if decision not in {"suggest", "uncertain"}:
+        decision = "uncertain"
+        notes.append("decision missing or invalid; normalized to uncertain")
+        schema_valid = False
+    evidence = row.get("evidence", row.get("evidence_sentence", row.get("visual_evidence")))
+    if "evidence" not in row and evidence:
+        notes.append("evidence field alias normalized")
+        schema_valid = False
+    if not isinstance(evidence, str) or not evidence.strip():
+        evidence = "모델이 판별 근거를 반환하지 않아 분류를 확인할 수 없습니다."
+        notes.append("evidence missing")
+        schema_valid = False
+    normalized = {"detection_id": detection_id, "decision": decision,
+                  "proposed_class": proposed if proposed in {*COMPONENT_CLASSES, UNKNOWN_CLASS,
+                                                                "other_component", "board_feature",
+                                                                "not_component"} else UNKNOWN_CLASS,
+                  "confidence": confidence if confidence is not None else 0.0,
+                  "evidence": evidence[:500]}
+    content = dict(content) if isinstance(content, dict) else {}
+    content["class_reviews"] = [normalized]
+    response["content"] = content
+    response["archive2_normalization"] = {"schema_valid_before_normalization": schema_valid,
+                                          "notes": notes}
+    return response
 
 
 def _result_path() -> Path:
@@ -143,6 +217,7 @@ def _summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "misclassification_rate": (sum(row.get("prediction") != row.get("ground_truth")
                                            for row in labeled) / len(labeled)) if labeled else None,
             "json_valid_rate": sum(bool(row.get("json_valid")) for row in items) / len(items),
+            "schema_valid_rate": sum(bool(row.get("schema_valid")) for row in items) / len(items),
             "first_run_ms": next((row.get("wall_ms") for row in items if row.get("repeat_index") == 0), None),
             "confirmed_cold_run_ms": confirmed_cold[0] if confirmed_cold else None,
             "actual_load_ms": next((row.get("load_ms") for row in items if row.get("load_ms") not in (None, 0)), None),
@@ -316,6 +391,15 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 for repeat_index in range(int(repeats)):
                     count += 1
                     start_ns = time.perf_counter_ns()
+                    original_chat_json = run_client.chat_json
+                    response_adaptation: dict[str, Any] = {}
+                    def archive2_chat_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                        response = original_chat_json(*args, **kwargs)
+                        normalized = _normalize_experiment_response(response, component_id)
+                        response_adaptation.update(normalized.get("archive2_normalization", {}))
+                        response_adaptation["raw_model_response"] = normalized.get("archive2_raw_content")
+                        return normalized
+                    run_client.chat_json = archive2_chat_json
                     try:
                         reviewed = review_components_with_qwen(
                             run_client, runtime_id, image_bytes, [detection], ocr_rows,
@@ -367,7 +451,11 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                   "first_run_label": "FIRST" if repeat_index == 0 else "WARM",
                                   "first_is_confirmed_cold": bool(repeat_index == 0 and load_ms and load_ms > 0),
                                   "think_parameter": "false" if think_supported else "omitted (model did not declare thinking)",
-                                  "json_valid": True, "status": "COMPLETE",
+                                  "json_valid": True, "schema_valid": response_adaptation.get(
+                                      "schema_valid_before_normalization", False),
+                                  "normalization_notes": response_adaptation.get("notes", []),
+                                  "raw_model_response": response_adaptation.get("raw_model_response"),
+                                  "status": "COMPLETE",
                                   "prediction": prediction.get("proposed_class", UNKNOWN_CLASS),
                                   "prediction_subtype": prediction.get("proposed_subtype"),
                                   "confidence_uncalibrated": prediction.get("confidence"),
@@ -393,11 +481,14 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                   "output_budget": int(budget), "repeat_index": repeat_index,
                                   "wall_ms": round((time.perf_counter_ns() - start_ns) / 1_000_000, 3),
                                   "status": "UNAVAILABLE" if unavailable else "FAILED",
-                                  "error": message, "json_valid": False}
+                                  "error": message, "json_valid": False,
+                                  "normalization_notes": response_adaptation.get("notes", [])}
                         if unavailable:
                             availability[model_key] = {**availability[model_key],
                                 "status": "UNAVAILABLE", "reason": message}
                             st.session_state[availability_key] = availability
+                    finally:
+                        run_client.chat_json = original_chat_json
                     produced.append(result)
                     all_rows.append(result)
                     _save_runs(all_rows)
@@ -423,6 +514,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 "Macro F1": f"{row['macro_f1']:.3f}" if row.get("macro_f1") is not None else "NOT_EVALUATED",
                 "정답 수": row["sample_n"],
                 "JSON 유효율": f"{row['json_valid_rate']:.1%}",
+                "원본 스키마 일치율": f"{row['schema_valid_rate']:.1%}",
                 "Unknown": f"{row['unknown_rate']:.1%}"}
                for row in summary]
     st.dataframe(display, use_container_width=True, hide_index=True)

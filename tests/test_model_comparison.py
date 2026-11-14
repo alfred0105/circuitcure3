@@ -1,6 +1,8 @@
 from circuitcare.component_taxonomy import COMPONENT_CLASSES, UNKNOWN_CLASS
 from circuitcare.vision.ai_review_service import _review_images
-from circuitcare.vision.model_comparison import MODEL_CATALOG, _probe_models, _summarize
+from circuitcare.vision.model_comparison import (
+    MODEL_CATALOG, _normalize_experiment_response, _probe_models, _summarize,
+)
 from PIL import Image
 import io
 
@@ -58,6 +60,42 @@ def test_summary_with_no_confirmed_labels_does_not_invent_accuracy():
     assert summary["macro_f1"] is None
     assert summary["sample_n"] == 0
     assert summary["unknown_rate"] == 1
+
+
+def test_archive2_normalizes_evidence_alias_and_missing_confidence_without_losing_raw_fields():
+    response = {"content": {"class_reviews": [{
+        "detection_id": "U1", "decision": "uncertain", "proposed_class": "unknown",
+        "evidence_sentence": "Visual marking is not readable.",
+    }]}}
+    normalized = _normalize_experiment_response(response, "U1")
+    assert normalized["content"]["class_reviews"][0]["evidence"] == "Visual marking is not readable."
+    assert normalized["content"]["class_reviews"][0]["confidence"] == 0.0
+    assert normalized["archive2_normalization"]["schema_valid_before_normalization"] is False
+    assert normalized["archive2_raw_content"]["class_reviews"][0]["evidence_sentence"] == "Visual marking is not readable."
+
+
+def test_archive2_normalizes_envelopes_and_percent_confidence_conservatively():
+    response = {"content": {"selected_detections": [{
+        "detection_id": "R1", "decision": "suggest", "proposed_class": "resistor",
+        "confidence": 82, "evidence": "Visible resistor body.",
+    }]}}
+    normalized = _normalize_experiment_response(response, "R1")
+    row = normalized["content"]["class_reviews"][0]
+    assert row["proposed_class"] == "resistor"
+    assert row["confidence"] == .82
+    assert normalized["archive2_normalization"]["schema_valid_before_normalization"] is False
+    assert "confidence percentage converted to 0..1" in normalized["archive2_normalization"]["notes"]
+
+
+def test_archive2_missing_classification_becomes_unknown_not_detector_echo():
+    response = {"content": {"selected_detections": [{
+        "detection_id": "C4", "detector_class": "capacitor", "nearby_ocr_text_candidates": [],
+    }]}}
+    normalized = _normalize_experiment_response(response, "C4")
+    row = normalized["content"]["class_reviews"][0]
+    assert row["proposed_class"] == UNKNOWN_CLASS
+    assert row["decision"] == "uncertain"
+    assert normalized["archive2_normalization"]["schema_valid_before_normalization"] is False
 
 
 def test_summary_uses_only_confirmed_18_class_labels_and_reports_slices():
