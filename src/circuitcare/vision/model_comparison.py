@@ -599,7 +599,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         ] = pair
     with st.expander(f"겹침·중복 의심 박스 · {len(duplicate_pairs)}쌍", expanded=bool(duplicate_pairs)):
         if duplicate_pairs:
-            st.caption("아래 빠른 분류는 박스 좌표만 비교한 결과입니다. 같은 부품인지 확정하려면 원하는 쌍만 선택해 AI로 따로 확인하세요. 어느 결과도 박스를 자동 삭제하지 않습니다.")
+            st.caption("좌표상 겹침은 후보일 뿐입니다. AI가 실제 같은 부품인지 쌍별로 확인합니다. 검토 결과는 제안이며 박스를 자동 삭제하지 않습니다.")
             st.dataframe([{
                 "박스 번호 A": model_detection_id_by_real_id.get(
                     str(pair["detections"][0]["detection_id"]), "—"),
@@ -625,22 +625,32 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 format_func=lambda value: MODEL_CATALOG[value]["label"],
                 key=f"cc_archive2_duplicate_model_{project.project_id}_{photo_id}",
             )
-            if st.button("선택 쌍 AI 중복 확인", key=f"cc_archive2_duplicate_run_{project.project_id}_{photo_id}",
-                         disabled=not selected_pair_labels):
+            review_all_pairs = st.button(
+                f"상위 후보 전체 AI 중복 확인 · {min(len(duplicate_pairs), 12)}쌍",
+                key=f"cc_archive2_duplicate_run_all_{project.project_id}_{photo_id}",
+                disabled=not duplicate_pairs,
+            )
+            review_selected_pairs = st.button(
+                "선택 쌍 AI 중복 확인",
+                key=f"cc_archive2_duplicate_run_{project.project_id}_{photo_id}",
+                disabled=not selected_pair_labels,
+            )
+            if review_all_pairs or review_selected_pairs:
                 duplicate_status = st.status("선택한 박스 쌍을 확인 중", expanded=True)
                 try:
                     duplicate_client = OllamaClient(timeout_seconds=300, num_predict=256,
                                                     keep_alive="10m", auto_start=True)
+                    selected_candidates = ([pair_label_to_candidate[label] for label in selected_pair_labels]
+                                           if review_selected_pairs else duplicate_pairs[:12])
                     duplicate_result = review_components_with_qwen(
                         duplicate_client, MODEL_CATALOG[duplicate_model]["ollama_id"], image_bytes,
                         comparison_detections, [],
-                        duplicate_pair_candidates=[pair_label_to_candidate[label] for label in selected_pair_labels],
+                        duplicate_pair_candidates=selected_candidates,
                         duplicate_pairs_only=True,
                     )
-                    pair_results = {tuple(item["detection_ids"]): item["decision"]
+                    pair_results = {tuple(sorted(item["detection_ids"])): item["decision"]
                                     for item in duplicate_result["duplicate_reviews"]}
-                    for label in selected_pair_labels:
-                        pair = pair_label_to_candidate[label]
+                    for pair in selected_candidates:
                         pair_ids = tuple(sorted(item["detection_id"] for item in pair["detections"]))
                         decision = pair_results.get(pair_ids)
                         st.session_state[duplicate_pair_review_state_key]["|".join(pair_ids)] = {
@@ -648,13 +658,137 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                             "different_components": "AI: 서로 다른 소자",
                             "uncertain": "AI: 판정 보류",
                         }.get(decision, "AI: 응답 누락")
-                    duplicate_status.update(label="선택 쌍 검토 완료", state="complete", expanded=False)
+                    deferred = max(0, len(duplicate_pairs) - 12) if review_all_pairs else 0
+                    duplicate_status.update(
+                        label=f"중복 쌍 검토 완료 · {len(selected_candidates)}쌍" +
+                              (f" · 나머지 {deferred}쌍은 대기" if deferred else ""),
+                        state="complete", expanded=bool(deferred),
+                    )
+                    if deferred:
+                        st.info(f"후보가 12쌍을 넘어 상위 12쌍만 이번에 검토했습니다. 남은 {deferred}쌍은 선택 검토로 확인하세요.")
                     st.rerun()
                 except Exception as exc:
                     duplicate_status.update(label="중복 쌍 검토 실패", state="error", expanded=True)
                     st.error(f"{type(exc).__name__}: {str(exc)[:400]}")
         else:
             st.caption("현재 겹침 기준에 맞는 후보가 없습니다.")
+
+    # Archive 2 quality pass: use the shared validator for oversized groups and
+    # missed boxes. Results stay in this experiment's session state and never
+    # modify the production component review rows.
+    quality_key = f"cc_archive2_quality_review_{project.project_id}_{photo_id}"
+    quality_fingerprint = hashlib.sha256(json.dumps({
+        "image": image_sha,
+        "detections": [{"id": row["detection_id"], "box": row["bbox_xyxy"], "class": row["class_name"]}
+                       for row in comparison_detections],
+        "model": MODEL_CATALOG["qwen35_9b"]["ollama_id"],
+        "mode": "group-and-missed-candidates-v1",
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    quality_state = st.session_state.get(quality_key)
+    if not isinstance(quality_state, dict) or quality_state.get("fingerprint") != quality_fingerprint:
+        quality_state = None
+    with st.expander("큰 박스 묶음 · 미탐지 소자 검사", expanded=False):
+        st.caption("Qwen이 전체 PCB와 고해상도 타일을 보고 큰 박스 안의 여러 소자 및 YOLO가 놓친 후보를 찾습니다. 결과는 실험 제안으로만 저장되며 검수 박스를 바꾸지 않습니다.")
+        if st.button("묶음·미탐지 AI 검사 실행", key=f"cc_archive2_quality_run_{project.project_id}_{photo_id}"):
+            quality_status = st.status("전체 PCB 묶음·미탐지 검사 중", expanded=True)
+            try:
+                quality_client = OllamaClient(timeout_seconds=600, num_predict=1536,
+                                              keep_alive="10m", auto_start=True)
+                quality_result = review_components_with_qwen(
+                    quality_client, MODEL_CATALOG["qwen35_9b"]["ollama_id"], image_bytes,
+                    comparison_detections, ocr_rows,
+                    duplicate_pair_candidates=[], include_board_context=True,
+                )
+                st.session_state[quality_key] = {
+                    "fingerprint": quality_fingerprint,
+                    "model": MODEL_CATALOG["qwen35_9b"]["ollama_id"],
+                    "result": quality_result,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                quality_status.update(label="묶음·미탐지 검사 완료", state="complete", expanded=False)
+                st.rerun()
+            except Exception as exc:
+                quality_status.update(label="묶음·미탐지 검사 실패", state="error", expanded=True)
+                st.error(f"{type(exc).__name__}: {str(exc)[:500]}")
+        if quality_state is None:
+            st.info("이 사진에서 묶음·미탐지 검사를 아직 실행하지 않았습니다.")
+        else:
+            quality_result = quality_state.get("result", {})
+            group_reviews = quality_result.get("group_reviews", [])
+            missed_candidates = quality_result.get("missed_component_candidates", [])
+            group_diagnostics = quality_result.get("review_diagnostics", {}).get("candidate_search", {})
+            deferred_groups = sum(item.get("reason") == "per_batch_group_crop_limit"
+                                  for item in group_diagnostics.get("items", []))
+            st.caption(f"그룹 후보 {group_diagnostics.get('candidate_count', 0)}개 · "
+                       f"Qwen 검토 {len(group_reviews)}개 · 미탐지 후보 {len(missed_candidates)}개 · "
+                       f"검토 보류 그룹 {deferred_groups}개")
+            quality_preview = _image.convert("RGB").copy()
+            quality_draw = ImageDraw.Draw(quality_preview)
+            for group_index, review in enumerate(group_reviews, start=1):
+                parent = real_detection_by_photo_number.get(
+                    model_detection_id_by_real_id.get(str(review.get("parent_id")), ""))
+                if parent:
+                    x1, y1, x2, y2 = [int(round(value)) for value in parent["bbox_xyxy"]]
+                    quality_draw.rectangle((x1, y1, x2, y2), outline="#ffb02e", width=5)
+                    quality_draw.text((x1 + 3, max(0, y1 - 20)), f"G{group_index}", fill="#ffb02e",
+                                      stroke_width=2, stroke_fill="#17202a")
+                for child_index, proposal in enumerate(review.get("new_components", []), start=1):
+                    box = proposal.get("bbox_xyxy")
+                    if isinstance(box, (list, tuple)) and len(box) == 4:
+                        bx1, by1, bx2, by2 = [int(round(value)) for value in box]
+                        quality_draw.rectangle((bx1, by1, bx2, by2), outline="#ff5d8f", width=4)
+                        quality_draw.text((bx1 + 2, max(0, by1 - 16)), f"G{group_index}.{child_index}",
+                                          fill="#ff5d8f", stroke_width=2, stroke_fill="#17202a")
+            for missed_index, proposal in enumerate(missed_candidates, start=1):
+                box = proposal.get("bbox_xyxy")
+                if isinstance(box, (list, tuple)) and len(box) == 4:
+                    bx1, by1, bx2, by2 = [int(round(value)) for value in box]
+                    quality_draw.rectangle((bx1, by1, bx2, by2), outline="#ff5d8f", width=4)
+                    quality_draw.text((bx1 + 2, max(0, by1 - 16)), f"M{missed_index}", fill="#ff5d8f",
+                                      stroke_width=2, stroke_fill="#17202a")
+            st.image(quality_preview, caption="노랑 G: 묶음 박스 · 분홍 G.*: 누락된 묶음 자식 후보 · 분홍 M: 미탐지 후보",
+                     width="stretch")
+            if group_reviews:
+                st.markdown("**큰 박스 검토 결과**")
+                group_rows = []
+                for index, review in enumerate(group_reviews, start=1):
+                    parent_id = str(review.get("parent_id", ""))
+                    group_rows.append({
+                        "표시": f"G{index} · 박스 {model_detection_id_by_real_id.get(parent_id, '—')}",
+                        "YOLO 원본 ID": parent_id,
+                        "AI 판단": {"multiple_components": "여러 소자일 수 있음",
+                                    "single_component": "단일 부품 후보", "uncertain": "판정 보류"}.get(
+                                        review.get("decision"), "판정 보류"),
+                        "기존 내부 박스": ", ".join(review.get("child_ids", [])) or "없음",
+                        "신규 위치 제안": len(review.get("new_components", [])),
+                        "근거": review.get("evidence", ""),
+                    })
+                st.dataframe(group_rows, use_container_width=True, hide_index=True)
+            if missed_candidates:
+                st.markdown("**YOLO 미탐지 후보**")
+                missed_rows = [{"표시": f"M{index}", "종류 제안": row.get("proposed_class", UNKNOWN_CLASS),
+                                "상세 유형": row.get("proposed_subtype") or "—",
+                                "AI 점수 · 확률 아님": row.get("confidence"),
+                                "겹친 기존 박스": ", ".join(row.get("possible_duplicate_ids", [])) or "없음",
+                                "근거": row.get("evidence", "")}
+                               for index, row in enumerate(missed_candidates, start=1)]
+                st.dataframe(missed_rows, use_container_width=True, hide_index=True)
+                selected_missed = st.selectbox(
+                    "확대해서 확인할 미탐지 제안", list(range(len(missed_candidates))),
+                    format_func=lambda value: f"M{value + 1} · {missed_candidates[value].get('proposed_class', UNKNOWN_CLASS)}",
+                    key=f"cc_archive2_quality_missed_{project.project_id}_{photo_id}",
+                )
+                missed_box = missed_candidates[selected_missed].get("bbox_xyxy")
+                if isinstance(missed_box, (list, tuple)) and len(missed_box) == 4:
+                    mx1, my1, mx2, my2 = [int(round(value)) for value in missed_box]
+                    left, top_px = max(0, min(_image.width, mx1)), max(0, min(_image.height, my1))
+                    right, bottom_px = max(0, min(_image.width, mx2)), max(0, min(_image.height, my2))
+                    if right > left and bottom_px > top_px:
+                        missed_crop = _image.convert("RGB").crop((left, top_px, right, bottom_px))
+                        missed_crop.thumbnail((720, 720), Image.Resampling.LANCZOS)
+                        st.image(missed_crop, caption=f"M{selected_missed + 1} 확대 · AI 제안, 사용자 확인 필요",
+                                 width="stretch")
+            st.caption("Qwen이 제안하지 않은 위치도 미탐지라고 단정할 수 없습니다. 결과는 후보 탐색이며 실제 정답 검증에는 사람이 사진을 확인해야 합니다.")
 
     run_key = f"cc_archive2_last_board_run_v3_{project.project_id}_{photo_id}"
     all_rows = _load_runs()
