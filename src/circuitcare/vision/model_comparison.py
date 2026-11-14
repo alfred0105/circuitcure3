@@ -506,6 +506,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
     detection_ids = [row["detection_id"] for row in comparison_detections]
     model_detection_ids = [str(index) for index in range(1, len(detection_ids) + 1)]
     model_detection_id_by_real_id = dict(zip(detection_ids, model_detection_ids))
+    real_detection_by_photo_number = {str(index): row for index, row in enumerate(comparison_detections, start=1)}
     model_detections = [{**row, "detection_id": model_id, "component_id": model_id}
                         for row, model_id in zip(comparison_detections, model_detection_ids)]
     bbox_by_id = {row["detection_id"]: row["bbox_xyxy"] for row in comparison_detections}
@@ -566,20 +567,42 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
     bottom.caption(f"모든 모델에 동일한 전체 사진과 박스 ID를 보냅니다 · "
                    f"사용자 확정 정답 {len(ground_truth_by_id)}개는 모델 입력에서 제외 · "
                    f"OCR 문맥 {len(ocr_rows)}개 · {image_size[0]}×{image_size[1]}px")
+    st.caption("사진 위 번호는 아래 ‘박스 번호’와 같습니다. YOLO 원본 ID는 별도 열에 함께 표시합니다.")
+    with st.expander("사진 번호로 박스 확대 확인", expanded=False):
+        selected_photo_number = st.selectbox(
+            "확대할 번호", model_detection_ids,
+            key=f"cc_archive2_box_crop_{project.project_id}_{photo_id}",
+        )
+        selected_detection = real_detection_by_photo_number[selected_photo_number]
+        x1, y1, x2, y2 = [int(round(value)) for value in selected_detection["bbox_xyxy"]]
+        crop = _image.convert("RGB").crop((max(0, x1), max(0, y1),
+                                            min(_image.width, x2), min(_image.height, y2)))
+        crop.thumbnail((720, 720), Image.Resampling.LANCZOS)
+        st.image(crop, caption=f"번호 {selected_photo_number} · {selected_detection['detection_id']} · "
+                               f"YOLO {selected_detection['class_name']}", width="stretch")
+        st.caption("AI의 ‘오탐 후보’는 확정 판정이 아닙니다. 확대 박스와 전체 기판을 함께 보고 사용자가 확인하세요.")
     duplicate_pairs = _duplicate_pair_candidates(comparison_detections, limit=24)
     duplicate_pair_review_state_key = f"cc_archive2_duplicate_pairs_{project.project_id}_{photo_id}"
     if not isinstance(st.session_state.get(duplicate_pair_review_state_key), dict):
         st.session_state[duplicate_pair_review_state_key] = {}
-    pair_label_to_candidate = {
-        f"{pair['detections'][0]['detection_id']} ↔ {pair['detections'][1]['detection_id']}": pair
-        for pair in duplicate_pairs
-    }
+    pair_label_to_candidate = {}
+    for pair in duplicate_pairs:
+        left_id, right_id = (str(item["detection_id"]) for item in pair["detections"])
+        left_number = model_detection_id_by_real_id.get(left_id, "?")
+        right_number = model_detection_id_by_real_id.get(right_id, "?")
+        pair_label_to_candidate[
+            f"{left_number}번 (YOLO {left_id}) ↔ {right_number}번 (YOLO {right_id})"
+        ] = pair
     with st.expander(f"겹침·중복 의심 박스 · {len(duplicate_pairs)}쌍", expanded=bool(duplicate_pairs)):
         if duplicate_pairs:
             st.caption("아래 빠른 분류는 박스 좌표만 비교한 결과입니다. 같은 부품인지 확정하려면 원하는 쌍만 선택해 AI로 따로 확인하세요. 어느 결과도 박스를 자동 삭제하지 않습니다.")
             st.dataframe([{
-                "박스 A": pair["detections"][0]["detection_id"],
-                "박스 B": pair["detections"][1]["detection_id"],
+                "박스 번호 A": model_detection_id_by_real_id.get(
+                    str(pair["detections"][0]["detection_id"]), "—"),
+                "YOLO 원본 ID A": pair["detections"][0]["detection_id"],
+                "박스 번호 B": model_detection_id_by_real_id.get(
+                    str(pair["detections"][1]["detection_id"]), "—"),
+                "YOLO 원본 ID B": pair["detections"][1]["detection_id"],
                 "기하 분류": "중복 가능성 높음" if same_component_box_pair(
                     pair["detections"][0]["bbox_xyxy"], pair["detections"][1]["bbox_xyxy"]
                 ) else "겹침만 확인 · 별도 소자일 수 있음",
@@ -652,6 +675,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
             spec = MODEL_CATALOG[model_key]
             model_id = spec["ollama_id"]
             model_state = availability.get(model_key, {})
+            model_batch_size = MODEL_BATCH_SIZES.get(model_key, FULL_BOARD_BATCH_SIZE)
             common = {"run_id": run_id, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                       "execution_mode": "REAL_MODEL", "backend": backend_code,
                       "model_key": model_key, "model_id": model_id, "runtime_id": model_id,
@@ -665,8 +689,8 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                       "image_sha256": image_sha, "input_mode": "FULL_BOARD",
                       "crop_px": "full_board", "padding_ratio": 0.0,
                       "output_budget": int(budget),
-                      "output_budget_total": int(budget) * ((len(detection_ids) + FULL_BOARD_BATCH_SIZE - 1)
-                                                              // FULL_BOARD_BATCH_SIZE),
+                      "output_budget_total": int(budget) * ((len(detection_ids) + model_batch_size - 1)
+                                                              // model_batch_size),
                       "repeat_index": 0,
                       "prompt_version": PROMPT_VERSION, "prompt_fingerprint": prompt_fingerprint,
                       "schema_version": SCHEMA_VERSION, "schema_fingerprint": schema_fingerprint,
@@ -692,7 +716,6 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 batch_errors = []
                 batch_metrics = []
                 try:
-                    model_batch_size = MODEL_BATCH_SIZES.get(model_key, FULL_BOARD_BATCH_SIZE)
                     batch_count = (len(model_detections) + model_batch_size - 1) // model_batch_size
                     for batch_index, batch_start in enumerate(range(0, len(model_detections), model_batch_size), start=1):
                         global_batch = model_detections[batch_start:batch_start + model_batch_size]
@@ -752,6 +775,64 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                                 f"배치 {batch_index}/") else None})
                         progress.progress((index - 1 + batch_index / batch_count) / len(selected_models),
                                           text=f"{MODEL_CATALOG[model_key]['label']} · 배치 {batch_index}/{batch_count}")
+
+                    # MiniCPM sometimes returns one valid row for a five-box batch
+                    # without an error. Retry only the omitted IDs as one-box requests.
+                    if model_key == "minicpm_v47_1b":
+                        replied_ids = {row["detection_id"] for row in batch_review_rows
+                                       if row.get("response_status") != "NO_RESPONSE"
+                                       and row.get("object_status") != "NO_RESPONSE"}
+                        retry_global_ids = [model_id for model_id in model_detection_ids
+                                            if model_id not in replied_ids]
+                        for retry_index, global_id in enumerate(retry_global_ids, start=1):
+                            original_detection = next(row for row in model_detections
+                                                      if row["detection_id"] == global_id)
+                            retry_detection = {**original_detection, "detection_id": "1", "component_id": "1"}
+                            retry_ids = ["1"]
+                            raw_response = {}
+
+                            def archive2_retry_request(method: str, path: str,
+                                                       payload: dict | None = None) -> dict:
+                                response = original_request(method, path, payload)
+                                if method == "POST" and path == "/api/chat":
+                                    adapted, original_content, notes = _normalize_experiment_chat_http_response(response)
+                                    if original_content is not None:
+                                        raw_response["content"] = original_content
+                                    if notes:
+                                        raw_response["http_normalization_notes"] = notes
+                                    return adapted
+                                return response
+
+                            def archive2_retry_chat(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                                response = original_chat_json(*args, **kwargs)
+                                normalized = _normalize_experiment_response_batch(response, retry_ids)
+                                raw_response.update(normalized.get("archive2_normalization", {}))
+                                raw_response.setdefault("content", normalized.get("archive2_raw_content"))
+                                return normalized
+
+                            run_client._request = archive2_retry_request
+                            run_client.chat_json = archive2_retry_chat
+                            retry_error = None
+                            try:
+                                retry_result = review_components_with_qwen(
+                                    run_client, model_id, image_bytes, [retry_detection], [],
+                                    classification_only=True, full_board_classification=True,
+                                    classification_output_budget=128, classification_think=False,
+                                )
+                                retry_row = retry_result["class_reviews"][0]
+                                retry_row = {**retry_row, "detection_id": global_id}
+                                if retry_row.get("response_status") != "NO_RESPONSE" and retry_row.get("object_status") != "NO_RESPONSE":
+                                    batch_review_rows.append(retry_row)
+                                    batch_metrics.append(retry_result.get("ollama_metrics", {}))
+                            except Exception as exc:
+                                retry_error = f"MiniCPM 단일 박스 재시도 {global_id}: {type(exc).__name__}: {str(exc)[:180]}"
+                                batch_errors.append(retry_error)
+                            finally:
+                                run_client.chat_json = original_chat_json
+                                run_client._request = original_request
+                            raw_batches.append({"detection_ids": [global_id], "request_ids": retry_ids,
+                                                "retry": True, "response": raw_response.get("content"),
+                                                "notes": raw_response.get("notes", []), "error": retry_error})
 
                     returned_by_id = {row["detection_id"]: row for row in batch_review_rows}
                     batch_review_rows = [returned_by_id.get(model_id, {
@@ -849,11 +930,12 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                         st.caption(f"설치 안내 · `ollama pull {MODEL_CATALOG[model_key]['ollama_id']}` 후 설치 상태를 확인하세요.")
                     continue
                 prediction_table = [{
-                    "박스 ID": item.get("detection_id"),
+                    "박스 번호": model_detection_id_by_real_id.get(str(item.get("detection_id")), "—"),
+                    "YOLO 원본 ID": item.get("detection_id"),
                     "YOLO 종류": item.get("detector_class"),
                     "모델 제안": item.get("proposed_class", UNKNOWN_CLASS),
-                    "박스 판별": {"COMPONENT": "실물 소자", "NOT_COMPONENT": "YOLO 오탐 의심",
-                                  "UNCERTAIN": "실물 여부 불확실", "NO_RESPONSE": "모델 무응답"}.get(
+                    "박스 판별": {"COMPONENT": "부품 후보 (AI)", "NOT_COMPONENT": "오탐 후보 (AI)",
+                                  "UNCERTAIN": "실물 여부 미확정 (AI)", "NO_RESPONSE": "모델 무응답"}.get(
                                       item.get("object_status"), "실물 여부 불확실"),
                     "분류 상태": "미응답" if item.get("response_status") == "NO_RESPONSE" else
                                 "종류 미확정" if item.get("proposed_class") == UNKNOWN_CLASS else "분류 제안",
@@ -861,6 +943,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 } for item in row.get("predictions", [])]
                 if row.get("status") == "PARTIAL":
                     st.warning("일부 박스에 응답이 없습니다. 무응답은 unknown 분류로 간주하지 않았습니다.")
+                st.caption("unknown + ‘부품 후보 (AI)’는 종류를 못 정한 박스, ‘오탐 후보 (AI)’는 실제 소자가 아닐 수 있다는 모델 제안입니다. ‘미확정’·‘무응답’은 판정 보류입니다. 모두 AI 제안이므로 확대 사진으로 사람이 확인해야 확정됩니다.")
                 unanswered = sum(item.get("response_status") == "NO_RESPONSE"
                                  for item in row.get("predictions", []))
                 if unanswered:
