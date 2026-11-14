@@ -487,10 +487,7 @@ def review_components_with_qwen(
             for row in identified
         ]
         payload = ({
-            "full_board_classification": True,
-            "detections": [{"detection_id": row["detection_id"],
-                            "detector_class": row["class_name"]} for row in identified],
-            "coordinate_rule": "Use the exact printed detection_id labels on the single full-board image.",
+            "boxes": [{"id": row["detection_id"], "yolo": row["class_name"]} for row in identified],
         } if full_board_classification else {
             "selected_detections": [{"detection_id": row["detection_id"],
                                      "detector_class": row["class_name"],
@@ -516,8 +513,10 @@ def review_components_with_qwen(
         response_schema["properties"]["duplicate_reviews"]["minItems"] = expected_pair_count
         response_schema["properties"]["duplicate_reviews"]["maxItems"] = expected_pair_count
     user_prompt = (
-        "Use the single full-board image and exact box labels. Return only compact JSON rows with detection_id, "
-        "object_status and proposed_class. Do not include explanations.\n" + json.dumps(payload, ensure_ascii=False)
+        "Classify the numbered boxes in the full-board image. Return exactly this JSON shape, with one row per box: "
+        "{\"class_reviews\":[{\"detection_id\":\"1\",\"object_status\":\"COMPONENT\",\"proposed_class\":\"ic\"}]}. "
+        "Use only the supplied box IDs. Do not copy the input object, explain, or add fields.\n"
+        + json.dumps(payload, ensure_ascii=False)
         if full_board_classification else
         (
             "Estimate only each selected detection using its orange-boxed crop, nearby silkscreen context, and supplied unverified OCR clues. "

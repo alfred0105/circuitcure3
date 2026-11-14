@@ -233,9 +233,8 @@ def test_full_board_classification_sends_one_annotated_photo_and_labels_every_bo
             assert output_schema["properties"]["class_reviews"]["minItems"] == 0
             assert output_schema["properties"]["class_reviews"]["maxItems"] == 2
             request = json.loads(messages[-1]["content"].split("\n", 1)[1])
-            assert request["full_board_classification"] is True
-            assert [row["detection_id"] for row in request["detections"]] == ["R1", "U1"]
-            assert "Do not include explanations" in messages[-1]["content"]
+            assert [row["id"] for row in request["boxes"]] == ["R1", "U1"]
+            assert "Do not copy the input object, explain, or add fields" in messages[-1]["content"]
             assert "evidence" not in output_schema["properties"]["class_reviews"]["items"]["properties"]
             return {"model": "qwen3.5:9b", "content": {"class_reviews": [
                 {"detection_id": "R1", "object_status": "COMPONENT", "proposed_class": "resistor"},

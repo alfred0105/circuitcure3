@@ -36,7 +36,8 @@ MODEL_CATALOG = {
 }
 CROP_SIZES = (384, 512, 720)
 PADDING_RATIOS = (0.0, 0.25, 0.75)
-OUTPUT_BUDGETS = (384, 512, 768)
+OUTPUT_BUDGETS = (192, 256, 384)
+FULL_BOARD_BATCH_SIZE = 10
 PROMPT_VERSION = "full-board-fast-classification-v2"
 SCHEMA_VERSION = "full-board-fast-classification-schema-v2"
 OUTPUT_NORMALIZATION_VERSION = "archive2-class-output-v3"
@@ -501,6 +502,10 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         return
     component_id = "__FULL_BOARD__"
     detection_ids = [row["detection_id"] for row in comparison_detections]
+    model_detection_ids = [str(index) for index in range(1, len(detection_ids) + 1)]
+    model_detection_id_by_real_id = dict(zip(detection_ids, model_detection_ids))
+    model_detections = [{**row, "detection_id": model_id, "component_id": model_id}
+                        for row, model_id in zip(comparison_detections, model_detection_ids)]
     bbox_by_id = {row["detection_id"]: row["bbox_xyxy"] for row in comparison_detections}
     ground_truth_by_id = {
         component_id: str(source_by_id[component_id].get("소자 종류") or "").casefold()
@@ -529,10 +534,10 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         "비교할 모델", list(MODEL_CATALOG), default=list(MODEL_CATALOG),
         key=f"cc_archive2_models_v2_{project.project_id}",
         format_func=lambda value: f"{MODEL_CATALOG[value]['label']} · "
-                                  f"{availability.get(value, {}).get('status', '확인 중')}",
+                                  f"{'서버 대기 · 실행 시 시작' if '서버 연결 실패' in str(availability.get(value, {}).get('reason', '')) else availability.get(value, {}).get('status', '확인 중')}",
     )
     with st.expander("고급 설정", expanded=False):
-        budget = st.selectbox("전체 응답 토큰 상한", OUTPUT_BUDGETS, index=OUTPUT_BUDGETS.index(512),
+        budget = st.selectbox("배치당 응답 토큰 상한", OUTPUT_BUDGETS, index=OUTPUT_BUDGETS.index(256),
                               key=f"cc_archive2_budget_v2_{project.project_id}")
 
     image_sha = hashlib.sha256(photo["data"]).hexdigest()
@@ -546,13 +551,13 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
     board_preview = _image.convert("RGB").copy()
     board_draw = ImageDraw.Draw(board_preview)
     box_width = max(2, round(min(board_preview.size) / 500))
-    for detection in comparison_detections:
+    for detection, model_id in zip(comparison_detections, model_detection_ids):
         x1, y1, x2, y2 = (round(value) for value in detection["bbox_xyxy"])
         board_draw.rectangle((x1, y1, x2, y2), outline="#77d8ff", width=box_width)
         label_y = max(0, y1 - max(18, box_width * 8))
-        board_draw.rectangle((x1, label_y, x1 + max(36, len(detection["detection_id"]) * 8),
+        board_draw.rectangle((x1, label_y, x1 + max(36, len(model_id) * 8),
                               label_y + max(18, box_width * 8)), fill="#77d8ff")
-        board_draw.text((x1 + 4, label_y + 2), detection["detection_id"], fill="#17202a")
+        board_draw.text((x1 + 4, label_y + 2), model_id, fill="#17202a")
     top, bottom = st.columns([2, 1])
     top.image(board_preview, caption=f"전체 PCB · 탐지 박스 {len(comparison_detections)}개", use_container_width=True)
     bottom.markdown(f"**전체 사진 비교 대상** · {len(comparison_detections)}개 YOLO 박스")
@@ -564,8 +569,8 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         if duplicate_pairs:
             st.caption("좌표 겹침만으로 뽑은 빠른 후보입니다. 같은 부품으로 확정하거나 박스를 자동 삭제하지 않습니다.")
             st.dataframe([{
-                "박스 A": pair["detections"][0]["detection_id"],
-                "박스 B": pair["detections"][1]["detection_id"],
+            "박스 A": pair["detections"][0]["detection_id"],
+            "박스 B": pair["detections"][1]["detection_id"],
                 "IoU": round(pair["metrics"]["iou"], 3),
                 "작은 박스 포함률": round(pair["metrics"]["smaller_coverage"], 3),
             } for pair in duplicate_pairs], use_container_width=True, hide_index=True)
@@ -608,7 +613,8 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                       "image_sha256": image_sha, "input_mode": "FULL_BOARD",
                       "crop_px": "full_board", "padding_ratio": 0.0,
                       "output_budget": int(budget),
-                      "output_budget_total": int(budget),
+                      "output_budget_total": int(budget) * ((len(detection_ids) + FULL_BOARD_BATCH_SIZE - 1)
+                                                              // FULL_BOARD_BATCH_SIZE),
                       "repeat_index": 0,
                       "prompt_version": PROMPT_VERSION, "prompt_fingerprint": prompt_fingerprint,
                       "schema_version": SCHEMA_VERSION, "schema_fingerprint": schema_fingerprint,
@@ -627,74 +633,105 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                           "error": model_state.get("reason") or
                                   f"미설치 상태입니다. `ollama pull {model_id}` 후 모델 설치 상태를 다시 확인하세요."}
             else:
-                raw_response: dict[str, Any] = {}
                 original_chat_json = run_client.chat_json
                 original_request = run_client._request
-
-                def archive2_request(method: str, path: str, payload: dict | None = None) -> dict:
-                    response = original_request(method, path, payload)
-                    if method == "POST" and path == "/api/chat":
-                        adapted, original_content, notes = _normalize_experiment_chat_http_response(response)
-                        if original_content is not None:
-                            raw_response["content"] = original_content
-                        if notes:
-                            raw_response["http_normalization_notes"] = notes
-                            raw_response["schema_valid_before_normalization"] = False
-                        return adapted
-                    return response
-
-                run_client._request = archive2_request
-
-                def archive2_chat_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
-                    response = original_chat_json(*args, **kwargs)
-                    normalized = _normalize_experiment_response_batch(response, detection_ids)
-                    raw_response.update(normalized.get("archive2_normalization", {}))
-                    if raw_response.get("http_normalization_notes"):
-                        raw_response["schema_valid_before_normalization"] = False
-                    raw_response["notes"] = [
-                        *raw_response.get("http_normalization_notes", []),
-                        *normalized.get("archive2_normalization", {}).get("notes", []),
-                    ]
-                    raw_response.setdefault("content", normalized.get("archive2_raw_content"))
-                    return normalized
-
-                run_client.chat_json = archive2_chat_json
+                batch_review_rows = []
+                raw_batches = []
+                batch_errors = []
+                batch_metrics = []
                 try:
-                    reviewed = review_components_with_qwen(
-                        run_client, model_id, image_bytes, comparison_detections, ocr_rows,
-                        classification_only=True, full_board_classification=True,
-                        include_board_context=True,
-                        classification_output_budget=int(budget), classification_think=False,
-                    )
+                    batch_count = (len(model_detections) + FULL_BOARD_BATCH_SIZE - 1) // FULL_BOARD_BATCH_SIZE
+                    for batch_index, batch_start in enumerate(range(0, len(model_detections), FULL_BOARD_BATCH_SIZE), start=1):
+                        batch_detections = model_detections[batch_start:batch_start + FULL_BOARD_BATCH_SIZE]
+                        batch_ids = [row["detection_id"] for row in batch_detections]
+                        raw_response: dict[str, Any] = {}
+
+                        def archive2_request(method: str, path: str, payload: dict | None = None) -> dict:
+                            response = original_request(method, path, payload)
+                            if method == "POST" and path == "/api/chat":
+                                adapted, original_content, notes = _normalize_experiment_chat_http_response(response)
+                                if original_content is not None:
+                                    raw_response["content"] = original_content
+                                if notes:
+                                    raw_response["http_normalization_notes"] = notes
+                                    raw_response["schema_valid_before_normalization"] = False
+                                return adapted
+                            return response
+
+                        def archive2_chat_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                            response = original_chat_json(*args, **kwargs)
+                            normalized = _normalize_experiment_response_batch(response, batch_ids)
+                            raw_response.update(normalized.get("archive2_normalization", {}))
+                            if raw_response.get("http_normalization_notes"):
+                                raw_response["schema_valid_before_normalization"] = False
+                            raw_response["notes"] = [*raw_response.get("http_normalization_notes", []),
+                                                      *normalized.get("archive2_normalization", {}).get("notes", [])]
+                            raw_response.setdefault("content", normalized.get("archive2_raw_content"))
+                            return normalized
+
+                        run_client._request = archive2_request
+                        run_client.chat_json = archive2_chat_json
+                        try:
+                            reviewed_batch = review_components_with_qwen(
+                                run_client, model_id, image_bytes, batch_detections, [],
+                                classification_only=True, full_board_classification=True,
+                                include_board_context=True, classification_output_budget=int(budget),
+                                classification_think=False,
+                            )
+                            batch_review_rows.extend(reviewed_batch["class_reviews"])
+                            batch_metrics.append(reviewed_batch.get("ollama_metrics", {}))
+                        except Exception as exc:
+                            batch_errors.append(f"배치 {batch_index}/{batch_count}: {type(exc).__name__}: {str(exc)[:240]}")
+                        finally:
+                            run_client.chat_json = original_chat_json
+                            run_client._request = original_request
+                        raw_batches.append({"detection_ids": batch_ids, "response": raw_response.get("content"),
+                                            "notes": raw_response.get("notes", []),
+                                            "error": batch_errors[-1] if batch_errors and batch_errors[-1].startswith(
+                                                f"배치 {batch_index}/") else None})
+                        progress.progress((index - 1 + batch_index / batch_count) / len(selected_models),
+                                          text=f"{MODEL_CATALOG[model_key]['label']} · 배치 {batch_index}/{batch_count}")
+
+                    returned_by_id = {row["detection_id"]: row for row in batch_review_rows}
+                    batch_review_rows = [returned_by_id.get(model_id, {
+                        "detection_id": model_id, "proposed_class": UNKNOWN_CLASS,
+                        "object_status": "NO_RESPONSE", "response_status": "NO_RESPONSE",
+                        "uncertain": True,
+                    }) for model_id in model_detection_ids]
                     wall_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
-                    prediction_by_id = {row["detection_id"]: row for row in reviewed["class_reviews"]}
+                    prediction_by_id = {row["detection_id"]: row for row in batch_review_rows}
                     prediction_rows = [{"detection_id": detection_id,
                                         "detector_class": next(item["class_name"] for item in comparison_detections
                                                                 if item["detection_id"] == detection_id),
                                         "ground_truth": ground_truth_by_id.get(detection_id),
-                                        "proposed_class": prediction_by_id[detection_id].get("proposed_class", UNKNOWN_CLASS),
-                                        "proposed_subtype": prediction_by_id[detection_id].get("proposed_subtype"),
-                                        "object_status": prediction_by_id[detection_id].get("object_status", "UNCERTAIN"),
-                                        "response_status": prediction_by_id[detection_id].get("response_status", "RECEIVED"),
-                                        "decision": prediction_by_id[detection_id].get("decision"),
-                                        "confidence_uncalibrated": prediction_by_id[detection_id].get("confidence"),
-                                        "uncertain": prediction_by_id[detection_id].get("uncertain", False),
+                                        "proposed_class": prediction_by_id[model_detection_id_by_real_id[detection_id]].get("proposed_class", UNKNOWN_CLASS),
+                                        "proposed_subtype": prediction_by_id[model_detection_id_by_real_id[detection_id]].get("proposed_subtype"),
+                                        "object_status": prediction_by_id[model_detection_id_by_real_id[detection_id]].get("object_status", "UNCERTAIN"),
+                                        "response_status": prediction_by_id[model_detection_id_by_real_id[detection_id]].get("response_status", "RECEIVED"),
+                                        "decision": prediction_by_id[model_detection_id_by_real_id[detection_id]].get("decision"),
+                                        "uncertain": prediction_by_id[model_detection_id_by_real_id[detection_id]].get("uncertain", False),
                                         }
                                        for detection_id in detection_ids]
-                    metrics = reviewed.get("ollama_metrics", {})
-                    eval_ms = _ns_ms(metrics.get("eval_duration_ns"))
-                    eval_count = metrics.get("eval_count")
+                    metric_sums = {key: sum(value.get(key, 0) for value in batch_metrics
+                                            if isinstance(value.get(key), (int, float)))
+                                   for key in ("load_duration_ns", "prompt_eval_duration_ns", "eval_duration_ns",
+                                               "prompt_eval_count", "eval_count")}
+                    eval_ms = _ns_ms(metric_sums["eval_duration_ns"])
+                    eval_count = metric_sums["eval_count"]
                     partial = any(item["response_status"] == "NO_RESPONSE" for item in prediction_rows)
-                    result = {**common, "status": "PARTIAL" if partial else "COMPLETE", "json_valid": True,
-                              "schema_valid": raw_response.get("schema_valid_before_normalization", False),
-                              "normalization_notes": raw_response.get("notes", []),
-                              "raw_model_response": raw_response.get("content"),
+                    if not batch_metrics:
+                        raise RuntimeError("모든 박스 배치가 실패했습니다 · " + "; ".join(batch_errors))
+                    result = {**common, "status": "PARTIAL" if partial or batch_errors else "COMPLETE", "json_valid": True,
+                              "schema_valid": all(bool(batch.get("response")) and not batch.get("error")
+                                                  for batch in raw_batches),
+                              "normalization_notes": [note for batch in raw_batches for note in batch.get("notes", [])],
+                              "batch_errors": batch_errors, "raw_model_response": {"batches": raw_batches},
                               "prediction": None, "predictions": prediction_rows,
                               "decision": None, "evidence": None, "uncertain": any(
                                   item["uncertain"] for item in prediction_rows),
                               "wall_ms": round(wall_ms, 3),
-                              "load_ms": _ns_ms(metrics.get("load_duration_ns")),
-                              "prompt_eval_ms": _ns_ms(metrics.get("prompt_eval_duration_ns")),
+                              "load_ms": _ns_ms(metric_sums["load_duration_ns"]),
+                              "prompt_eval_ms": _ns_ms(metric_sums["prompt_eval_duration_ns"]),
                               "eval_ms": eval_ms, "prompt_eval_count": metrics.get("prompt_eval_count"),
                               "eval_count": eval_count,
                               "tokens_per_second": (eval_count / (eval_ms / 1000)
@@ -712,12 +749,8 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                     result = {**common, "status": "FAILED", "wall_ms": round(
                         (time.perf_counter_ns() - start_ns) / 1_000_000, 3), "json_valid": False,
                         "error": f"{type(exc).__name__}: {str(exc)[:400]}",
-                        "normalization_notes": [*raw_response.get("http_normalization_notes", []),
-                                                 *raw_response.get("notes", [])],
-                        "raw_model_response": raw_response.get("content")}
-                finally:
-                    run_client.chat_json = original_chat_json
-                    run_client._request = original_request
+                        "batch_errors": batch_errors,
+                        "raw_model_response": {"batches": raw_batches}}
             produced.append(result)
             all_rows.append(result)
             _save_runs(all_rows)
@@ -727,6 +760,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         status.update(label="모델 비교 완료", state="complete", expanded=False)
         st.session_state[run_key] = run_id
         st.success(f"{len(produced)}개 모델 결과를 실험 기록에 저장했습니다.")
+        st.rerun()
 
     component_runs = [row for row in all_rows if row.get("project_id") == project.project_id
                       and row.get("photo_id") == photo_id and row.get("component_id") == component_id]
