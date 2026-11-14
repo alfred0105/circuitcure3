@@ -98,6 +98,49 @@ def test_archive2_missing_classification_becomes_unknown_not_detector_echo():
     assert normalized["archive2_normalization"]["schema_valid_before_normalization"] is False
 
 
+def test_archive2_preserves_explicit_class_when_model_uses_confirmed_decision_alias():
+    response = {"content": {"class_reviews": [{
+        "detection_id": "U1", "proposed_class": "ic", "decision": "confirmed",
+        "evidence_sentence": "Four-sided leads and visible package marking indicate an IC.",
+    }]}}
+    normalized = _normalize_experiment_response(response, "U1")
+    row = normalized["content"]["class_reviews"][0]
+    assert row["proposed_class"] == "ic"
+    assert row["decision"] == "suggest"
+    assert normalized["archive2_normalization"]["model_uncertain"] is False
+
+
+def test_archive2_preserves_class_alias_and_explicit_uncertainty_separately():
+    response = {"content": {"class_reviews": [{
+        "detection_id": "U1", "component_type": "IC", "confidence": .8,
+        "decision": "uncertain", "evidence": "Square body with pins on four sides.",
+    }]}}
+    normalized = _normalize_experiment_response(response, "U1")
+    row = normalized["content"]["class_reviews"][0]
+    assert row["proposed_class"] == "ic"
+    assert row["decision"] == "suggest"
+    assert normalized["archive2_normalization"]["model_uncertain"] is True
+    assert "component class alias normalized" in normalized["archive2_normalization"]["notes"]
+
+
+def test_archive2_all_models_are_presented_through_one_classification_field_schema():
+    raw_outputs = [
+        {"class_reviews": [{"detection_id": "U1", "proposed_class": "ic",
+                            "decision": "confirmed", "evidence_sentence": "Four-sided IC package."}]},
+        {"class_reviews": [{"detection_id": "U1", "component_type": "IC",
+                            "confidence": .95, "evidence": "Square body and metallic pins."}]},
+        {"class_reviews": [{"detection_id": "U1", "proposed_class": "ic", "decision": "uncertain",
+                            "confidence": 9, "evidence": "Visible IC marking."}]},
+    ]
+    results = [_normalize_experiment_response({"content": raw}, "U1")["content"]["class_reviews"][0]
+               for raw in raw_outputs]
+    expected_fields = {"detection_id", "proposed_class", "proposed_subtype", "decision",
+                       "confidence", "evidence", "uncertain"}
+    assert all(set(row) == expected_fields for row in results)
+    assert [row["proposed_class"] for row in results] == ["ic", "ic", "ic"]
+    assert [row["uncertain"] for row in results] == [False, False, True]
+
+
 def test_summary_uses_only_confirmed_18_class_labels_and_reports_slices():
     assert len(COMPONENT_CLASSES) == 18
     rows = [{"status": "COMPLETE", "backend": "Ollama", "model_key": "qwen35_9b",

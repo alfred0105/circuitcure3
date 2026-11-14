@@ -15,7 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from circuitcare.component_taxonomy import COMPONENT_CLASSES, UNKNOWN_CLASS, normalize_qwen_class
+from circuitcare.component_taxonomy import (
+    COMPONENT_CLASSES, UNKNOWN_CLASS, normalize_qwen_class, normalize_qwen_subtype,
+)
 from circuitcare.local_llm import OllamaClient
 
 MODEL_CATALOG = {
@@ -62,10 +64,16 @@ def _normalize_experiment_response(response: dict[str, Any], detection_id: str) 
         row = {}
         notes.append("classification result missing; recorded as unknown")
 
-    proposed_raw = row.get("proposed_class", row.get("proposed_base_class"))
+    proposed_raw = next((row[key] for key in (
+        "proposed_class", "proposed_base_class", "component_type", "component_class",
+        "predicted_class", "prediction", "class", "type",
+    ) if row.get(key) is not None), None)
     proposed = normalize_qwen_class(proposed_raw) if proposed_raw is not None else UNKNOWN_CLASS
     if proposed_raw is None:
         notes.append("proposed_class missing; recorded as unknown")
+        schema_valid = False
+    elif "proposed_class" not in row and "proposed_base_class" not in row:
+        notes.append("component class alias normalized")
         schema_valid = False
     confidence = row.get("confidence")
     if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
@@ -82,9 +90,28 @@ def _normalize_experiment_response(response: dict[str, Any], detection_id: str) 
         confidence = None
         notes.append("confidence missing or invalid")
         schema_valid = False
-    decision = row.get("decision")
-    if decision not in {"suggest", "uncertain"}:
+    original_decision = str(row.get("decision") or "").strip().casefold()
+    model_uncertain = original_decision in {"uncertain", "unsure", "not_sure", "inconclusive"}
+    if original_decision == "suggest":
+        decision = "suggest"
+    elif original_decision in {"confirmed", "confirm", "identified", "classified", "likely"}:
+        decision = "suggest"
+        notes.append("model confirmation normalized to an unconfirmed suggestion")
+        schema_valid = False
+    elif original_decision in {"uncertain", "unsure", "not_sure", "inconclusive"}:
+        # Keep an explicit class prediction visible while preserving uncertainty
+        # as a separate flag. The review helper otherwise replaces that class with
+        # UNKNOWN whenever decision=uncertain.
+        decision = "suggest" if proposed != UNKNOWN_CLASS else "uncertain"
+        notes.append("model uncertainty retained separately from its proposed class")
+        schema_valid = False
+    elif not original_decision and proposed != UNKNOWN_CLASS:
+        decision = "suggest"
+        notes.append("missing decision normalized to an unconfirmed suggestion")
+        schema_valid = False
+    else:
         decision = "uncertain"
+        model_uncertain = True
         notes.append("decision missing or invalid; normalized to uncertain")
         schema_valid = False
     evidence = row.get("evidence", row.get("evidence_sentence", row.get("visual_evidence")))
@@ -95,16 +122,23 @@ def _normalize_experiment_response(response: dict[str, Any], detection_id: str) 
         evidence = "모델이 판별 근거를 반환하지 않아 분류를 확인할 수 없습니다."
         notes.append("evidence missing")
         schema_valid = False
+    allowed_classes = {*COMPONENT_CLASSES, UNKNOWN_CLASS, "other_component", "board_feature", "not_component"}
+    proposed = proposed if proposed in allowed_classes else UNKNOWN_CLASS
+    subtype_raw = next((row[key] for key in ("proposed_subtype", "subtype", "component_subtype")
+                        if row.get(key) is not None), None)
+    model_uncertain = bool(model_uncertain or proposed == UNKNOWN_CLASS)
     normalized = {"detection_id": detection_id, "decision": decision,
-                  "proposed_class": proposed if proposed in {*COMPONENT_CLASSES, UNKNOWN_CLASS,
-                                                                "other_component", "board_feature",
-                                                                "not_component"} else UNKNOWN_CLASS,
+                  "proposed_class": proposed,
+                  "proposed_subtype": normalize_qwen_subtype(proposed, subtype_raw),
                   "confidence": confidence if confidence is not None else 0.0,
-                  "evidence": evidence[:500]}
+                  "evidence": evidence[:500],
+                  "uncertain": model_uncertain}
     content = dict(content) if isinstance(content, dict) else {}
     content["class_reviews"] = [normalized]
     response["content"] = content
     response["archive2_normalization"] = {"schema_valid_before_normalization": schema_valid,
+                                          "original_decision": original_decision or None,
+                                          "model_uncertain": model_uncertain,
                                           "notes": notes}
     return response
 
@@ -413,7 +447,13 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                       "output_budget": int(budget), "repeat_index": 0,
                       "prompt_version": PROMPT_VERSION, "prompt_fingerprint": prompt_fingerprint,
                       "schema_version": SCHEMA_VERSION, "schema_fingerprint": schema_fingerprint,
-                      "model_digest": model_state.get("digest"), "json_valid": False}
+                      "model_digest": model_state.get("digest"), "json_valid": False,
+                      "schema_valid": False, "prediction": None, "prediction_subtype": None,
+                      "confidence_uncalibrated": None, "decision": None, "evidence": None,
+                      "uncertain": None, "normalization_notes": [], "raw_model_response": None,
+                      "wall_ms": None, "load_ms": None, "prompt_eval_ms": None,
+                      "eval_ms": None, "prompt_eval_count": None, "eval_count": None,
+                      "tokens_per_second": None, "model_memory_mb": None}
             start_ns = time.perf_counter_ns()
             if model_state.get("status") != "READY":
                 result = {**common, "status": "UNAVAILABLE", "wall_ms": None,
@@ -450,8 +490,11 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                               "prediction_subtype": prediction.get("proposed_subtype"),
                               "confidence_uncalibrated": (None if "confidence missing or invalid" in raw_response.get("notes", [])
                                                            else prediction.get("confidence")),
-                              "decision": prediction.get("decision"), "evidence": prediction.get("evidence"),
-                              "uncertain": prediction.get("decision") == "uncertain",
+                              "decision": response_adaptation.get("original_decision") or prediction.get("decision"),
+                              "evidence": prediction.get("evidence"),
+                              "uncertain": response_adaptation.get(
+                                  "model_uncertain", prediction.get("uncertain",
+                                                                     prediction.get("decision") == "uncertain")),
                               "wall_ms": round(wall_ms, 3),
                               "load_ms": _ns_ms(metrics.get("load_duration_ns")),
                               "prompt_eval_ms": _ns_ms(metrics.get("prompt_eval_duration_ns")),
@@ -510,7 +553,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                     if row.get("status") == "UNAVAILABLE":
                         st.caption(f"설치 안내 · `ollama pull {MODEL_CATALOG[model_key]['ollama_id']}` 후 설치 상태를 확인하세요.")
                     continue
-                st.markdown(f"### {row.get('prediction') or UNKNOWN_CLASS}")
+                st.markdown(f"### 분류 제안 · {row.get('prediction') or UNKNOWN_CLASS}")
                 if row.get("prediction_subtype"):
                     st.caption(f"세부 유형 · {row['prediction_subtype']}")
                 st.write(row.get("evidence") or "판단 근거 없음")
