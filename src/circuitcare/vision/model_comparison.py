@@ -36,10 +36,10 @@ MODEL_CATALOG = {
 }
 CROP_SIZES = (384, 512, 720)
 PADDING_RATIOS = (0.0, 0.25, 0.75)
-OUTPUT_BUDGETS = (128, 192, 256)
-PROMPT_VERSION = "full-board-classification-v1"
-SCHEMA_VERSION = "full-board-classification-schema-v1"
-OUTPUT_NORMALIZATION_VERSION = "archive2-class-output-v2"
+OUTPUT_BUDGETS = (384, 512, 768)
+PROMPT_VERSION = "full-board-fast-classification-v2"
+SCHEMA_VERSION = "full-board-fast-classification-schema-v2"
+OUTPUT_NORMALIZATION_VERSION = "archive2-class-output-v3"
 
 
 def _normalize_experiment_chat_http_response(response: dict[str, Any]) -> tuple[dict[str, Any], Any, list[str]]:
@@ -181,31 +181,90 @@ def _normalize_experiment_response(response: dict[str, Any], detection_id: str) 
 def _normalize_experiment_response_batch(
     response: dict[str, Any], detection_ids: list[str],
 ) -> dict[str, Any]:
-    """Apply the same strict class contract to every full-board box result."""
+    """Normalize model envelopes without turning absent rows into unknown parts."""
     raw_content = json.loads(json.dumps(response.get("content"), ensure_ascii=False))
-    normalized_rows = []
+    id_set = set(detection_ids)
     notes: list[str] = []
-    metadata = []
+    raw_rows: list[Any] = []
+    if isinstance(raw_content, list):
+        raw_rows = raw_content
+        notes.append("root array normalized")
+    elif isinstance(raw_content, dict):
+        for key in ("class_reviews", "detections", "results", "selected_detections"):
+            value = raw_content.get(key)
+            if isinstance(value, list):
+                raw_rows = value
+                if key != "class_reviews":
+                    notes.append(f"{key} envelope normalized")
+                break
+        if not raw_rows and raw_content.get("detection_id"):
+            raw_rows = [raw_content]
+            notes.append("single row normalized")
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            continue
+        detection_id = str(raw.get("detection_id") or raw.get("component_id") or "")
+        if detection_id not in id_set:
+            continue
+        # Some VLMs wrap each row's useful fields in class_reviews.
+        nested = raw.get("class_reviews")
+        if isinstance(nested, list) and nested:
+            inner = next((item for item in nested if isinstance(item, dict)), {})
+            raw = {**raw, **inner, "detection_id": detection_id}
+            notes.append("nested class_reviews row normalized")
+        class_raw = next((raw.get(key) for key in (
+            "proposed_class", "proposed_base_class", "component_type", "component_class",
+            "predicted_class", "prediction", "class", "type",
+        ) if raw.get(key) is not None), None)
+        proposed = normalize_qwen_class(class_raw) if class_raw is not None else UNKNOWN_CLASS
+        class_token = str(class_raw or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        if proposed not in QWEN_CLASSIFICATION_CLASSES or (
+                proposed == UNKNOWN_CLASS and class_token not in {"", "unknown", "unknown_component"}):
+            proposed = UNKNOWN_CLASS
+        raw_status = raw.get("object_status", raw.get("presence_status"))
+        if raw_status is None and raw.get("is_physical_component") is True:
+            raw_status = "COMPONENT"
+        elif raw_status is None and raw.get("is_physical_component") is False:
+            raw_status = "NOT_COMPONENT"
+        if raw_status is None and str(raw.get("decision") or "").casefold() == "not_component":
+            raw_status = "NOT_COMPONENT"
+        status_aliases = {"COMPONENT": "COMPONENT", "PRESENT": "COMPONENT", "PHYSICAL_COMPONENT": "COMPONENT",
+                          "NOT_COMPONENT": "NOT_COMPONENT", "FALSE_POSITIVE": "NOT_COMPONENT", "FP": "NOT_COMPONENT",
+                          "UNCERTAIN": "UNCERTAIN", "UNKNOWN": "UNCERTAIN", "UNSURE": "UNCERTAIN"}
+        object_status = status_aliases.get(str(raw_status or "").strip().upper(), "UNCERTAIN")
+        if object_status == "NOT_COMPONENT":
+            proposed = UNKNOWN_CLASS
+        by_id.setdefault(detection_id, {
+            "detection_id": detection_id, "proposed_class": proposed,
+            "proposed_subtype": normalize_qwen_subtype(proposed, raw.get("proposed_subtype", raw.get("subtype"))),
+            "object_status": object_status,
+            "decision": "suggest" if proposed != UNKNOWN_CLASS else "uncertain",
+            "uncertain": object_status == "UNCERTAIN" or proposed == UNKNOWN_CLASS,
+            "response_status": "RECEIVED",
+        })
+
+    normalized_rows = []
     for detection_id in detection_ids:
-        one = _normalize_experiment_response({"content": json.loads(json.dumps(raw_content,
-                                                                               ensure_ascii=False))},
-                                             detection_id)
-        normalized_rows.append(one["content"]["class_reviews"][0])
-        info = one["archive2_normalization"]
-        metadata.append(info)
-        for note in info.get("notes", []):
-            if note not in notes:
-                notes.append(note)
+        row = by_id.get(detection_id)
+        if row is None:
+            row = {"detection_id": detection_id, "proposed_class": UNKNOWN_CLASS,
+                   "proposed_subtype": None, "object_status": "NO_RESPONSE",
+                   "decision": "uncertain", "uncertain": True, "response_status": "NO_RESPONSE"}
+        normalized_rows.append(row)
+    missing_ids = [row["detection_id"] for row in normalized_rows if row["response_status"] == "NO_RESPONSE"]
+    if missing_ids:
+        notes.append(f"missing detection responses: {len(missing_ids)}")
     normalized = dict(response)
     normalized_content = dict(raw_content) if isinstance(raw_content, dict) else {}
     normalized_content["class_reviews"] = normalized_rows
     normalized["content"] = normalized_content
     normalized["archive2_raw_content"] = raw_content
     normalized["archive2_normalization"] = {
-        "schema_valid_before_normalization": bool(metadata) and all(
-            item.get("schema_valid_before_normalization") for item in metadata
-        ),
+        "schema_valid_before_normalization": bool(raw_rows) and not notes,
         "model_uncertain_by_id": {row["detection_id"]: row["uncertain"] for row in normalized_rows},
+        "missing_ids": missing_ids,
         "notes": notes,
     }
     return normalized
@@ -363,7 +422,8 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         ensure_component_detection, review_aux_keys, review_keys, review_scope,
     )
     from circuitcare.vision.ai_review_service import (
-        CLASS_ONLY_REVIEW_SCHEMA, _FULL_BOARD_CLASSIFICATION_SYSTEM, review_components_with_qwen,
+        FULL_BOARD_CLASSIFICATION_SCHEMA, _FULL_BOARD_CLASSIFICATION_SYSTEM,
+        _duplicate_pair_candidates, review_components_with_qwen,
     )
 
     st.markdown("### Archive 2 · 소자별 이미지 AI 비교")
@@ -472,13 +532,13 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                   f"{availability.get(value, {}).get('status', '확인 중')}",
     )
     with st.expander("고급 설정", expanded=False):
-        budget = st.selectbox("박스당 출력 토큰 예산", OUTPUT_BUDGETS, index=OUTPUT_BUDGETS.index(192),
+        budget = st.selectbox("전체 응답 토큰 상한", OUTPUT_BUDGETS, index=OUTPUT_BUDGETS.index(512),
                               key=f"cc_archive2_budget_v2_{project.project_id}")
 
     image_sha = hashlib.sha256(photo["data"]).hexdigest()
     prompt_fingerprint = hashlib.sha256(_FULL_BOARD_CLASSIFICATION_SYSTEM.encode("utf-8")).hexdigest()
-    full_board_schema = deepcopy(CLASS_ONLY_REVIEW_SCHEMA)
-    full_board_schema["properties"]["class_reviews"]["minItems"] = len(comparison_detections)
+    full_board_schema = deepcopy(FULL_BOARD_CLASSIFICATION_SCHEMA)
+    full_board_schema["properties"]["class_reviews"]["minItems"] = 0
     full_board_schema["properties"]["class_reviews"]["maxItems"] = len(comparison_detections)
     schema_fingerprint = hashlib.sha256(json.dumps(
         full_board_schema, ensure_ascii=False, sort_keys=True,
@@ -499,6 +559,18 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
     bottom.caption(f"모든 모델에 동일한 전체 사진과 박스 ID를 보냅니다 · "
                    f"사용자 확정 정답 {len(ground_truth_by_id)}개는 모델 입력에서 제외 · "
                    f"OCR 문맥 {len(ocr_rows)}개 · {image_size[0]}×{image_size[1]}px")
+    duplicate_pairs = _duplicate_pair_candidates(comparison_detections, limit=24)
+    with st.expander(f"겹침·중복 의심 박스 · {len(duplicate_pairs)}쌍", expanded=False):
+        if duplicate_pairs:
+            st.caption("좌표 겹침만으로 뽑은 빠른 후보입니다. 같은 부품으로 확정하거나 박스를 자동 삭제하지 않습니다.")
+            st.dataframe([{
+                "박스 A": pair["detections"][0]["detection_id"],
+                "박스 B": pair["detections"][1]["detection_id"],
+                "IoU": round(pair["metrics"]["iou"], 3),
+                "작은 박스 포함률": round(pair["metrics"]["smaller_coverage"], 3),
+            } for pair in duplicate_pairs], use_container_width=True, hide_index=True)
+        else:
+            st.caption("현재 겹침 기준에 맞는 후보가 없습니다.")
 
     run_key = f"cc_archive2_last_board_run_v3_{project.project_id}_{photo_id}"
     all_rows = _load_runs()
@@ -536,7 +608,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                       "image_sha256": image_sha, "input_mode": "FULL_BOARD",
                       "crop_px": "full_board", "padding_ratio": 0.0,
                       "output_budget": int(budget),
-                      "output_budget_total": min(4096, max(256, int(budget) * len(detection_ids))),
+                      "output_budget_total": int(budget),
                       "repeat_index": 0,
                       "prompt_version": PROMPT_VERSION, "prompt_fingerprint": prompt_fingerprint,
                       "schema_version": SCHEMA_VERSION, "schema_fingerprint": schema_fingerprint,
@@ -602,15 +674,18 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                                         "ground_truth": ground_truth_by_id.get(detection_id),
                                         "proposed_class": prediction_by_id[detection_id].get("proposed_class", UNKNOWN_CLASS),
                                         "proposed_subtype": prediction_by_id[detection_id].get("proposed_subtype"),
+                                        "object_status": prediction_by_id[detection_id].get("object_status", "UNCERTAIN"),
+                                        "response_status": prediction_by_id[detection_id].get("response_status", "RECEIVED"),
                                         "decision": prediction_by_id[detection_id].get("decision"),
                                         "confidence_uncalibrated": prediction_by_id[detection_id].get("confidence"),
                                         "uncertain": prediction_by_id[detection_id].get("uncertain", False),
-                                        "evidence": prediction_by_id[detection_id].get("evidence")}
+                                        }
                                        for detection_id in detection_ids]
                     metrics = reviewed.get("ollama_metrics", {})
                     eval_ms = _ns_ms(metrics.get("eval_duration_ns"))
                     eval_count = metrics.get("eval_count")
-                    result = {**common, "status": "COMPLETE", "json_valid": True,
+                    partial = any(item["response_status"] == "NO_RESPONSE" for item in prediction_rows)
+                    result = {**common, "status": "PARTIAL" if partial else "COMPLETE", "json_valid": True,
                               "schema_valid": raw_response.get("schema_valid_before_normalization", False),
                               "normalization_notes": raw_response.get("notes", []),
                               "raw_model_response": raw_response.get("content"),
@@ -673,7 +748,7 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                 if not row:
                     st.caption("이 실행에서 선택되지 않음")
                     continue
-                if row.get("status") != "COMPLETE":
+                if row.get("status") not in {"COMPLETE", "PARTIAL"}:
                     st.warning(row.get("error") or row.get("status"))
                     if row.get("status") == "UNAVAILABLE":
                         st.caption(f"설치 안내 · `ollama pull {MODEL_CATALOG[model_key]['ollama_id']}` 후 설치 상태를 확인하세요.")
@@ -682,11 +757,15 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
                     "박스 ID": item.get("detection_id"),
                     "YOLO 종류": item.get("detector_class"),
                     "모델 제안": item.get("proposed_class", UNKNOWN_CLASS),
-                    "세부 유형": item.get("proposed_subtype") or "—",
-                    "판정": "불확실" if item.get("uncertain") else "제안",
-                    "근거": item.get("evidence") or "판단 근거 없음",
+                    "박스 판별": {"COMPONENT": "실물 소자", "NOT_COMPONENT": "YOLO 오탐 의심",
+                                  "UNCERTAIN": "실물 여부 불확실", "NO_RESPONSE": "모델 무응답"}.get(
+                                      item.get("object_status"), "실물 여부 불확실"),
+                    "분류 상태": "미응답" if item.get("response_status") == "NO_RESPONSE" else
+                                "종류 미확정" if item.get("proposed_class") == UNKNOWN_CLASS else "분류 제안",
                     "사용자 확인 정답": item.get("ground_truth") or "—",
                 } for item in row.get("predictions", [])]
+                if row.get("status") == "PARTIAL":
+                    st.warning("일부 박스에 응답이 없습니다. 무응답은 unknown 분류로 간주하지 않았습니다.")
                 st.markdown(f"### 전체 박스 분류 · {len(prediction_table)}개")
                 if prediction_table:
                     st.dataframe(prediction_table, use_container_width=True, hide_index=True)

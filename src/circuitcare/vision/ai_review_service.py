@@ -141,7 +141,18 @@ _SYSTEM = """Review the PCB images independently of YOLO. For each detection fir
 
 _DUPLICATES_ONLY_SYSTEM = """Assess only whether each supplied pair of detection boxes depicts the same physical component or two distinct components. Use the paired crops and supplied IDs. Pay attention to connector housing/pins, IC package structure, and nearby separate parts; pins or contacts within one connector/IC are not separate PCB components. Do not classify components, propose boxes, or recommend deletion. Use decision uncertain when the crop does not settle identity. Keep evidence to one concise sentence. Return empty arrays for class_reviews, group_reviews, missed_component_candidates, and notes, and return exactly one duplicate_reviews object for every supplied pair. Every duplicate object must include detection_ids with the exact pair IDs, decision, numeric confidence from 0 to 1, and evidence. Confidence is uncalibrated and never authorizes deletion. Return only schema-valid JSON."""
 _CLASS_ONLY_SYSTEM = """Estimate the component type for only the supplied selected PCB box(es). Each crop includes nearby PCB context; use supplied nearby OCR and silkscreen reference candidates only as supporting clues. A designator such as R12, C4, U3, or J1 is not enough by itself to decide the part type, and nearby text may belong to another part. Distinguish body markings from silkscreen. user_confirmed_reference_info contains locally saved information confirmed by a user for matching markings; use it only as a comparison clue and do not assume it matches unless the visible/OCR marking supports the match. Do not claim an exact part number, electrical rating, pinout, function, or fault. Return one class_reviews item for each supplied detection_id and no other analysis. Choose only from the 18 detector component classes listed in the schema. When the component cannot be identified confidently, use proposed_class=unknown and decision=uncertain. Do not use extension labels such as other_component, board_feature, or not_component in this selected-class task. Do not analyze duplicate boxes, groups, missed components, electrical function, or faults. Give one short evidence sentence that identifies whether it relies on body appearance, body marking, nearby silkscreen, or a user-confirmed matching reference. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
-_FULL_BOARD_CLASSIFICATION_SYSTEM = """Classify every supplied YOLO detection from the single complete annotated PCB image, using whole-board visual context and the exact box ID labels. OCR and silkscreen candidates are unverified clues tied to the supplied detection IDs; do not infer a component type from a nearby designator alone. Return exactly one class_reviews item for every supplied detection_id. Choose only from the 18 detector component classes in the schema; use unknown with decision=uncertain when a box cannot be identified confidently. Do not use other_component, board_feature, or not_component in this selected-class comparison. Do not propose or remove boxes, analyze duplicates, or infer electrical function or faults. Give one concise visual evidence sentence per detection. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
+_FULL_BOARD_CLASSIFICATION_SYSTEM = """Classify each labeled YOLO box quickly. For each ID return only: detection_id, object_status (COMPONENT, NOT_COMPONENT, or UNCERTAIN), proposed_class (one of the 18 classes or unknown). COMPONENT means a real physical part; use unknown when it is real but its type is unclear. NOT_COMPONENT means the box is a clear false positive. UNCERTAIN means presence itself is unclear. Do not explain, add evidence, confidence, subtype, or other text. Never treat missing output as unknown. Return compact JSON only."""
+
+FULL_BOARD_CLASSIFICATION_SCHEMA = {
+    "type": "object",
+    "properties": {"class_reviews": {"type": "array", "minItems": 1,
+        "items": {"type": "object", "properties": {
+            "detection_id": {"type": "string"},
+            "object_status": {"type": "string", "enum": ["COMPONENT", "NOT_COMPONENT", "UNCERTAIN"]},
+            "proposed_class": {"type": "string", "enum": list(QWEN_CLASSIFICATION_CLASSES)},
+        }, "required": ["detection_id", "object_status", "proposed_class"], "additionalProperties": False}}},
+    "required": ["class_reviews"], "additionalProperties": False,
+}
 
 
 def _review_images(
@@ -477,9 +488,8 @@ def review_components_with_qwen(
         ]
         payload = ({
             "full_board_classification": True,
-            "detections": detection_payload,
-            "image_sources": image_manifest,
-            "nearby_ocr_text_candidates": _compact_ocr_candidates(ocr_records),
+            "detections": [{"detection_id": row["detection_id"],
+                            "detector_class": row["class_name"]} for row in identified],
             "coordinate_rule": "Use the exact printed detection_id labels on the single full-board image.",
         } if full_board_classification else {
             "selected_detections": [{"detection_id": row["detection_id"],
@@ -497,8 +507,8 @@ def review_components_with_qwen(
             })
     response_schema = CLASS_ONLY_REVIEW_SCHEMA if classification_only else REVIEW_SCHEMA
     if full_board_classification:
-        response_schema = deepcopy(CLASS_ONLY_REVIEW_SCHEMA)
-        response_schema["properties"]["class_reviews"]["minItems"] = len(identified)
+        response_schema = deepcopy(FULL_BOARD_CLASSIFICATION_SCHEMA)
+        response_schema["properties"]["class_reviews"]["minItems"] = 0
         response_schema["properties"]["class_reviews"]["maxItems"] = len(identified)
     if duplicate_pairs_only:
         response_schema = deepcopy(DUPLICATE_REVIEW_SCHEMA)
@@ -506,9 +516,8 @@ def review_components_with_qwen(
         response_schema["properties"]["duplicate_reviews"]["minItems"] = expected_pair_count
         response_schema["properties"]["duplicate_reviews"]["maxItems"] = expected_pair_count
     user_prompt = (
-        "Inspect the single annotated full-board PCB image. Classify every supplied detection_id against the "
-        "whole-board visual context; use the matching drawn box label for each ID. Return exactly one "
-        "class_reviews item per supplied detection_id and no other analysis.\n" + json.dumps(payload, ensure_ascii=False)
+        "Use the single full-board image and exact box labels. Return only compact JSON rows with detection_id, "
+        "object_status and proposed_class. Do not include explanations.\n" + json.dumps(payload, ensure_ascii=False)
         if full_board_classification else
         (
             "Estimate only each selected detection using its orange-boxed crop, nearby silkscreen context, and supplied unverified OCR clues. "
@@ -529,7 +538,7 @@ def review_components_with_qwen(
     try:
         chat_options = {
             "output_schema": response_schema, "images": images,
-            "output_budget": ((min(4096, max(256, (classification_output_budget or 192) * len(identified)))
+            "output_budget": ((min(1024, max(128, classification_output_budget or 512))
                                if full_board_classification else
                                classification_output_budget or min(1536, 256 * len(identified)))
                               if classification_only else None),
@@ -553,6 +562,40 @@ def review_components_with_qwen(
     allowed_pairs = {tuple(sorted(pair["detection_ids"])) for pair in pair_manifest}
     class_reviews = []
     for row in content.get("class_reviews", []):
+        if full_board_classification:
+            detection_id = str(row.get("detection_id") or "")
+            if detection_id not in known_ids:
+                continue
+            if row.get("response_status") == "NO_RESPONSE" or row.get("object_status") == "NO_RESPONSE":
+                target = next(item for item in identified if item["detection_id"] == detection_id)
+                class_reviews.append({"detection_id": detection_id, "decision": "uncertain",
+                                      "proposed_class": UNKNOWN_CLASS, "proposed_base_class": UNKNOWN_CLASS,
+                                      "proposed_subtype": None, "confidence": 0.0, "evidence": "",
+                                      "uncertain": True, "object_status": "NO_RESPONSE",
+                                      "response_status": "NO_RESPONSE", "review_status": "NO_RESPONSE",
+                                      "detector_class": target["class_name"]})
+                continue
+            object_status = str(row.get("object_status") or "UNCERTAIN").upper()
+            if object_status not in {"COMPONENT", "NOT_COMPONENT", "UNCERTAIN"}:
+                object_status = "UNCERTAIN"
+            raw_class = row.get("proposed_class")
+            proposed = normalize_qwen_class(raw_class) if raw_class is not None else UNKNOWN_CLASS
+            raw_token = str(raw_class or "").strip().casefold().replace("-", "_").replace(" ", "_")
+            if proposed not in QWEN_CLASSIFICATION_CLASSES or (proposed == UNKNOWN_CLASS and raw_token not in {"", "unknown", "unknown_component"}):
+                proposed = UNKNOWN_CLASS
+            if object_status == "NOT_COMPONENT":
+                proposed = UNKNOWN_CLASS
+            elif object_status == "UNCERTAIN" and proposed == UNKNOWN_CLASS:
+                proposed = UNKNOWN_CLASS
+            target = next(item for item in identified if item["detection_id"] == detection_id)
+            class_reviews.append({"detection_id": detection_id, "decision": "uncertain" if proposed == UNKNOWN_CLASS else "suggest",
+                                  "proposed_class": proposed, "proposed_base_class": proposed,
+                                  "proposed_subtype": None, "confidence": 0.0, "evidence": "",
+                                  "uncertain": object_status == "UNCERTAIN" or proposed == UNKNOWN_CLASS,
+                                  "object_status": object_status, "response_status": "RECEIVED",
+                                  "review_status": "AI_SUGGESTED",
+                                  "detector_class": target["class_name"]})
+            continue
         confidence = row.get("confidence")
         proposed = normalize_qwen_class(row.get("proposed_base_class", row.get("proposed_class")))
         decision = row.get("decision")
@@ -625,7 +668,16 @@ def review_components_with_qwen(
     if classification_only:
         requested_ids = {row["detection_id"] for row in identified}
         returned_ids = [row["detection_id"] for row in class_reviews]
-        if set(returned_ids) != requested_ids or len(returned_ids) != len(requested_ids):
+        if full_board_classification:
+            returned_by_id = {row["detection_id"]: row for row in class_reviews}
+            class_reviews = [returned_by_id.get(detection_id, {
+                "detection_id": detection_id, "decision": "uncertain", "proposed_class": UNKNOWN_CLASS,
+                "proposed_base_class": UNKNOWN_CLASS, "proposed_subtype": None, "confidence": 0.0,
+                "evidence": "", "uncertain": True, "object_status": "NO_RESPONSE",
+                "response_status": "NO_RESPONSE", "review_status": "NO_RESPONSE",
+                "detector_class": next(item["class_name"] for item in identified if item["detection_id"] == detection_id),
+            }) for detection_id in [row["detection_id"] for row in identified]]
+        elif set(returned_ids) != requested_ids or len(returned_ids) != len(requested_ids):
             raise AIReviewStageError(
                 "qwen_validation",
                 f"Qwen selected-box classification expected {len(requested_ids)} unique result(s), "

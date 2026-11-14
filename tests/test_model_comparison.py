@@ -169,17 +169,42 @@ def test_archive2_proposals_are_normalized_to_the_fixed_18_class_taxonomy():
 
 def test_full_board_response_normalizes_each_detection_id_independently():
     response = {"model": "qwen3.5:9b", "content": {"class_reviews": [
-        {"detection_id": "R1", "proposed_class": "resistor", "decision": "suggest",
-         "confidence": .8, "evidence": "Rectangular passive body."},
-        {"detection_id": "U1", "proposed_class": "ic", "decision": "uncertain",
-         "confidence": .4, "evidence": "Possible IC package."},
+        {"detection_id": "R1", "proposed_class": "resistor", "object_status": "COMPONENT"},
+        {"detection_id": "U1", "proposed_class": "ic", "object_status": "COMPONENT"},
     ]}}
     normalized = _normalize_experiment_response_batch(response, ["R1", "U1"])
     rows = normalized["content"]["class_reviews"]
     assert [row["detection_id"] for row in rows] == ["R1", "U1"]
     assert [row["proposed_class"] for row in rows] == ["resistor", "ic"]
-    assert [row["uncertain"] for row in rows] == [False, True]
-    assert normalized["archive2_normalization"]["schema_valid_before_normalization"] is False
+    assert [row["object_status"] for row in rows] == ["COMPONENT", "COMPONENT"]
+    assert [row["uncertain"] for row in rows] == [False, False]
+    assert normalized["archive2_normalization"]["schema_valid_before_normalization"] is True
+
+
+def test_full_board_unknown_false_positive_and_missing_response_are_distinct():
+    response = {"content": {"detections": [
+        {"detection_id": "R1", "proposed_class": "unknown", "object_status": "COMPONENT"},
+        {"detection_id": "U1", "proposed_class": "ic", "object_status": "NOT_COMPONENT"},
+    ]}}
+    normalized = _normalize_experiment_response_batch(response, ["R1", "U1", "C1"])
+    by_id = {row["detection_id"]: row for row in normalized["content"]["class_reviews"]}
+    assert by_id["R1"]["proposed_class"] == UNKNOWN_CLASS
+    assert by_id["R1"]["object_status"] == "COMPONENT"
+    assert by_id["U1"]["proposed_class"] == UNKNOWN_CLASS
+    assert by_id["U1"]["object_status"] == "NOT_COMPONENT"
+    assert by_id["C1"]["object_status"] == "NO_RESPONSE"
+    assert normalized["archive2_normalization"]["missing_ids"] == ["C1"]
+    assert all("evidence" not in row and "confidence" not in row for row in by_id.values())
+
+
+def test_nested_class_reviews_envelope_is_unwrapped_without_using_yolo_class_as_prediction():
+    response = {"content": [{"detection_id": "U1", "detector_class": "ic",
+                             "class_reviews": [{"review_text": "confirmed"}]}]}
+    normalized = _normalize_experiment_response_batch(response, ["U1"])
+    row = normalized["content"]["class_reviews"][0]
+    assert row["proposed_class"] == UNKNOWN_CLASS
+    assert row["object_status"] == "UNCERTAIN"
+    assert row["response_status"] == "RECEIVED"
 
 
 def test_summary_scores_nested_full_board_predictions_without_repeating_run_time_per_box():
