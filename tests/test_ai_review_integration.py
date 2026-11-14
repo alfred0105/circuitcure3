@@ -223,6 +223,37 @@ def test_selected_box_classification_schema_is_limited_to_the_18_detector_classe
     assert result["class_reviews"][0]["decision"] == "uncertain"
 
 
+def test_full_board_classification_sends_one_annotated_photo_and_labels_every_box():
+    class FullBoardClient:
+        def chat_json(self, _model, messages, *, output_schema, images, output_budget=None):
+            assert len(images) == 1
+            with Image.open(io.BytesIO(images[0])) as sent_image:
+                assert sent_image.size == (100, 80)
+            assert output_budget == 256
+            assert output_schema["properties"]["class_reviews"]["minItems"] == 2
+            assert output_schema["properties"]["class_reviews"]["maxItems"] == 2
+            request = json.loads(messages[-1]["content"].split("\n", 1)[1])
+            assert request["full_board_classification"] is True
+            assert [row["detection_id"] for row in request["detections"]] == ["R1", "U1"]
+            assert "single annotated full-board PCB image" in messages[-1]["content"]
+            return {"model": "qwen3.5:9b", "content": {"class_reviews": [
+                {"detection_id": "R1", "decision": "suggest", "proposed_class": "resistor",
+                 "confidence": .8, "evidence": "Small rectangular passive package."},
+                {"detection_id": "U1", "decision": "suggest", "proposed_class": "ic",
+                 "confidence": .9, "evidence": "Large package with many leads."},
+            ]}}
+
+    result = review_components_with_qwen(
+        FullBoardClient(), "qwen3.5:9b", _png(), [
+            {"component_id": "R1", "class_name": "resistor", "bbox_xyxy": [5, 5, 30, 25]},
+            {"component_id": "U1", "class_name": "ic", "bbox_xyxy": [50, 15, 90, 65]},
+        ], [], classification_only=True, full_board_classification=True,
+        classification_output_budget=128,
+    )
+    assert [row["detection_id"] for row in result["class_reviews"]] == ["R1", "U1"]
+    assert [row["proposed_class"] for row in result["class_reviews"]] == ["resistor", "ic"]
+
+
 @pytest.mark.parametrize(
     ("left", "right", "overlap_candidate", "same_component"),
     [

@@ -141,6 +141,7 @@ _SYSTEM = """Review the PCB images independently of YOLO. For each detection fir
 
 _DUPLICATES_ONLY_SYSTEM = """Assess only whether each supplied pair of detection boxes depicts the same physical component or two distinct components. Use the paired crops and supplied IDs. Pay attention to connector housing/pins, IC package structure, and nearby separate parts; pins or contacts within one connector/IC are not separate PCB components. Do not classify components, propose boxes, or recommend deletion. Use decision uncertain when the crop does not settle identity. Keep evidence to one concise sentence. Return empty arrays for class_reviews, group_reviews, missed_component_candidates, and notes, and return exactly one duplicate_reviews object for every supplied pair. Every duplicate object must include detection_ids with the exact pair IDs, decision, numeric confidence from 0 to 1, and evidence. Confidence is uncalibrated and never authorizes deletion. Return only schema-valid JSON."""
 _CLASS_ONLY_SYSTEM = """Estimate the component type for only the supplied selected PCB box(es). Each crop includes nearby PCB context; use supplied nearby OCR and silkscreen reference candidates only as supporting clues. A designator such as R12, C4, U3, or J1 is not enough by itself to decide the part type, and nearby text may belong to another part. Distinguish body markings from silkscreen. user_confirmed_reference_info contains locally saved information confirmed by a user for matching markings; use it only as a comparison clue and do not assume it matches unless the visible/OCR marking supports the match. Do not claim an exact part number, electrical rating, pinout, function, or fault. Return one class_reviews item for each supplied detection_id and no other analysis. Choose only from the 18 detector component classes listed in the schema. When the component cannot be identified confidently, use proposed_class=unknown and decision=uncertain. Do not use extension labels such as other_component, board_feature, or not_component in this selected-class task. Do not analyze duplicate boxes, groups, missed components, electrical function, or faults. Give one short evidence sentence that identifies whether it relies on body appearance, body marking, nearby silkscreen, or a user-confirmed matching reference. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
+_FULL_BOARD_CLASSIFICATION_SYSTEM = """Classify every supplied YOLO detection from the single complete annotated PCB image, using whole-board visual context and the exact box ID labels. OCR and silkscreen candidates are unverified clues tied to the supplied detection IDs; do not infer a component type from a nearby designator alone. Return exactly one class_reviews item for every supplied detection_id. Choose only from the 18 detector component classes in the schema; use unknown with decision=uncertain when a box cannot be identified confidently. Do not use other_component, board_feature, or not_component in this selected-class comparison. Do not propose or remove boxes, analyze duplicates, or infer electrical function or faults. Give one concise visual evidence sentence per detection. Confidence is an uncalibrated score, not a probability. Return only schema-valid JSON."""
 
 
 def _review_images(
@@ -151,6 +152,7 @@ def _review_images(
     component_crop_padding_ratio: float = .25,
     component_crop_size_px: int = 720,
     include_full_image: bool = True,
+    include_full_resolution_tiles: bool = True,
 ) -> tuple[list[bytes], tuple[int, int], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     with Image.open(io.BytesIO(image_bytes)) as source_image:
         image = source_image.convert("RGB")
@@ -203,7 +205,7 @@ def _review_images(
     tile_size, overlap, max_tiles = 1024, 0.25, 16
     # The overview is already kept at up to 1600 px. Tiling a 1310x1444 source
     # adds four highly redundant images without adding source detail.
-    if include_full_image and (width > 1600 or height > 1600):
+    if include_full_image and include_full_resolution_tiles and (width > 1600 or height > 1600):
         step = int(tile_size * (1 - overlap))
         def positions(length: int) -> list[int]:
             if length <= tile_size:
@@ -375,6 +377,7 @@ def review_components_with_qwen(
     *, duplicate_pair_candidates: list[dict[str, Any]] | None = None,
     duplicate_pairs_only: bool = False,
     classification_only: bool = False,
+    full_board_classification: bool = False,
     include_board_context: bool = True,
     classification_crop_size_px: int = 720,
     classification_padding_ratio: float = .75,
@@ -382,6 +385,8 @@ def review_components_with_qwen(
     classification_think: bool | None = False,
 ) -> dict[str, Any]:
     """Request suggestions and validate every ID and normalized box before display."""
+    if full_board_classification and not classification_only:
+        raise ValueError("Full-board classification is available only in selected-class mode.")
     identified = []
     for index, row in enumerate(detections, start=1):
         box = row.get("bbox_xyxy", [row.get("x1"), row.get("y1"), row.get("x2"), row.get("y2")])
@@ -427,10 +432,13 @@ def review_components_with_qwen(
             duplicate_pair_candidates=([] if classification_only or
                                        (not duplicate_pairs_only and duplicate_pair_candidates is None)
                                        else duplicate_pair_candidates),
-            max_crop_count=0 if duplicate_pairs_only else (len(identified) if classification_only else 10),
+            max_crop_count=0 if duplicate_pairs_only or full_board_classification else (
+                len(identified) if classification_only else 10),
             component_crop_padding_ratio=classification_padding_ratio if classification_only else .25,
             component_crop_size_px=classification_crop_size_px if classification_only else 720,
-            include_full_image=not duplicate_pairs_only and not classification_only and include_board_context,
+            include_full_image=(full_board_classification or
+                                (not duplicate_pairs_only and not classification_only and include_board_context)),
+            include_full_resolution_tiles=not full_board_classification,
             review_diagnostics=candidate_diagnostics)
     except Exception as exc:
         raise AIReviewStageError("candidate_search", str(exc)) from exc
@@ -455,7 +463,25 @@ def review_components_with_qwen(
                                    if str(row.get("detection_id")) in allowed_ids],
         }
     elif classification_only:
-        payload = {
+        detection_payload = [
+            {"detection_id": row["detection_id"],
+             "detector_class": row["class_name"],
+             "nearby_ocr_text_candidates": row.get("ocr_text", [])[:12],
+             "ocr_class_hints": row.get("ocr_class_hints", [])[:8],
+             "reference_designators": row.get("reference_designators", [])[:8],
+             "body_marking": row.get("body_marking"),
+             "body_marking_candidates": row.get("marking_candidates", [])[:8],
+             "possible_part_number_candidate": row.get("possible_part_number"),
+             "user_confirmed_reference_info": row.get("user_component_knowledge", [])[:4]}
+            for row in identified
+        ]
+        payload = ({
+            "full_board_classification": True,
+            "detections": detection_payload,
+            "image_sources": image_manifest,
+            "nearby_ocr_text_candidates": _compact_ocr_candidates(ocr_records),
+            "coordinate_rule": "Use the exact printed detection_id labels on the single full-board image.",
+        } if full_board_classification else {
             "selected_detections": [{"detection_id": row["detection_id"],
                                      "detector_class": row["class_name"],
                                      "nearby_ocr_text_candidates": row.get("ocr_text", [])[:12],
@@ -468,33 +494,45 @@ def review_components_with_qwen(
                                     for row in identified],
             "selected_context_crop_sources": image_manifest,
             "note": "Crop boundary is orange. Nearby OCR and silkscreen tokens are unverified clues and may belong to adjacent components.",
-        }
+            })
     response_schema = CLASS_ONLY_REVIEW_SCHEMA if classification_only else REVIEW_SCHEMA
+    if full_board_classification:
+        response_schema = deepcopy(CLASS_ONLY_REVIEW_SCHEMA)
+        response_schema["properties"]["class_reviews"]["minItems"] = len(identified)
+        response_schema["properties"]["class_reviews"]["maxItems"] = len(identified)
     if duplicate_pairs_only:
         response_schema = deepcopy(DUPLICATE_REVIEW_SCHEMA)
         expected_pair_count = len(pair_manifest)
         response_schema["properties"]["duplicate_reviews"]["minItems"] = expected_pair_count
         response_schema["properties"]["duplicate_reviews"]["maxItems"] = expected_pair_count
     user_prompt = (
-        "Estimate only each selected detection using its orange-boxed crop, nearby silkscreen context, and supplied unverified OCR clues. "
-        "Do not treat an adjacent reference designator as proof. Return exactly one class_reviews item "
-        "per selected detection_id. Do not return any other analysis.\n" + json.dumps(payload, ensure_ascii=False)
-        if classification_only else
+        "Inspect the single annotated full-board PCB image. Classify every supplied detection_id against the "
+        "whole-board visual context; use the matching drawn box label for each ID. Return exactly one "
+        "class_reviews item per supplied detection_id and no other analysis.\n" + json.dumps(payload, ensure_ascii=False)
+        if full_board_classification else
         (
-        "For each pair shown in duplicate_pair_crops, return exactly one duplicate_reviews item using those two IDs. "
-        "Include detection_ids, decision, numeric confidence, and evidence in each item. "
-        "If the evidence cannot distinguish them, use decision=uncertain; do not omit a pair. Do not return class, group, "
-        "or missed-component analysis.\n" + json.dumps(payload, ensure_ascii=False)
-        if duplicate_pairs_only else
-        "Review the PCB image, YOLO proposals, and OCR evidence. Return conservative candidate findings.\n"
-        + json.dumps(payload, ensure_ascii=False)
+            "Estimate only each selected detection using its orange-boxed crop, nearby silkscreen context, and supplied unverified OCR clues. "
+            "Do not treat an adjacent reference designator as proof. Return exactly one class_reviews item "
+            "per selected detection_id. Do not return any other analysis.\n" + json.dumps(payload, ensure_ascii=False)
+            if classification_only else
+            (
+                "For each pair shown in duplicate_pair_crops, return exactly one duplicate_reviews item using those two IDs. "
+                "Include detection_ids, decision, numeric confidence, and evidence in each item. "
+                "If the evidence cannot distinguish them, use decision=uncertain; do not omit a pair. Do not return class, group, "
+                "or missed-component analysis.\n" + json.dumps(payload, ensure_ascii=False)
+                if duplicate_pairs_only else
+                "Review the PCB image, YOLO proposals, and OCR evidence. Return conservative candidate findings.\n"
+                + json.dumps(payload, ensure_ascii=False)
+        )
         )
     )
     try:
         chat_options = {
             "output_schema": response_schema, "images": images,
-            "output_budget": ((classification_output_budget or min(1536, 256 * len(identified)))
-                               if classification_only else None),
+            "output_budget": ((min(4096, max(256, (classification_output_budget or 192) * len(identified)))
+                               if full_board_classification else
+                               classification_output_budget or min(1536, 256 * len(identified)))
+                              if classification_only else None),
         }
         # Preserve the long-standing client contract for production Qwen review.
         # Benchmark backends may request omission when a model does not advertise
@@ -503,6 +541,7 @@ def review_components_with_qwen(
             chat_options["think"] = None
         response = client.chat_json(
             model, [{"role": "system", "content": (_DUPLICATES_ONLY_SYSTEM if duplicate_pairs_only else
+                                                       _FULL_BOARD_CLASSIFICATION_SYSTEM if full_board_classification else
                                                        _CLASS_ONLY_SYSTEM if classification_only else _SYSTEM)},
                     {"role": "user", "content": user_prompt}],
             **chat_options,

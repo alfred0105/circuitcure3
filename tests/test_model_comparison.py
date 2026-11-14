@@ -4,7 +4,7 @@ from circuitcare.component_taxonomy import COMPONENT_CLASSES, QWEN_CLASSIFICATIO
 from circuitcare.vision.ai_review_service import _review_images
 from circuitcare.vision.model_comparison import (
     MODEL_CATALOG, _normalize_experiment_chat_http_response,
-    _normalize_experiment_response, _probe_models, _summarize,
+    _normalize_experiment_response, _normalize_experiment_response_batch, _probe_models, _summarize,
 )
 from PIL import Image
 import io
@@ -165,6 +165,37 @@ def test_archive2_proposals_are_normalized_to_the_fixed_18_class_taxonomy():
         assert row["proposed_class"] == UNKNOWN_CLASS
         assert row["decision"] == "uncertain"
         assert row["uncertain"] is True
+
+
+def test_full_board_response_normalizes_each_detection_id_independently():
+    response = {"model": "qwen3.5:9b", "content": {"class_reviews": [
+        {"detection_id": "R1", "proposed_class": "resistor", "decision": "suggest",
+         "confidence": .8, "evidence": "Rectangular passive body."},
+        {"detection_id": "U1", "proposed_class": "ic", "decision": "uncertain",
+         "confidence": .4, "evidence": "Possible IC package."},
+    ]}}
+    normalized = _normalize_experiment_response_batch(response, ["R1", "U1"])
+    rows = normalized["content"]["class_reviews"]
+    assert [row["detection_id"] for row in rows] == ["R1", "U1"]
+    assert [row["proposed_class"] for row in rows] == ["resistor", "ic"]
+    assert [row["uncertain"] for row in rows] == [False, True]
+    assert normalized["archive2_normalization"]["schema_valid_before_normalization"] is False
+
+
+def test_summary_scores_nested_full_board_predictions_without_repeating_run_time_per_box():
+    row = {"status": "COMPLETE", "backend": "Ollama", "model_key": "qwen35_9b",
+           "crop_px": "full_board", "padding_ratio": 0, "output_budget": 256,
+           "json_valid": True, "schema_valid": True, "wall_ms": 1200,
+           "predictions": [
+               {"detection_id": "R1", "proposed_class": "resistor", "ground_truth": "resistor"},
+               {"detection_id": "U1", "proposed_class": "capacitor", "ground_truth": "ic"},
+               {"detection_id": "C1", "proposed_class": "unknown", "ground_truth": None},
+           ]}
+    summary = _summarize([row])[0]
+    assert summary["sample_n"] == 2
+    assert summary["accuracy"] == .5
+    assert summary["unknown_rate"] == 1 / 3
+    assert summary["mean_ms"] == 1200
 
 
 def test_archive2_wraps_qwen_root_array_before_shared_json_parser():
