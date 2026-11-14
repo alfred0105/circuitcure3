@@ -12,7 +12,6 @@ import statistics
 import sys
 import time
 from datetime import datetime, timezone
-from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -245,22 +244,23 @@ def _subset_accuracy(rows: list[dict[str, Any]], classes: set[str]) -> float | N
 
 
 def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[str, Any]]) -> None:
-    """Run sequential, isolated experiments using cached detections and OCR."""
+    """Compare selected-component crops in an isolated Archive 2 workspace."""
     from circuitcare.dashboard.views.unified_workspace import _cached_photo_pixels
     from circuitcare.vision.component_recognition_panel import review_aux_keys, review_keys, review_scope
     from circuitcare.vision.ai_review_service import (
-        CLASS_ONLY_REVIEW_SCHEMA, _CLASS_ONLY_SYSTEM, review_components_with_qwen,
+        CLASS_ONLY_REVIEW_SCHEMA, _CLASS_ONLY_SYSTEM, _review_images, review_components_with_qwen,
     )
 
-    st.markdown("### Archive 2 · 경량 이미지 모델 비교")
-    st.caption("실험은 저장된 YOLO/OCR 결과를 재사용합니다. 모델 제안은 원본 검수·Registry·진단 기록에 적용되지 않습니다.")
-    photos = [row for row in photos if isinstance(row, dict) and row.get("image_id") and isinstance(row.get("data"), bytes)]
+    st.markdown("### Archive 2 · 소자별 이미지 AI 비교")
+    st.caption("사진 → YOLO 박스 → 모델 선택 → 비교 실행. 결과는 실험 기록에만 저장되고 검수·진단 데이터는 바뀌지 않습니다.")
+    photos = [row for row in photos if isinstance(row, dict) and row.get("image_id")
+              and isinstance(row.get("data"), bytes)]
     if not photos:
-        st.info("PCB 사진이 없습니다.")
+        st.info("PCB 사진을 먼저 올려 주세요.")
         return
+
     photo_ids = [str(row["image_id"]) for row in photos]
-    pkey = f"cc_archive2_photo_{project.project_id}"
-    photo_id = st.selectbox("실험 사진", photo_ids, key=pkey,
+    photo_id = st.selectbox("PCB 사진", photo_ids, key=f"cc_archive2_photo_v2_{project.project_id}",
                             format_func=lambda value: f"사진 {photo_ids.index(value) + 1} · {value}")
     photo = next(row for row in photos if str(row["image_id"]) == photo_id)
     try:
@@ -269,79 +269,105 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         st.error(f"사진을 준비하지 못했습니다 · {exc}")
         return
     scope = review_scope(image_bytes, project.project_id, photo_id)
+    _result_key, rows_key, _error_key = review_keys(scope)
+    detections = st.session_state.get(rows_key, [])
+    if not isinstance(detections, list) or not detections:
+        st.warning("저장된 YOLO 박스가 없습니다. 먼저 PCB 검수 화면에서 해당 사진을 탐지하세요.")
+        return
+    active = [row for row in detections if isinstance(row, dict) and row.get("상태") != "제외"
+              and row.get("component_id")]
+    if not active:
+        st.info("비교할 수 있는 활성 박스가 없습니다.")
+        return
+    by_id = {str(row["component_id"]): row for row in active}
+    component_ids = list(by_id)
+    component_id = st.selectbox(
+        "소자 박스", component_ids, key=f"cc_archive2_component_v2_{project.project_id}_{photo_id}",
+        format_func=lambda value: f"{value} · YOLO {by_id[value].get('detector_class') or by_id[value].get('class_name') or by_id[value].get('소자 종류') or 'unknown'}",
+    )
+    source = by_id[component_id]
+    try:
+        bbox = [float(source[name]) for name in ("x1", "y1", "x2", "y2")]
+    except (KeyError, TypeError, ValueError):
+        bbox = []
+    if len(bbox) != 4:
+        st.error("선택한 YOLO 박스의 좌표가 올바르지 않아 Crop을 만들 수 없습니다.")
+        return
+
+    ocr_key, _ = review_aux_keys(scope)
+    ocr_state = st.session_state.get(ocr_key, {})
+    ocr_rows = ocr_state.get("records", []) if isinstance(ocr_state, dict) else []
+    backend_code = "Ollama"
+    client = OllamaClient(timeout_seconds=4, num_predict=256, keep_alive="10m", auto_start=False)
+    availability_key = f"cc_archive2_model_status_v2_{backend_code}"
+    availability = st.session_state.get(availability_key, {})
+    if not isinstance(availability, dict) or not availability:
+        availability = _probe_models(client, backend_code)
+        st.session_state[availability_key] = availability
+    if st.button("모델 상태 새로고침", key=f"cc_archive2_probe_v2_{project.project_id}"):
+        availability = _probe_models(client, backend_code)
+        st.session_state[availability_key] = availability
+
+    selected_models = st.multiselect(
+        "비교할 모델", list(MODEL_CATALOG), default=list(MODEL_CATALOG),
+        key=f"cc_archive2_models_v2_{project.project_id}",
+        format_func=lambda value: f"{MODEL_CATALOG[value]['label']} · "
+                                  f"{availability.get(value, {}).get('status', '확인 중')}",
+    )
+    with st.expander("고급 설정", expanded=False):
+        crop_px = st.selectbox("Crop 최대 변 길이", CROP_SIZES, index=CROP_SIZES.index(512),
+                               key=f"cc_archive2_crop_v2_{project.project_id}")
+        padding = st.selectbox("주변 여백 비율", PADDING_RATIOS, index=PADDING_RATIOS.index(.25),
+                               key=f"cc_archive2_padding_v2_{project.project_id}",
+                               format_func=lambda value: f"{value:.0%}")
+        budget = st.selectbox("출력 상한", (128, 192, 256), index=1,
+                              key=f"cc_archive2_budget_v2_{project.project_id}")
+
+    detection = {"component_id": component_id,
+                 "class_name": str(source.get("detector_class") or source.get("class_name")
+                                   or source.get("소자 종류") or UNKNOWN_CLASS),
+                 "bbox_xyxy": bbox, "confidence": source.get("신뢰도", source.get("confidence")),
+                 "ocr_candidates": source.get("ocr_candidates", []),
+                 "ocr_class_hints": source.get("ocr_class_hints", []),
+                 "reference_designators": source.get("reference_designators", []),
+                 "body_marking": source.get("body_marking"),
+                 "marking_candidates": source.get("marking_candidates", []),
+                 "possible_part_number": source.get("possible_part_number"),
+                 "user_component_knowledge": []}
+    image_sha = hashlib.sha256(photo["data"]).hexdigest()
     prompt_fingerprint = hashlib.sha256(_CLASS_ONLY_SYSTEM.encode("utf-8")).hexdigest()
     schema_fingerprint = hashlib.sha256(json.dumps(
         CLASS_ONLY_REVIEW_SCHEMA, ensure_ascii=False, sort_keys=True,
     ).encode("utf-8")).hexdigest()
-    _result_key, rows_key, _error_key = review_keys(scope)
-    rows = st.session_state.get(rows_key, [])
-    if not isinstance(rows, list) or not rows:
-        st.warning("저장된 YOLO 탐지 결과가 없습니다. 먼저 PCB 검수 화면에서 사진을 탐지하세요. 여기서는 YOLO를 다시 실행하지 않습니다.")
-        return
-    ocr_key, _ = review_aux_keys(scope)
-    ocr_state = st.session_state.get(ocr_key, {})
-    ocr_rows = ocr_state.get("records", []) if isinstance(ocr_state, dict) else []
-    active = [row for row in rows if isinstance(row, dict) and row.get("상태") != "제외"]
-    confirmed = [row for row in active if row.get("상태") == "확인"]
-    st.caption(f"같은 탐지 {len(active)}개 · 사용자 확인 정답 {len(confirmed)}개 · OCR 캐시 {len(ocr_rows)}개 · "
-               f"사진 {image_size[0]}×{image_size[1]} px")
-    if not ocr_rows:
-        st.info("저장된 OCR 결과가 없습니다. 현재 결과 그대로 진행하거나 원본 검수 화면에서 OCR을 실행하세요.")
-    by_id = {str(row.get("component_id")): row for row in active if row.get("component_id")}
-    ids = list(by_id)
-    default_ids = [str(row["component_id"]) for row in confirmed[:10] if row.get("component_id")]
-    selected_ids = st.multiselect("비교할 박스", ids, default=default_ids,
-                                 key=f"cc_archive2_boxes_{project.project_id}_{photo_id}")
-    backend = st.selectbox("백엔드", ["Ollama", "MLX 현재 서버"],
-                           key=f"cc_archive2_backend_{project.project_id}")
-    backend_code = "MLX" if backend.startswith("MLX") else "Ollama"
-    client = OllamaClient(timeout_seconds=4, num_predict=256, keep_alive="10m", auto_start=False,
-                          backend="mlx" if backend_code == "MLX" else "ollama")
-    availability_key = f"cc_archive2_model_status_{backend_code}"
-    availability = st.session_state.get(availability_key, {})
-    if st.button("설치·이미지 입력 지원 확인", key=f"cc_archive2_probe_{backend_code}"):
-        availability = _probe_models(client, backend_code)
-        st.session_state[availability_key] = availability
-    status_rows = [{"모델": spec["label"], "식별자": spec["mlx_id"] if backend_code == "MLX" else spec["ollama_id"],
-                    "상태": availability.get(key, {}).get("status", "확인 전"),
-                    "사유": availability.get(key, {}).get("reason", "모델 확인을 실행하세요.")}
-                   for key, spec in MODEL_CATALOG.items()]
-    st.dataframe(status_rows, use_container_width=True, hide_index=True)
-    ready = [key for key in MODEL_CATALOG if availability.get(key, {}).get("status") == "READY"]
-    selected_models = st.multiselect("실행 모델", list(MODEL_CATALOG), default=ready,
-                                     key=f"cc_archive2_models_{backend_code}",
-                                     format_func=lambda value: MODEL_CATALOG[value]["label"])
-    crop_sizes = st.multiselect("Crop 최대 변 길이", CROP_SIZES, default=[512],
-                                key=f"cc_archive2_crop_{project.project_id}")
-    paddings = st.multiselect("주변 여백 비율", PADDING_RATIOS, default=[0.25],
-                              key=f"cc_archive2_padding_{project.project_id}",
-                              format_func=lambda value: f"{value:.0%}")
-    budgets = st.multiselect("출력 토큰 상한", OUTPUT_BUDGETS, default=[128],
-                             key=f"cc_archive2_budget_{project.project_id}")
-    repeats = st.number_input("소자별 반복 횟수", min_value=1, max_value=5, value=2, step=1,
-                              key=f"cc_archive2_repeats_{project.project_id}")
-    call_count = len(selected_ids) * len(selected_models) * len(crop_sizes) * len(paddings) * len(budgets) * int(repeats)
-    st.caption(f"예상 {call_count}회 호출 · 순차 실행 · 모델별 입력 Crop/OCR/JSON Schema 공유")
-    st.caption("전체 PCB는 모델에 보내지 않습니다. 전달되는 것은 선택 박스 Crop과 해당 영역 OCR 문맥뿐이며, 사용자 정답은 프롬프트에서 제외됩니다.")
-    run_button = st.button("모델 비교 실행", type="primary", key=f"cc_archive2_run_{project.project_id}",
-                           disabled=(not call_count or any(availability.get(key, {}).get("status") != "READY"
-                                                          for key in selected_models)))
+    preview_images, _size, crop_manifest, *_ = _review_images(
+        image_bytes, [{"detection_id": component_id, **detection}], max_crop_count=1,
+        component_crop_padding_ratio=float(padding), component_crop_size_px=int(crop_px),
+        include_full_image=False,
+    )
+    original_class = str(source.get("detector_class") or source.get("class_name")
+                         or source.get("소자 종류") or UNKNOWN_CLASS)
+    confirmed_class = (str(source.get("소자 종류") or "")
+                       if source.get("상태") == "확인" else "")
+    top, bottom = st.columns([1, 2])
+    top.image(preview_images[0], caption=f"선택한 소자 Crop · {crop_manifest[0]['bbox_xyxy']}",
+              use_container_width=True)
+    bottom.markdown(f"**소자 ID** · `{component_id}`")
+    bottom.markdown(f"**YOLO 결과** · {original_class} · 신뢰도 {source.get('신뢰도', source.get('confidence', '미제공'))}")
+    if confirmed_class:
+        bottom.caption(f"사용자 확정 종류(모델 입력에서 제외) · {confirmed_class}")
+    else:
+        bottom.caption("사용자 확정 정답 없음")
+    bottom.caption(f"동일 Crop · OCR 문맥 {len(ocr_rows)}개 · {image_size[0]}×{image_size[1]}px 원본")
+
+    run_key = f"cc_archive2_last_run_v2_{project.project_id}_{photo_id}_{component_id}"
     all_rows = _load_runs()
-    if run_button:
+    if st.button("선택 소자 모델 비교 실행", type="primary",
+                  key=f"cc_archive2_run_v2_{project.project_id}_{photo_id}_{component_id}",
+                  disabled=not selected_models):
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        confirmed_labels = {str(row.get("component_id")): str(row.get("소자 종류") or "unknown").casefold()
-                            for row in confirmed}
-        image_sha = hashlib.sha256(photo["data"]).hexdigest()
-        ds_fingerprint = hashlib.sha256(json.dumps({
-            "image_sha": image_sha,
-            "boxes": [{"id": key, "bbox": [by_id[key].get(k) for k in ("x1", "y1", "x2", "y2")],
-                       "label": confirmed_labels.get(key)} for key in selected_ids],
-            "ocr": ocr_rows,
-        }, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
-        progress = st.progress(0, text="실험 시작")
-        status = st.status("모델 비교 중", expanded=True)
-        run_client = OllamaClient(timeout_seconds=600, num_predict=256, keep_alive="10m", auto_start=False,
-                                  backend="mlx" if backend_code == "MLX" else "ollama")
+        run_client = OllamaClient(timeout_seconds=600, num_predict=256, keep_alive="10m", auto_start=True)
+        availability = _probe_models(run_client, backend_code)
+        st.session_state[availability_key] = availability
         try:
             runtime_version = run_client._request("GET", "/api/version").get("version")
         except Exception:
@@ -349,205 +375,162 @@ def render_model_comparison_workspace(st: Any, project: Any, photos: list[dict[s
         runtime_environment = {"python_version": sys.version.split()[0], "platform": platform.platform(),
                                "machine": platform.machine(),
                                "code_revision": os.environ.get("CIRCUITCARE_GIT_SHA")}
+        progress = st.progress(0, text="비교 시작")
+        status = st.status("선택한 소자 모델 비교 중", expanded=True)
         produced = []
-        count, total = 0, max(call_count, 1)
-        for model_key, crop_px, padding, budget in product(selected_models, crop_sizes, paddings, budgets):
+        for index, model_key in enumerate(selected_models, start=1):
             spec = MODEL_CATALOG[model_key]
-            runtime_id = availability[model_key].get("runtime_id") or (
-                "qwen3.5:9b" if backend_code == "MLX" else spec["ollama_id"])
-            think_supported = bool(availability[model_key].get("think_supported"))
-            for component_id in selected_ids:
-                source = by_id[component_id]
+            model_id = spec["ollama_id"]
+            model_state = availability.get(model_key, {})
+            common = {"run_id": run_id, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                      "execution_mode": "REAL_MODEL", "backend": backend_code,
+                      "model_key": model_key, "model_id": model_id, "runtime_id": model_id,
+                      "ollama_model_id": model_id, "runtime_version": runtime_version,
+                      "runtime_environment": runtime_environment, "project_id": project.project_id,
+                      "board_id": project.board_id, "photo_id": photo_id, "component_id": component_id,
+                      "image_sha256": image_sha, "bbox_xyxy": bbox, "detector_class_input": original_class,
+                      "ground_truth": confirmed_class.casefold() if confirmed_class.casefold() in COMPONENT_CLASSES else None,
+                      "crop_px": int(crop_px), "padding_ratio": float(padding),
+                      "output_budget": int(budget), "repeat_index": 0,
+                      "prompt_version": PROMPT_VERSION, "prompt_fingerprint": prompt_fingerprint,
+                      "schema_version": SCHEMA_VERSION, "schema_fingerprint": schema_fingerprint,
+                      "model_digest": model_state.get("digest"), "json_valid": False}
+            start_ns = time.perf_counter_ns()
+            if model_state.get("status") != "READY":
+                result = {**common, "status": "UNAVAILABLE", "wall_ms": None,
+                          "error": model_state.get("reason") or
+                                  f"미설치 상태입니다. `ollama pull {model_id}` 후 모델 설치 상태를 다시 확인하세요."}
+            else:
+                raw_response: dict[str, Any] = {}
+                original_chat_json = run_client.chat_json
+                def archive2_chat_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                    response = original_chat_json(*args, **kwargs)
+                    normalized = _normalize_experiment_response(response, component_id)
+                    raw_response.update(normalized.get("archive2_normalization", {}))
+                    raw_response["content"] = normalized.get("archive2_raw_content")
+                    return normalized
+                run_client.chat_json = archive2_chat_json
                 try:
-                    bbox = [float(source[name]) for name in ("x1", "y1", "x2", "y2")]
-                except (KeyError, TypeError, ValueError):
-                    bbox = []
-                detected_type = str(source.get("detector_class") or source.get("class_name") or "unknown")
-                ground_truth = confirmed_labels.get(component_id)
-                if ground_truth not in COMPONENT_CLASSES:
-                    ground_truth = None
-                small_smd = bool(bbox and max(bbox[2]-bbox[0], bbox[3]-bbox[1]) <= 64
-                                 and ground_truth in {"resistor", "capacitor", "diode", "led", "inductor", "fuse", "transistor"})
-                # Keep detector and OCR evidence, but never pass the confirmed answer or confirmed part knowledge.
-                detection = {"component_id": component_id, "class_name": detected_type, "bbox_xyxy": bbox,
-                             "confidence": source.get("신뢰도", source.get("confidence")),
-                             "ocr_candidates": source.get("ocr_candidates", []),
-                             "ocr_class_hints": source.get("ocr_class_hints", []),
-                             "reference_designators": source.get("reference_designators", []),
-                             "body_marking": source.get("body_marking"),
-                             "marking_candidates": source.get("marking_candidates", []),
-                             "possible_part_number": source.get("possible_part_number"),
-                             "user_component_knowledge": []}
-                experiment_fingerprint = hashlib.sha256(json.dumps({
-                    "backend": backend_code, "model_id": runtime_id,
-                    "model_digest": availability[model_key].get("digest"),
-                    "image_sha256": image_sha, "component_id": component_id,
-                    "bbox": bbox, "ocr": ocr_rows,
-                    "prompt_version": PROMPT_VERSION, "prompt_fingerprint": prompt_fingerprint,
-                    "schema_version": SCHEMA_VERSION, "schema_fingerprint": schema_fingerprint,
-                    "crop_px": int(crop_px), "padding_ratio": float(padding),
-                    "output_budget": int(budget), "think": False if think_supported else None,
-                }, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
-                for repeat_index in range(int(repeats)):
-                    count += 1
-                    start_ns = time.perf_counter_ns()
-                    original_chat_json = run_client.chat_json
-                    response_adaptation: dict[str, Any] = {}
-                    def archive2_chat_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
-                        response = original_chat_json(*args, **kwargs)
-                        normalized = _normalize_experiment_response(response, component_id)
-                        response_adaptation.update(normalized.get("archive2_normalization", {}))
-                        response_adaptation["raw_model_response"] = normalized.get("archive2_raw_content")
-                        return normalized
-                    run_client.chat_json = archive2_chat_json
-                    try:
-                        reviewed = review_components_with_qwen(
-                            run_client, runtime_id, image_bytes, [detection], ocr_rows,
-                            classification_only=True, include_board_context=False,
-                            classification_crop_size_px=int(crop_px),
-                            classification_padding_ratio=float(padding),
-                            classification_output_budget=int(budget),
-                            classification_think=False if think_supported else None,
-                        )
-                        wall_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
-                        prediction = reviewed["class_reviews"][0]
-                        metrics = reviewed.get("ollama_metrics", {})
-                        load_ms = _ns_ms(metrics.get("load_duration_ns"))
-                        prefill_ms = _ns_ms(metrics.get("prompt_eval_duration_ns"))
-                        decode_ms = _ns_ms(metrics.get("eval_duration_ns"))
-                        eval_count = metrics.get("eval_count")
-                        model_memory_mb = None
-                        try:
-                            ps = run_client._request("GET", "/api/ps")
-                            target_id = spec["ollama_id"] if backend_code == "Ollama" else runtime_id
-                            process = next((row for row in ps.get("models", [])
-                                            if row.get("name") in {runtime_id, target_id}), None)
-                            if process and isinstance(process.get("size"), (int, float)):
-                                model_memory_mb = process["size"] / (1024 * 1024)
-                        except Exception:
-                            pass
-                        result = {"run_id": run_id, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                                  "execution_mode": "REAL_MODEL", "backend": backend_code,
-                                  "model_key": model_key, "model_id": runtime_id,
-                                  "ollama_model_id": spec["ollama_id"],
-                                  "runtime_id": runtime_id, "model_digest": availability[model_key].get("digest"),
-                                  "runtime_version": runtime_version, "runtime_environment": runtime_environment,
-                                  "experiment_fingerprint": experiment_fingerprint,
-                                  "prompt_version": PROMPT_VERSION, "prompt_fingerprint": prompt_fingerprint,
-                                  "schema_version": SCHEMA_VERSION, "schema_fingerprint": schema_fingerprint,
-                                  "project_id": project.project_id, "board_id": project.board_id,
-                                  "photo_id": photo_id, "image_sha256": image_sha,
-                                  "dataset_fingerprint": ds_fingerprint, "component_id": component_id,
-                                  "ground_truth": ground_truth,
-                                  "ground_truth_subtype": source.get("confirmed_subtype") if ground_truth else None,
-                                  "small_smd": small_smd, "crop_px": int(crop_px),
-                                  "padding_ratio": float(padding), "output_budget": int(budget),
-                                  "repeat_index": repeat_index, "wall_ms": round(wall_ms, 3),
-                                  "load_ms": load_ms, "prompt_eval_ms": prefill_ms, "eval_ms": decode_ms,
-                                  "prompt_eval_count": metrics.get("prompt_eval_count"), "eval_count": eval_count,
-                                  "tokens_per_second": (eval_count / (decode_ms / 1000)
-                                      if isinstance(eval_count, (int, float)) and decode_ms else None),
-                                  "model_memory_mb": model_memory_mb,
-                                  "first_run_label": "FIRST" if repeat_index == 0 else "WARM",
-                                  "first_is_confirmed_cold": bool(repeat_index == 0 and load_ms and load_ms > 0),
-                                  "think_parameter": "false" if think_supported else "omitted (model did not declare thinking)",
-                                  "json_valid": True, "schema_valid": response_adaptation.get(
-                                      "schema_valid_before_normalization", False),
-                                  "normalization_notes": response_adaptation.get("notes", []),
-                                  "raw_model_response": response_adaptation.get("raw_model_response"),
-                                  "status": "COMPLETE",
-                                  "prediction": prediction.get("proposed_class", UNKNOWN_CLASS),
-                                  "prediction_subtype": prediction.get("proposed_subtype"),
-                                  "confidence_uncalibrated": prediction.get("confidence"),
-                                  "decision": prediction.get("decision"), "evidence": prediction.get("evidence"),
-                                  "uncertain": prediction.get("decision") == "uncertain"}
-                    except Exception as exc:
-                        message = f"{type(exc).__name__}: {str(exc)[:400]}"
-                        unavailable = any(token in message.casefold() for token in
-                                          ("unsupported", "not supported", "unknown model", "architecture", "projector"))
-                        result = {"run_id": run_id, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                                  "execution_mode": "REAL_MODEL", "backend": backend_code,
-                                  "model_key": model_key, "model_id": runtime_id,
-                                  "ollama_model_id": spec["ollama_id"],
-                                  "runtime_id": runtime_id, "project_id": project.project_id,
-                                  "runtime_version": runtime_version, "runtime_environment": runtime_environment,
-                                  "experiment_fingerprint": experiment_fingerprint,
-                                  "prompt_version": PROMPT_VERSION, "prompt_fingerprint": prompt_fingerprint,
-                                  "schema_version": SCHEMA_VERSION, "schema_fingerprint": schema_fingerprint,
-                                  "board_id": project.board_id, "photo_id": photo_id,
-                                  "image_sha256": image_sha, "dataset_fingerprint": ds_fingerprint,
-                                  "component_id": component_id, "ground_truth": ground_truth,
-                                  "crop_px": int(crop_px), "padding_ratio": float(padding),
-                                  "output_budget": int(budget), "repeat_index": repeat_index,
-                                  "wall_ms": round((time.perf_counter_ns() - start_ns) / 1_000_000, 3),
-                                  "status": "UNAVAILABLE" if unavailable else "FAILED",
-                                  "error": message, "json_valid": False,
-                                  "normalization_notes": response_adaptation.get("notes", [])}
-                        if unavailable:
-                            availability[model_key] = {**availability[model_key],
-                                "status": "UNAVAILABLE", "reason": message}
-                            st.session_state[availability_key] = availability
-                    finally:
-                        run_client.chat_json = original_chat_json
-                    produced.append(result)
-                    all_rows.append(result)
-                    _save_runs(all_rows)
-                    progress.progress(count / total, text=f"{count}/{total} 호출 · {result['status']}")
-                    status.write(f"{count}/{total} · {MODEL_CATALOG[model_key]['label']} · {component_id} · "
-                                 f"{result['status']} · {result.get('wall_ms', 0):.0f} ms")
-        status.update(label=f"비교 완료 · {len(produced)}개 기록", state="complete", expanded=False)
-        st.session_state[f"cc_archive2_last_run_{project.project_id}"] = run_id
-        st.success("실험 결과를 원본 검수·측정 데이터와 분리해 저장했습니다.")
+                    reviewed = review_components_with_qwen(
+                        run_client, model_id, image_bytes, [detection], ocr_rows,
+                        classification_only=True, include_board_context=False,
+                        classification_crop_size_px=int(crop_px),
+                        classification_padding_ratio=float(padding),
+                        classification_output_budget=int(budget), classification_think=False,
+                    )
+                    wall_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
+                    prediction = reviewed["class_reviews"][0]
+                    metrics = reviewed.get("ollama_metrics", {})
+                    eval_ms = _ns_ms(metrics.get("eval_duration_ns"))
+                    eval_count = metrics.get("eval_count")
+                    result = {**common, "status": "COMPLETE", "json_valid": True,
+                              "schema_valid": raw_response.get("schema_valid_before_normalization", False),
+                              "normalization_notes": raw_response.get("notes", []),
+                              "raw_model_response": raw_response.get("content"),
+                              "prediction": prediction.get("proposed_class", UNKNOWN_CLASS),
+                              "prediction_subtype": prediction.get("proposed_subtype"),
+                              "confidence_uncalibrated": (None if "confidence missing or invalid" in raw_response.get("notes", [])
+                                                           else prediction.get("confidence")),
+                              "decision": prediction.get("decision"), "evidence": prediction.get("evidence"),
+                              "uncertain": prediction.get("decision") == "uncertain",
+                              "wall_ms": round(wall_ms, 3),
+                              "load_ms": _ns_ms(metrics.get("load_duration_ns")),
+                              "prompt_eval_ms": _ns_ms(metrics.get("prompt_eval_duration_ns")),
+                              "eval_ms": eval_ms, "prompt_eval_count": metrics.get("prompt_eval_count"),
+                              "eval_count": eval_count,
+                              "tokens_per_second": (eval_count / (eval_ms / 1000)
+                                  if isinstance(eval_count, (int, float)) and eval_ms else None),
+                              "model_memory_mb": None,
+                              "experiment_fingerprint": hashlib.sha256(json.dumps({
+                                  "model": model_id, "digest": model_state.get("digest"),
+                                  "image": image_sha, "component": component_id, "bbox": bbox,
+                                  "ocr": ocr_rows, "crop": crop_px, "padding": padding,
+                                  "budget": budget, "prompt": prompt_fingerprint,
+                                  "schema": schema_fingerprint,
+                              }, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()}
+                except Exception as exc:
+                    result = {**common, "status": "FAILED", "wall_ms": round(
+                        (time.perf_counter_ns() - start_ns) / 1_000_000, 3), "json_valid": False,
+                        "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+                        "normalization_notes": raw_response.get("notes", []),
+                        "raw_model_response": raw_response.get("content")}
+                finally:
+                    run_client.chat_json = original_chat_json
+            produced.append(result)
+            all_rows.append(result)
+            _save_runs(all_rows)
+            progress.progress(index / len(selected_models), text=f"{index}/{len(selected_models)} · {result['status']}")
+            status.write(f"{index}/{len(selected_models)} · {MODEL_CATALOG[model_key]['label']} · "
+                         f"{result['status']} · {result.get('wall_ms') or 0:.0f}ms")
+        status.update(label="모델 비교 완료", state="complete", expanded=False)
+        st.session_state[run_key] = run_id
+        st.success(f"{len(produced)}개 모델 결과를 실험 기록에 저장했습니다.")
 
-    if not all_rows:
+    component_runs = [row for row in all_rows if row.get("project_id") == project.project_id
+                      and row.get("photo_id") == photo_id and row.get("component_id") == component_id]
+    run_ids = list(dict.fromkeys(row.get("run_id") for row in reversed(component_runs) if row.get("run_id")))
+    if not run_ids:
         return
-    st.markdown("#### 결과")
-    run_ids = list(dict.fromkeys(row.get("run_id") for row in all_rows if row.get("run_id")))
-    last_run = st.session_state.get(f"cc_archive2_last_run_{project.project_id}")
-    default_index = run_ids.index(last_run) if last_run in run_ids else len(run_ids) - 1
-    chosen = st.selectbox("실험 실행", run_ids, index=default_index,
-                          key=f"cc_archive2_show_run_{project.project_id}")
-    run_rows = [row for row in all_rows if row.get("run_id") == chosen]
-    summary = _summarize(run_rows)
-    display = [{**row,
-                "Accuracy": f"{row['accuracy']:.1%}" if row.get("accuracy") is not None else "NOT_EVALUATED",
-                "Macro F1": f"{row['macro_f1']:.3f}" if row.get("macro_f1") is not None else "NOT_EVALUATED",
-                "정답 수": row["sample_n"],
-                "JSON 유효율": f"{row['json_valid_rate']:.1%}",
-                "원본 스키마 일치율": f"{row['schema_valid_rate']:.1%}",
-                "Unknown": f"{row['unknown_rate']:.1%}"}
-               for row in summary]
-    st.dataframe(display, use_container_width=True, hide_index=True)
-    if not any(row.get("sample_n") for row in summary):
-        st.info("이 실행에 사용자 확정 18종 정답이 없어 정확도·Macro F1은 NOT_EVALUATED입니다.")
-    st.dataframe([{"모델": MODEL_CATALOG.get(row.get("model_key"), {}).get("label", row.get("model_key")),
-                   "소자 ID": row.get("component_id"), "정답": row.get("ground_truth") or "미확정",
-                   "예측": row.get("prediction", row.get("status")), "세부 유형": row.get("prediction_subtype"),
-                   "근거": row.get("evidence"), "불확실": row.get("uncertain"),
-                   "JSON 유효": row.get("json_valid"), "시간 ms": row.get("wall_ms"), "오류": row.get("error")}
-                  for row in run_rows], use_container_width=True, hide_index=True)
-    json_bytes = json.dumps({"run_id": chosen, "summary": summary, "results": run_rows},
+    last_run = st.session_state.get(run_key)
+    run_index = run_ids.index(last_run) if last_run in run_ids else 0
+    chosen_run = st.selectbox("이 소자의 비교 기록", run_ids, index=run_index,
+                              key=f"cc_archive2_history_v2_{project.project_id}_{photo_id}_{component_id}")
+    run_rows = {row.get("model_key"): row for row in component_runs if row.get("run_id") == chosen_run}
+    st.markdown("#### 모델별 결과")
+    columns = st.columns(2)
+    for index, model_key in enumerate(MODEL_CATALOG):
+        row = run_rows.get(model_key)
+        with columns[index % 2]:
+            with st.container(border=True):
+                st.markdown(f"**{MODEL_CATALOG[model_key]['label']}**")
+                if not row:
+                    st.caption("이 실행에서 선택되지 않음")
+                    continue
+                if row.get("status") != "COMPLETE":
+                    st.warning(row.get("error") or row.get("status"))
+                    if row.get("status") == "UNAVAILABLE":
+                        st.caption(f"설치 안내 · `ollama pull {MODEL_CATALOG[model_key]['ollama_id']}` 후 설치 상태를 확인하세요.")
+                    continue
+                st.markdown(f"### {row.get('prediction') or UNKNOWN_CLASS}")
+                if row.get("prediction_subtype"):
+                    st.caption(f"세부 유형 · {row['prediction_subtype']}")
+                st.write(row.get("evidence") or "판단 근거 없음")
+                st.caption("불확실" if row.get("uncertain") else "제안 · 사용자 확인 필요")
+                if row.get("confidence_uncalibrated") is not None:
+                    st.caption(f"비보정 점수 · {row['confidence_uncalibrated']}")
+                st.caption(f"전체 {row.get('wall_ms', 0):.0f}ms · Prefill {row.get('prompt_eval_ms') if row.get('prompt_eval_ms') is not None else '—'}ms · "
+                           f"생성 {row.get('eval_ms') if row.get('eval_ms') is not None else '—'}ms · "
+                           f"{row.get('tokens_per_second') if row.get('tokens_per_second') is not None else '—'} token/s · "
+                           f"로드 {row.get('load_ms') if row.get('load_ms') is not None else '미보고'}ms")
+                with st.expander("모델 원본 응답", expanded=False):
+                    st.json(row.get("raw_model_response") or {})
+                    if row.get("normalization_notes"):
+                        st.caption("정규화 · " + "; ".join(row["normalization_notes"]))
+
+    timing_rows = [{"모델": MODEL_CATALOG[key]["label"], "응답 ms": row["wall_ms"]}
+                   for key, row in run_rows.items() if row.get("status") == "COMPLETE"
+                   and isinstance(row.get("wall_ms"), (int, float))]
+    if timing_rows:
+        st.markdown("#### 응답 시간 비교")
+        st.bar_chart(timing_rows, x="모델", y="응답 ms")
+    if not any(row.get("ground_truth") for row in run_rows.values()):
+        st.caption("사용자 확정 정답이 없거나 평가 대상이 아니므로 정확도는 표시하지 않습니다.")
+    export_rows = [row for row in run_rows.values()]
+    summary = _summarize(export_rows)
+    json_bytes = json.dumps({"run_id": chosen_run, "summary": summary, "results": export_rows},
                             ensure_ascii=False, indent=2).encode("utf-8")
-    buffer = io.StringIO()
-    fields = sorted({key for row in run_rows for key in row})
-    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    csv_buffer = io.StringIO()
+    fields = sorted({key for row in export_rows for key in row})
+    writer = csv.DictWriter(csv_buffer, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(run_rows)
+    writer.writerows(export_rows)
     left, right = st.columns(2)
-    left.download_button("JSON 내보내기", json_bytes, file_name=f"archive2-{chosen}.json",
-                         mime="application/json", key=f"cc_archive2_json_{chosen}")
-    right.download_button("CSV 내보내기", buffer.getvalue().encode("utf-8-sig"),
-                          file_name=f"archive2-{chosen}.csv", mime="text/csv",
-                          key=f"cc_archive2_csv_{chosen}")
-    eligible = [row for row in summary if row.get("sample_n", 0) >= 20
-                and row.get("class_n", 0) >= 5 and row.get("accuracy") is not None]
-    if eligible:
-        best = max(eligible, key=lambda row: (row.get("macro_f1") or 0,
-                                              -(row.get("mean_ms") or float("inf"))))
-        st.info(f"확정 정답 20개 이상·5개 종류 이상 기준 우선 후보 · {best['model']} · Macro F1 {best['macro_f1']:.3f} · "
-                f"평균 {best['mean_ms']:.0f} ms")
-    else:
-        st.caption("추천 모델은 설정별 사용자 확정 정답 20개·5개 종류 이상이 쌓일 때까지 표시하지 않습니다.")
+    left.download_button("이 비교 JSON 저장", json_bytes,
+                         file_name=f"archive2-{chosen_run}-{component_id}.json",
+                         mime="application/json", key=f"cc_archive2_json_v2_{chosen_run}_{component_id}")
+    right.download_button("이 비교 CSV 저장", csv_buffer.getvalue().encode("utf-8-sig"),
+                          file_name=f"archive2-{chosen_run}-{component_id}.csv", mime="text/csv",
+                          key=f"cc_archive2_csv_v2_{chosen_run}_{component_id}")
 
 
 def _ns_ms(value: Any) -> float | None:
